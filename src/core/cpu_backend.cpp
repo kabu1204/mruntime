@@ -248,7 +248,7 @@ void CpuBackend::rmsnorm(
     size_t hidden_size = input_fp32.dim(input_fp32.ndim() - 1);
     size_t num_tokens = input_fp32.numel() / hidden_size;
 
-    for (size_t t = 0; t < num_tokens; ++t) {
+    auto worker = [&](size_t t) {
         const float* x = in + t * hidden_size;
         float* y = out + t * hidden_size;
 
@@ -262,7 +262,9 @@ void CpuBackend::rmsnorm(
         for (size_t i = 0; i < hidden_size; ++i) {
             y[i] = x[i] * inv_rms * w[i];
         }
-    }
+    };
+
+    pthreadpool_.parallelize_1d(num_tokens, worker);
 }
 
 void CpuBackend::rope(
@@ -274,7 +276,7 @@ void CpuBackend::rope(
     // rope modifies Q and K in-place, they should be FP32
     assert(Q.dtype() == DType::FP32 && K.dtype() == DType::FP32);
 
-    auto apply_rope = [theta, position_offset](Tensor& t) {
+    auto apply_rope = [this, theta, position_offset](Tensor& t) {
         float* data = t.data_ptr<float>();
         size_t batch = t.dim(0);
         size_t seq_len = t.dim(1);
@@ -282,24 +284,29 @@ void CpuBackend::rope(
         size_t head_dim = t.dim(3);
         size_t half_dim = head_dim / 2;
 
-        for (size_t b = 0; b < batch; ++b) {
-            for (size_t s = 0; s < seq_len; ++s) {
-                size_t pos = position_offset + s;
-                for (size_t h = 0; h < num_heads; ++h) {
-                    float* head_data = data + (((b * seq_len + s) * num_heads + h) * head_dim);
-                    for (size_t i = 0; i < half_dim; ++i) {
-                        float freq = 1.0f / std::pow(theta, static_cast<float>(2 * i) / static_cast<float>(head_dim));
-                        float angle = static_cast<float>(pos) * freq;
-                        float cos_val = std::cos(angle);
-                        float sin_val = std::sin(angle);
-                        float x0 = head_data[i];
-                        float x1 = head_data[i + half_dim];
-                        head_data[i] = x0 * cos_val - x1 * sin_val;
-                        head_data[i + half_dim] = x0 * sin_val + x1 * cos_val;
-                    }
-                }
+        const size_t total_heads = batch * seq_len * num_heads;
+        auto worker = [&](size_t idx) {
+            size_t tmp = idx;
+            size_t h = tmp % num_heads;
+            tmp /= num_heads;
+            size_t s = tmp % seq_len;
+            size_t b = tmp / seq_len;
+
+            size_t pos = position_offset + s;
+            float* head_data = data + (((b * seq_len + s) * num_heads + h) * head_dim);
+            for (size_t i = 0; i < half_dim; ++i) {
+                float freq = 1.0f / std::pow(theta, static_cast<float>(2 * i) / static_cast<float>(head_dim));
+                float angle = static_cast<float>(pos) * freq;
+                float cos_val = std::cos(angle);
+                float sin_val = std::sin(angle);
+                float x0 = head_data[i];
+                float x1 = head_data[i + half_dim];
+                head_data[i] = x0 * cos_val - x1 * sin_val;
+                head_data[i + half_dim] = x0 * sin_val + x1 * cos_val;
             }
-        }
+        };
+
+        pthreadpool_.parallelize_1d(total_heads, worker);
     };
 
     apply_rope(Q);
@@ -318,10 +325,12 @@ void CpuBackend::silu(
     float* out = output.data_ptr<float>();
     size_t n = input_fp32.numel();
 
-    for (size_t i = 0; i < n; ++i) {
+    auto worker = [&](size_t i) {
         float x = in[i];
         out[i] = x / (1.0f + std::exp(-x));
-    }
+    };
+
+    pthreadpool_.parallelize_1d(n, worker);
 }
 
 void CpuBackend::elementwise_mul(
@@ -341,9 +350,11 @@ void CpuBackend::elementwise_mul(
     float* pout = output.data_ptr<float>();
     size_t n = a_fp32.numel();
 
-    for (size_t i = 0; i < n; ++i) {
+    auto worker = [&](size_t i) {
         pout[i] = pa[i] * pb[i];
-    }
+    };
+
+    pthreadpool_.parallelize_1d(n, worker);
 }
 
 void CpuBackend::add(
@@ -363,9 +374,11 @@ void CpuBackend::add(
     float* pout = output.data_ptr<float>();
     size_t n = a_fp32.numel();
 
-    for (size_t i = 0; i < n; ++i) {
+    auto worker = [&](size_t i) {
         pout[i] = pa[i] + pb[i];
-    }
+    };
+
+    pthreadpool_.parallelize_1d(n, worker);
 }
 
 void CpuBackend::softmax(
@@ -395,25 +408,30 @@ void CpuBackend::softmax(
         inner_size *= input_fp32.dim(i);
     }
 
-    for (size_t o = 0; o < outer_size; ++o) {
-        for (size_t inner = 0; inner < inner_size; ++inner) {
-            float max_val = -std::numeric_limits<float>::infinity();
-            for (size_t d = 0; d < dim_size; ++d) {
-                size_t idx = (o * dim_size + d) * inner_size + inner;
-                max_val = std::max(max_val, in[idx]);
-            }
-            float sum = 0.0f;
-            for (size_t d = 0; d < dim_size; ++d) {
-                size_t idx = (o * dim_size + d) * inner_size + inner;
-                out[idx] = std::exp(in[idx] - max_val);
-                sum += out[idx];
-            }
-            for (size_t d = 0; d < dim_size; ++d) {
-                size_t idx = (o * dim_size + d) * inner_size + inner;
-                out[idx] /= sum;
-            }
+    const size_t total_rows = outer_size * inner_size;
+    auto worker = [&](size_t row) {
+        size_t o = row / inner_size;
+        size_t inner = row % inner_size;
+
+        float max_val = -std::numeric_limits<float>::infinity();
+        for (size_t d = 0; d < dim_size; ++d) {
+            size_t idx = (o * dim_size + d) * inner_size + inner;
+            max_val = std::max(max_val, in[idx]);
         }
-    }
+
+        float sum = 0.0f;
+        for (size_t d = 0; d < dim_size; ++d) {
+            size_t idx = (o * dim_size + d) * inner_size + inner;
+            out[idx] = std::exp(in[idx] - max_val);
+            sum += out[idx];
+        }
+        for (size_t d = 0; d < dim_size; ++d) {
+            size_t idx = (o * dim_size + d) * inner_size + inner;
+            out[idx] /= sum;
+        }
+    };
+
+    pthreadpool_.parallelize_1d(total_rows, worker);
 }
 
 void CpuBackend::embedding_lookup(
@@ -431,11 +449,13 @@ void CpuBackend::embedding_lookup(
     const float* w = weight_fp32.data_ptr<float>();
     float* out = output.data_ptr<float>();
 
-    for (size_t t = 0; t < token_ids.size(); ++t) {
+    auto worker = [&](size_t t) {
         int token_id = token_ids[t];
         const float* emb = w + token_id * hidden_size;
         std::memcpy(out + t * hidden_size, emb, hidden_size * sizeof(float));
-    }
+    };
+
+    pthreadpool_.parallelize_1d(token_ids.size(), worker);
 }
 
 }  // namespace mruntime

@@ -176,7 +176,7 @@ int main(int argc, char** argv) {
         mruntime::QwenModel model(model_config);
         model.load_weights(*weights);
 
-        mruntime::CpuBackend backend;
+        mruntime::CpuBackend backend(8);
 
         const auto tokenizer = mruntime::Qwen2Tokenizer::from_files(
             join_path(model_dir, "vocab.json"),

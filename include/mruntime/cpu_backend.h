@@ -1,13 +1,20 @@
 #pragma once
 
 #include "mruntime/backend.h"
+#include "mruntime/pthreadpool_raii.h"
 
 namespace mruntime {
 
 class CpuBackend : public Backend {
 public:
-    CpuBackend() = default;
+    CpuBackend() : pthreadpool_(PThreadPool::Create(0)) {}
+    explicit CpuBackend(size_t threads_count) : pthreadpool_(PThreadPool::Create(threads_count)) {}
     ~CpuBackend() override = default;
+
+    CpuBackend(const CpuBackend&) = delete;
+    CpuBackend& operator=(const CpuBackend&) = delete;
+    CpuBackend(CpuBackend&&) noexcept = default;
+    CpuBackend& operator=(CpuBackend&&) noexcept = default;
 
     // Platform capability queries
     static bool supports_fp16_gemm();
@@ -74,6 +81,9 @@ public:
         const std::vector<int>& token_ids,
         Tensor& output
     ) override;
+
+private:
+    PThreadPool pthreadpool_;
 };
 
 }  // namespace mruntime
