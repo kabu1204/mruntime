@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.16)
+cmake_minimum_required(VERSION 3.18)
 project(mruntime VERSION 0.1.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
@@ -44,6 +44,12 @@ FetchContent_Declare(
     URL_HASH SHA256=f602ab141bdc5d5872a79d6551e9063b5bfa7ad6ad60cceaa641de5c45c86d70
     DOWNLOAD_EXTRACT_TIMESTAMP FALSE
 )
+FetchContent_Declare(
+    kleidiai
+    GIT_REPOSITORY https://github.com/ARM-software/kleidiai.git
+    GIT_TAG v0.1.0
+    GIT_SHALLOW TRUE
+)
 set(ABSL_BUILD_TESTING OFF CACHE BOOL "Disable Abseil tests")
 set(ABSL_PROPAGATE_CXX_STD ON CACHE BOOL "Let Abseil match consumer C++ standard")
 set(RE2_BUILD_TESTING OFF CACHE BOOL "Disable RE2 tests")
@@ -53,9 +59,12 @@ set(JSON_Install OFF CACHE BOOL "Disable nlohmann/json install rules")
 set(PTHREADPOOL_BUILD_TESTS OFF CACHE BOOL "Disable pthreadpool tests")
 set(PTHREADPOOL_BUILD_BENCHMARKS OFF CACHE BOOL "Disable pthreadpool benchmarks")
 set(PTHREADPOOL_BUILD_SHARED_LIBRARY OFF CACHE BOOL "Build pthreadpool as a shared library")
+set(KLEIDIAI_BUILD_TESTS OFF CACHE BOOL "Disable KleidiAI tests")
+set(KLEIDIAI_BUILD_BENCHMARK OFF CACHE BOOL "Disable KleidiAI benchmark tool")
+set(KLEIDIAI_ENABLE_CLANG_TIDY OFF CACHE BOOL "Disable KleidiAI clang-tidy checks")
 set(_MRUNTIME_PREV_SKIP_INSTALL_RULES "${CMAKE_SKIP_INSTALL_RULES}")
 set(CMAKE_SKIP_INSTALL_RULES TRUE)
-FetchContent_MakeAvailable(spdlog absl re2 nlohmann_json pthreadpool)
+FetchContent_MakeAvailable(spdlog absl re2 nlohmann_json pthreadpool kleidiai)
 set(CMAKE_SKIP_INSTALL_RULES "${_MRUNTIME_PREV_SKIP_INSTALL_RULES}")
 
 # MLAS setup
@@ -114,6 +123,7 @@ target_link_libraries(mruntime
         re2::re2
         spdlog::spdlog_header_only
         pthreadpool
+        kleidiai
     PRIVATE
         nlohmann_json::nlohmann_json
         onnxruntime_mlas
