@@ -38,15 +38,24 @@ FetchContent_Declare(
     GIT_TAG v3.12.0
     GIT_SHALLOW TRUE
 )
+FetchContent_Declare(
+    pthreadpool
+    URL https://github.com/google/pthreadpool/archive/0e6ca13779b57d397a5ba6bfdcaa8a275bc8ea2e.zip
+    URL_HASH SHA256=f602ab141bdc5d5872a79d6551e9063b5bfa7ad6ad60cceaa641de5c45c86d70
+    DOWNLOAD_EXTRACT_TIMESTAMP FALSE
+)
 set(ABSL_BUILD_TESTING OFF CACHE BOOL "Disable Abseil tests")
 set(ABSL_PROPAGATE_CXX_STD ON CACHE BOOL "Let Abseil match consumer C++ standard")
 set(RE2_BUILD_TESTING OFF CACHE BOOL "Disable RE2 tests")
 set(RE2_BUILD_BENCHMARK OFF CACHE BOOL "Disable RE2 benchmark binary")
 set(JSON_BuildTests OFF CACHE BOOL "Disable nlohmann/json tests")
 set(JSON_Install OFF CACHE BOOL "Disable nlohmann/json install rules")
+set(PTHREADPOOL_BUILD_TESTS OFF CACHE BOOL "Disable pthreadpool tests")
+set(PTHREADPOOL_BUILD_BENCHMARKS OFF CACHE BOOL "Disable pthreadpool benchmarks")
+set(PTHREADPOOL_BUILD_SHARED_LIBRARY OFF CACHE BOOL "Build pthreadpool as a shared library")
 set(_MRUNTIME_PREV_SKIP_INSTALL_RULES "${CMAKE_SKIP_INSTALL_RULES}")
 set(CMAKE_SKIP_INSTALL_RULES TRUE)
-FetchContent_MakeAvailable(spdlog absl re2 nlohmann_json)
+FetchContent_MakeAvailable(spdlog absl re2 nlohmann_json pthreadpool)
 set(CMAKE_SKIP_INSTALL_RULES "${_MRUNTIME_PREV_SKIP_INSTALL_RULES}")
 
 # MLAS setup
@@ -58,8 +67,6 @@ set(MLAS_LIB_DIR "${MLAS_DIR}/install/lib")
 set(MRUNTIME_CORE_SOURCES
     src/core/tensor.cpp
     src/core/cpu_backend.cpp
-    src/core/sync.cpp
-    src/core/thread_pool.cpp
 )
 
 set(MRUNTIME_LOADER_SOURCES
@@ -106,6 +113,7 @@ target_link_libraries(mruntime
     PUBLIC
         re2::re2
         spdlog::spdlog_header_only
+        pthreadpool
     PRIVATE
         nlohmann_json::nlohmann_json
         onnxruntime_mlas

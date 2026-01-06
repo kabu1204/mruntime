@@ -37,15 +37,15 @@ target_link_directories(engine_test PRIVATE ${MLAS_LIB_DIR})
 target_link_libraries(engine_test PRIVATE onnxruntime_mlas onnxruntime_common)
 add_test(NAME engine_test COMMAND engine_test)
 
-add_executable(thread_pool_test thread_pool_test.cpp)
-target_link_libraries(thread_pool_test PRIVATE mruntime)
-target_include_directories(thread_pool_test PRIVATE
+add_executable(pthreadpool_raii_test pthreadpool_raii_test.cpp)
+target_link_libraries(pthreadpool_raii_test PRIVATE mruntime)
+target_include_directories(pthreadpool_raii_test PRIVATE
     ${CMAKE_SOURCE_DIR}/include
     ${CMAKE_SOURCE_DIR}/src/core
 )
-target_link_directories(thread_pool_test PRIVATE ${MLAS_LIB_DIR})
-target_link_libraries(thread_pool_test PRIVATE onnxruntime_mlas onnxruntime_common)
-add_test(NAME thread_pool_test COMMAND thread_pool_test)
+target_link_directories(pthreadpool_raii_test PRIVATE ${MLAS_LIB_DIR})
+target_link_libraries(pthreadpool_raii_test PRIVATE onnxruntime_mlas onnxruntime_common)
+add_test(NAME pthreadpool_raii_test COMMAND pthreadpool_raii_test)
 
 add_executable(tokenizer_test tokenizer_test.cpp)
 target_link_libraries(tokenizer_test PRIVATE mruntime)
