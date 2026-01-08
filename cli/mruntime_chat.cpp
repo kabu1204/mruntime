@@ -2,6 +2,7 @@
 #include <cstdint>
 #include <fstream>
 #include <iostream>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <utility>
@@ -9,6 +10,7 @@
 
 #include "mruntime/cpu_backend.h"
 #include "mruntime/inference_engine.h"
+#include "mruntime/profiling_backend.h"
 #include "mruntime/qwen_model.h"
 #include "mruntime/safetensors.h"
 
@@ -74,6 +76,9 @@ struct Args {
     bool greedy = false;
     uint64_t seed = 42;
     int eos_token_id = 151645;  // <|im_end|>
+
+    bool profile_backend = false;
+    std::string profile_backend_trace_path;
 };
 
 auto print_usage(const char* argv0) -> void {
@@ -89,6 +94,8 @@ auto print_usage(const char* argv0) -> void {
         << "  --greedy                Greedy decoding\n"
         << "  --seed N                RNG seed (default: 42)\n"
         << "  --eos-token-id ID       Stop token id (default: 151645 = <|im_end|>)\n"
+        << "  --profile-backend       Print per-op backend timing summary\n"
+        << "  --profile-backend-trace PATH  Write Chrome trace JSON for backend ops\n"
         << "  -h, --help              Show this help\n";
 }
 
@@ -124,6 +131,11 @@ auto parse_args(int argc, char** argv) -> Args {
             args.seed = static_cast<uint64_t>(std::stoull(require_value("--seed")));
         } else if (a == "--eos-token-id") {
             args.eos_token_id = std::stoi(require_value("--eos-token-id"));
+        } else if (a == "--profile-backend") {
+            args.profile_backend = true;
+        } else if (a == "--profile-backend-trace") {
+            args.profile_backend = true;
+            args.profile_backend_trace_path = require_value("--profile-backend-trace");
         } else {
             throw std::runtime_error("Unknown argument: " + a);
         }
@@ -176,7 +188,18 @@ int main(int argc, char** argv) {
         mruntime::QwenModel model(model_config);
         model.load_weights(*weights);
 
-        mruntime::CpuBackend backend(8);
+        mruntime::CpuBackend cpu_backend(8);
+
+        std::optional<mruntime::ProfilingBackend> profiling_backend;
+        mruntime::Backend* backend = &cpu_backend;
+        if (args.profile_backend) {
+            mruntime::ProfilingBackend::Options opts;
+            opts.enabled = true;
+            opts.trace_enabled = !args.profile_backend_trace_path.empty();
+            opts.trace_path = args.profile_backend_trace_path;
+            profiling_backend.emplace(cpu_backend, opts);
+            backend = &*profiling_backend;
+        }
 
         const auto tokenizer = mruntime::Qwen2Tokenizer::from_files(
             join_path(model_dir, "vocab.json"),
@@ -198,7 +221,7 @@ int main(int argc, char** argv) {
             history.push_back({"system", args.system_prompt});
         }
 
-        mruntime::InferenceEngine engine(model, backend);
+        mruntime::InferenceEngine engine(model, *backend);
 
         std::cout << "mruntime Qwen2 chat\n";
         std::cout << "Type /exit to quit, /reset to clear conversation.\n";
@@ -242,7 +265,20 @@ int main(int argc, char** argv) {
             const std::string reply = tokenizer.decode(reply_tokens);
             std::cout << reply << "\n";
 
+            if (profiling_backend) {
+                std::cout << "\n" << profiling_backend->profiler().format_report();
+            }
+
             history.push_back({"assistant", reply});
+        }
+
+        if (profiling_backend && !args.profile_backend_trace_path.empty()) {
+            std::string err;
+            if (!profiling_backend->flush_trace_to_file(&err)) {
+                std::cerr << "WARN: " << err << "\n";
+            } else {
+                std::cout << "\nWrote backend trace to: " << args.profile_backend_trace_path << "\n";
+            }
         }
 
         return 0;

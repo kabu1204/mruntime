@@ -16,6 +16,13 @@ target_link_directories(backend_test PRIVATE ${MLAS_LIB_DIR})
 target_link_libraries(backend_test PRIVATE onnxruntime_mlas onnxruntime_common)
 add_test(NAME backend_test COMMAND backend_test)
 
+add_executable(profiling_backend_test profiling_backend_test.cpp)
+target_link_libraries(profiling_backend_test PRIVATE mruntime)
+target_include_directories(profiling_backend_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_link_directories(profiling_backend_test PRIVATE ${MLAS_LIB_DIR})
+target_link_libraries(profiling_backend_test PRIVATE onnxruntime_mlas onnxruntime_common)
+add_test(NAME profiling_backend_test COMMAND profiling_backend_test)
+
 add_executable(loader_test loader_test.cpp)
 target_link_libraries(loader_test PRIVATE mruntime)
 target_include_directories(loader_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
