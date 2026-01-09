@@ -4,10 +4,10 @@
 #include <cassert>
 #include <cmath>
 #include <cstring>
+#include <limits>
 #include <vector>
 
-#include "MLAS/include/mlas.h"
-#include "MLAS/include/mlas_float16.h"
+#include "kai_gemm.h"
 
 namespace mruntime {
 
@@ -21,19 +21,89 @@ Tensor ensure_fp32(const Tensor& t) {
     return t.to(DType::FP32);
 }
 
+inline float load_scalar_as_fp32(const void* data, DType dtype, size_t index) {
+    switch (dtype) {
+        case DType::FP32:
+            return static_cast<const float*>(data)[index];
+        case DType::BF16:
+            return bf16_to_float(static_cast<const uint16_t*>(data)[index]);
+        case DType::FP16:
+            return fp16_bits_to_float(static_cast<const uint16_t*>(data)[index]);
+    }
+    return 0.0f;
+}
+
+inline void store_scalar_from_fp32(void* data, DType dtype, size_t index, float value) {
+    switch (dtype) {
+        case DType::FP32:
+            static_cast<float*>(data)[index] = value;
+            return;
+        case DType::BF16:
+            static_cast<uint16_t*>(data)[index] = float_to_bf16(value);
+            return;
+        case DType::FP16:
+            static_cast<uint16_t*>(data)[index] = float_to_fp16_bits(value);
+            return;
+    }
+}
+
 }  // namespace
 
 // Platform capability queries
 bool CpuBackend::supports_fp16_gemm() {
-    return MlasFp16AccelerationSupported();
+    return kai_has_fp16();
 }
 
 bool CpuBackend::supports_bf16_gemm() {
-#if defined(__aarch64__) && defined(__linux__)
-    return MlasBf16AccelerationSupported();
-#else
     return false;
-#endif
+}
+
+const std::vector<uint16_t>& CpuBackend::get_or_create_packed_rhs_fp16(const Tensor& B, size_t n, size_t k) {
+    const void* data = B.data();
+    for (auto& entry : packed_rhs_cache_) {
+        if (entry.data == data && entry.n == n && entry.k == k && entry.dtype == B.dtype()) {
+            return entry.rhs_packed;
+        }
+    }
+
+    PackedRhsCacheEntry entry;
+    entry.data = data;
+    entry.n = n;
+    entry.k = k;
+    entry.dtype = B.dtype();
+
+    // Pack RHS as KxN FP16 (transposed from the usual NxK weight layout).
+    std::vector<uint16_t> rhs_kxn_fp16(k * n);
+
+    if (B.dtype() == DType::FP16) {
+        const uint16_t* b = B.data_ptr<uint16_t>();
+        for (size_t row = 0; row < n; ++row) {
+            for (size_t col = 0; col < k; ++col) {
+                rhs_kxn_fp16[col * n + row] = b[row * k + col];
+            }
+        }
+    } else if (B.dtype() == DType::BF16) {
+        const uint16_t* b = B.data_ptr<uint16_t>();
+        for (size_t row = 0; row < n; ++row) {
+            for (size_t col = 0; col < k; ++col) {
+                float f = bf16_to_float(b[row * k + col]);
+                rhs_kxn_fp16[col * n + row] = float_to_fp16_bits(f);
+            }
+        }
+    } else {
+        // Not expected today, but keep a defined behavior.
+        const float* b = B.data_ptr<float>();
+        for (size_t row = 0; row < n; ++row) {
+            for (size_t col = 0; col < k; ++col) {
+                rhs_kxn_fp16[col * n + row] = float_to_fp16_bits(b[row * k + col]);
+            }
+        }
+    }
+
+    KaiPackedRhsFp16 packed = kai_pack_rhs_fp16_kxn_with_zero_bias(rhs_kxn_fp16.data(), n, k);
+    entry.rhs_packed = std::move(packed.rhs_packed);
+    packed_rhs_cache_.push_back(std::move(entry));
+    return packed_rhs_cache_.back().rhs_packed;
 }
 
 void CpuBackend::gemm(
@@ -47,125 +117,102 @@ void CpuBackend::gemm(
 ) {
     assert(A.is_contiguous() && B.is_contiguous() && C.is_contiguous());
 
-    // Calculate dimensions
-    size_t M, N, K;
-    if (!trans_a) {
-        M = A.ndim() == 2 ? A.dim(0) : A.dim(0) * A.dim(1);
-        K = A.dim(A.ndim() - 1);
-    } else {
-        K = A.ndim() == 2 ? A.dim(0) : A.dim(0) * A.dim(1);
-        M = A.dim(A.ndim() - 1);
-    }
-    if (!trans_b) {
-        assert(B.dim(0) == K);
-        N = B.dim(B.ndim() - 1);
-    } else {
-        N = B.dim(0);
-        assert(B.dim(B.ndim() - 1) == K);
-    }
+    assert(A.ndim() == 2 || A.ndim() == 3);
+    assert(B.ndim() == 2);
+    assert(C.ndim() == 2 || C.ndim() == 3);
 
-    size_t lda = trans_a ? M : K;
-    size_t ldb = trans_b ? K : N;
-    size_t ldc = N;
+    const size_t a_rows0 = (A.ndim() == 2) ? A.dim(0) : (A.dim(0) * A.dim(1));
+    const size_t a_cols0 = A.dim(A.ndim() - 1);
+    const size_t b_rows0 = B.dim(0);
+    const size_t b_cols0 = B.dim(1);
 
-    DType a_dtype = A.dtype();
-    DType b_dtype = B.dtype();
-    DType c_dtype = C.dtype();
+    const size_t M = trans_a ? a_cols0 : a_rows0;
+    const size_t K = trans_a ? a_rows0 : a_cols0;
+    const size_t N = trans_b ? b_rows0 : b_cols0;
+    assert((trans_b ? b_cols0 : b_rows0) == K);
 
-    // Case 1: All FP32 - use standard SGEMM
-    if (a_dtype == DType::FP32 && b_dtype == DType::FP32 && c_dtype == DType::FP32) {
-        MlasGemm(
-            trans_a ? CblasTrans : CblasNoTrans,
-            trans_b ? CblasTrans : CblasNoTrans,
-            M, N, K,
-            alpha,
-            A.data_ptr<float>(), lda,
-            B.data_ptr<float>(), ldb,
-            beta,
-            C.data_ptr<float>(), ldc,
-            nullptr
+    assert(((C.ndim() == 2) ? C.dim(0) : (C.dim(0) * C.dim(1))) == M);
+    assert(C.dim(C.ndim() - 1) == N);
+
+    const DType a_dtype = A.dtype();
+    const DType b_dtype = B.dtype();
+    const DType c_dtype = C.dtype();
+
+    // KleidiAI fast-path (Arm64): fp32 activations + (fp16/bf16) weights (transposed), output fp32.
+    if (!trans_a && trans_b && alpha == 1.0f && beta == 0.0f && a_dtype == DType::FP32 && c_dtype == DType::FP32 &&
+        (b_dtype == DType::FP16 || b_dtype == DType::BF16) && supports_fp16_gemm()) {
+        const float* a_fp32 = A.data_ptr<float>();
+        std::vector<uint16_t> lhs_fp16(M * K);
+        for (size_t i = 0; i < M * K; ++i) {
+            lhs_fp16[i] = float_to_fp16_bits(a_fp32[i]);
+        }
+
+        const std::vector<uint16_t>& rhs_packed = get_or_create_packed_rhs_fp16(B, N, K);
+
+        std::vector<uint16_t> dst_fp16(M * N);
+        kai_matmul_fp16_packed_rhs(
+            M,
+            N,
+            K,
+            lhs_fp16.data(),
+            K * sizeof(uint16_t),
+            rhs_packed.data(),
+            dst_fp16.data(),
+            N * sizeof(uint16_t)
         );
-        return;
-    }
 
-    // Case 2: FP16 weights with hardware support
-    if (b_dtype == DType::FP16 && supports_fp16_gemm() && !trans_b) {
-        // MlasHalfGemmBatch supports FP32 activations with FP16 weights
-        // Output is FP16, we'll convert to target dtype after
-        Tensor C_fp16 = Tensor::empty(C.shape(), DType::FP16);
-
-        MLAS_HALF_GEMM_DATA_PARAMS params{};
-        params.A = A.data();
-        params.B = B.data();
-        params.C = reinterpret_cast<MLAS_FP16*>(C_fp16.data());
-        params.lda = lda;
-        params.ldb = ldb;
-        params.ldc = ldc;
-        params.AIsfp32 = (a_dtype == DType::FP32);
-        params.BIsfp32 = false;
-        params.Bias = nullptr;
-        params.OutputProcessor = nullptr;
-
-        MlasHalfGemmBatch(M, N, K, 1, &params, nullptr);
-
-        // Convert output to target dtype
-        if (c_dtype == DType::FP16) {
-            std::memcpy(C.data(), C_fp16.data(), C.nbytes());
-        } else {
-            Tensor C_converted = C_fp16.to(c_dtype);
-            std::memcpy(C.data(), C_converted.data(), C.nbytes());
+        float* c_fp32 = C.data_ptr<float>();
+        for (size_t i = 0; i < M * N; ++i) {
+            c_fp32[i] = fp16_bits_to_float(dst_fp16[i]);
         }
         return;
     }
 
-#if defined(__aarch64__) && defined(__linux__)
-    // Case 3: BF16 weights with hardware support (ARM64 Linux only)
-    if (b_dtype == DType::BF16 && supports_bf16_gemm() && !trans_b) {
-        // MlasSBGemmBatch outputs FP32 directly
-        assert(c_dtype == DType::FP32 && "BF16 GEMM outputs FP32");
-
-        MLAS_SBGEMM_DATA_PARAMS params{};
-        params.A = A.data();
-        params.B = B.data();
-        params.C = C.data_ptr<float>();
-        params.lda = lda;
-        params.ldb = ldb;
-        params.ldc = ldc;
-        params.AIsfp32 = (a_dtype == DType::FP32);
-        params.BIsfp32 = false;
-        params.Bias = nullptr;
-        params.OutputProcessor = nullptr;
-
-        MlasSBGemmBatch(M, N, K, 1, &params, nullptr);
+    if (M == 0 || N == 0) {
         return;
     }
-#endif
 
-    // Case 4: Fallback - convert everything to FP32
-    Tensor A_fp32 = ensure_fp32(A);
-    Tensor B_fp32 = ensure_fp32(B);
+    const void* a_data = A.data();
+    const void* b_data = B.data();
+    void* c_data = C.data();
 
-    // Ensure output is FP32 for computation
-    bool need_convert_output = (c_dtype != DType::FP32);
-    Tensor C_fp32 = need_convert_output ? Tensor::empty(C.shape(), DType::FP32) : C;
+    const auto a_index = [&](size_t m, size_t k) -> size_t {
+        return trans_a ? (k * a_cols0 + m) : (m * a_cols0 + k);
+    };
+    const auto b_index = [&](size_t k, size_t n) -> size_t {
+        return trans_b ? (n * b_cols0 + k) : (k * b_cols0 + n);
+    };
 
-    MlasGemm(
-        trans_a ? CblasTrans : CblasNoTrans,
-        trans_b ? CblasTrans : CblasNoTrans,
-        M, N, K,
-        alpha,
-        A_fp32.data_ptr<float>(), lda,
-        B_fp32.data_ptr<float>(), ldb,
-        beta,
-        C_fp32.data_ptr<float>(), ldc,
-        nullptr
-    );
+    constexpr size_t tile_n = 128;
+    const size_t n_tiles = (N + tile_n - 1) / tile_n;
+    const size_t task_count = M * n_tiles;
 
-    // Convert output if needed
-    if (need_convert_output) {
-        Tensor converted = C_fp32.to(c_dtype);
-        std::memcpy(C.data(), converted.data(), C.nbytes());
-    }
+    auto worker = [&](size_t task_id) {
+        const size_t m = task_id / n_tiles;
+        const size_t tile = task_id - m * n_tiles;
+        const size_t n0 = tile * tile_n;
+        const size_t n1 = std::min(n0 + tile_n, N);
+
+        for (size_t n = n0; n < n1; ++n) {
+            float acc = 0.0f;
+            if (alpha != 0.0f) {
+                for (size_t k = 0; k < K; ++k) {
+                    const float a = load_scalar_as_fp32(a_data, a_dtype, a_index(m, k));
+                    const float b = load_scalar_as_fp32(b_data, b_dtype, b_index(k, n));
+                    acc += a * b;
+                }
+                acc *= alpha;
+            }
+
+            float out = acc;
+            if (beta != 0.0f) {
+                out += beta * load_scalar_as_fp32(c_data, c_dtype, m * N + n);
+            }
+            store_scalar_from_fp32(c_data, c_dtype, m * N + n, out);
+        }
+    };
+
+    pthreadpool_.parallelize_1d(task_count, worker);
 }
 
 void CpuBackend::flash_attention(
@@ -176,56 +223,118 @@ void CpuBackend::flash_attention(
     float scale,
     bool causal
 ) {
-    // Convert inputs to FP32 if needed
+    // Convert inputs to FP32 if needed.
     Tensor Q_fp32 = ensure_fp32(Q);
     Tensor K_fp32 = ensure_fp32(K);
     Tensor V_fp32 = ensure_fp32(V);
 
     assert(Q_fp32.ndim() == 4);
+    assert(K_fp32.ndim() == 4);
+    assert(V_fp32.ndim() == 4);
+    assert(output.ndim() == 4);
     assert(output.dtype() == DType::FP32);
 
-    int batch_size = static_cast<int>(Q_fp32.dim(0));
-    int num_heads = static_cast<int>(Q_fp32.dim(1));
-    int q_seq_len = static_cast<int>(Q_fp32.dim(2));
-    int head_dim = static_cast<int>(Q_fp32.dim(3));
-    int kv_seq_len = static_cast<int>(K_fp32.dim(2));
-    int v_head_dim = static_cast<int>(V_fp32.dim(3));
+    const size_t batch_size = Q_fp32.dim(0);
+    const size_t num_heads = Q_fp32.dim(1);
+    const size_t q_seq_len = Q_fp32.dim(2);
+    const size_t qk_head_size = Q_fp32.dim(3);
+    const size_t kv_seq_len = K_fp32.dim(2);
+    const size_t v_head_size = V_fp32.dim(3);
 
-    int q_block_size = std::min(64, q_seq_len);
-    int kv_block_size = std::min(64, kv_seq_len);
-    const int thread_count = 1;
+    assert(K_fp32.dim(0) == batch_size);
+    assert(K_fp32.dim(1) == num_heads);
+    assert(V_fp32.dim(0) == batch_size);
+    assert(V_fp32.dim(1) == num_heads);
+    assert(output.dim(0) == batch_size);
+    assert(output.dim(1) == num_heads);
+    assert(output.dim(2) == q_seq_len);
+    assert(output.dim(3) == v_head_size);
+    assert(K_fp32.dim(3) == qk_head_size);
+    assert(V_fp32.dim(2) == kv_seq_len);
 
-    const size_t floats_per_thread = static_cast<size_t>(q_block_size) * (2 + kv_block_size + v_head_dim);
-    const size_t required_floats = floats_per_thread * static_cast<size_t>(thread_count);
+    const float* q = Q_fp32.data_ptr<float>();
+    const float* k = K_fp32.data_ptr<float>();
+    const float* v = V_fp32.data_ptr<float>();
+    float* out = output.data_ptr<float>();
 
-    // MLAS expects a per-thread scratch buffer. Reuse a thread-local buffer to
-    // avoid reallocating and zero-initializing scratch memory on every call.
-    static thread_local std::vector<float> buffer;
-    if (buffer.size() < required_floats) {
-        buffer.resize(required_floats);
-    }
+    const size_t q_stride0 = Q_fp32.stride(0);
+    const size_t q_stride1 = Q_fp32.stride(1);
+    const size_t q_stride2 = Q_fp32.stride(2);
+    const size_t q_stride3 = Q_fp32.stride(3);
 
-    MlasFlashAttentionThreadedArgs args{};
-    args.batch_size = batch_size;
-    args.num_heads = num_heads;
-    args.q_sequence_length = q_seq_len;
-    args.kv_sequence_length = kv_seq_len;
-    args.qk_head_size = head_dim;
-    args.v_head_size = v_head_dim;
-    args.q_block_size = q_block_size;
-    args.kv_block_size = kv_block_size;
-    args.scale = scale;
-    args.thread_count = thread_count;
-    args.buffer = buffer.data();
-    args.buffer_size_per_thread = floats_per_thread * sizeof(float);
-    args.query = Q_fp32.data_ptr<float>();
-    args.key = K_fp32.data_ptr<float>();
-    args.value = V_fp32.data_ptr<float>();
-    args.output = output.data_ptr<float>();
+    const size_t k_stride0 = K_fp32.stride(0);
+    const size_t k_stride1 = K_fp32.stride(1);
+    const size_t k_stride2 = K_fp32.stride(2);
+    const size_t k_stride3 = K_fp32.stride(3);
 
-    MlasFlashAttention(&args, nullptr);
+    const size_t v_stride0 = V_fp32.stride(0);
+    const size_t v_stride1 = V_fp32.stride(1);
+    const size_t v_stride2 = V_fp32.stride(2);
+    const size_t v_stride3 = V_fp32.stride(3);
 
-    (void)causal;
+    const size_t o_stride0 = output.stride(0);
+    const size_t o_stride1 = output.stride(1);
+    const size_t o_stride2 = output.stride(2);
+    const size_t o_stride3 = output.stride(3);
+
+    // For the call sites in this repo, Q corresponds to the last q_seq_len positions in K/V.
+    const size_t base_position = (kv_seq_len >= q_seq_len) ? (kv_seq_len - q_seq_len) : 0;
+
+    const size_t task_count = batch_size * num_heads * q_seq_len;
+    auto worker = [&](size_t task_id) {
+        size_t tmp = task_id;
+        const size_t qi = tmp % q_seq_len;
+        tmp /= q_seq_len;
+        const size_t h = tmp % num_heads;
+        const size_t b = tmp / num_heads;
+
+        size_t max_k = kv_seq_len - 1;
+        if (causal && kv_seq_len >= q_seq_len) {
+            max_k = base_position + qi;
+            if (max_k >= kv_seq_len) max_k = kv_seq_len - 1;
+        }
+
+        static thread_local std::vector<float> scores;
+        static thread_local std::vector<float> acc;
+        if (scores.size() < kv_seq_len) {
+            scores.resize(kv_seq_len);
+        }
+        if (acc.size() < v_head_size) {
+            acc.resize(v_head_size);
+        }
+        std::fill(acc.begin(), acc.begin() + v_head_size, 0.0f);
+
+        float max_score = -std::numeric_limits<float>::infinity();
+        for (size_t ki = 0; ki <= max_k; ++ki) {
+            float dot = 0.0f;
+            for (size_t d = 0; d < qk_head_size; ++d) {
+                const size_t q_idx = b * q_stride0 + h * q_stride1 + qi * q_stride2 + d * q_stride3;
+                const size_t k_idx = b * k_stride0 + h * k_stride1 + ki * k_stride2 + d * k_stride3;
+                dot += q[q_idx] * k[k_idx];
+            }
+            const float s = dot * scale;
+            scores[ki] = s;
+            max_score = std::max(max_score, s);
+        }
+
+        float sum_exp = 0.0f;
+        for (size_t ki = 0; ki <= max_k; ++ki) {
+            const float e = std::exp(scores[ki] - max_score);
+            sum_exp += e;
+            for (size_t d = 0; d < v_head_size; ++d) {
+                const size_t v_idx = b * v_stride0 + h * v_stride1 + ki * v_stride2 + d * v_stride3;
+                acc[d] += e * v[v_idx];
+            }
+        }
+
+        const float inv_sum = 1.0f / sum_exp;
+        for (size_t d = 0; d < v_head_size; ++d) {
+            const size_t o_idx = b * o_stride0 + h * o_stride1 + qi * o_stride2 + d * o_stride3;
+            out[o_idx] = acc[d] * inv_sum;
+        }
+    };
+
+    pthreadpool_.parallelize_1d(task_count, worker);
 }
 
 void CpuBackend::rmsnorm(

@@ -83,7 +83,18 @@ public:
     ) override;
 
 private:
+    struct PackedRhsCacheEntry {
+        const void* data = nullptr;
+        size_t n = 0;
+        size_t k = 0;
+        DType dtype = DType::FP32;
+        std::vector<uint16_t> rhs_packed;
+    };
+
+    const std::vector<uint16_t>& get_or_create_packed_rhs_fp16(const Tensor& B, size_t n, size_t k);
+
     PThreadPool pthreadpool_;
+    std::vector<PackedRhsCacheEntry> packed_rhs_cache_;
 };
 
 }  // namespace mruntime

@@ -3,8 +3,6 @@
 #include <cmath>
 #include <stdexcept>
 
-#include "MLAS/include/mlas_float16.h"
-
 namespace mruntime {
 
 Tensor Tensor::empty(Shape shape, DType dtype) {
@@ -76,7 +74,7 @@ Tensor Tensor::to(DType target_dtype) const {
         const float* src_ptr = src.data_ptr<float>();
         uint16_t* dst_ptr = result.data_ptr<uint16_t>();
         for (size_t i = 0; i < n; ++i) {
-            dst_ptr[i] = MLAS_Float2Half(src_ptr[i]);
+            dst_ptr[i] = float_to_fp16_bits(src_ptr[i]);
         }
     }
     // FP16 -> FP32
@@ -84,7 +82,7 @@ Tensor Tensor::to(DType target_dtype) const {
         const uint16_t* src_ptr = src.data_ptr<uint16_t>();
         float* dst_ptr = result.data_ptr<float>();
         for (size_t i = 0; i < n; ++i) {
-            dst_ptr[i] = MLAS_Half2Float(src_ptr[i]);
+            dst_ptr[i] = fp16_bits_to_float(src_ptr[i]);
         }
     }
     // FP32 -> BF16

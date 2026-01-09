@@ -16,8 +16,6 @@
 
 #include <nlohmann/json.hpp>
 
-#include "MLAS/include/mlas_float16.h"
-
 namespace mruntime {
 
 namespace {

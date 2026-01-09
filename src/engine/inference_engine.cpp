@@ -39,10 +39,8 @@ std::vector<int> InferenceEngine::generate(
         return output_tokens;
     }
 
-    // IMPORTANT: We intentionally avoid a multi-token prefill pass because the
-    // current MLAS FlashAttention path does not implement causal masking.
-    // Feeding the prompt one token at a time produces correct KV-cache context
-    // for autoregressive decoding (at the cost of speed).
+    // NOTE: We prefill the KV-cache one token at a time to match the
+    // incremental decoding path (at the cost of speed).
     Tensor logits;
     logits = model_.forward(backend_, {prompt_tokens[0]}, kv_cache_);
     for (size_t i = 1; i < prompt_tokens.size(); ++i) {

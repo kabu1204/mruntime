@@ -67,15 +67,11 @@ set(CMAKE_SKIP_INSTALL_RULES TRUE)
 FetchContent_MakeAvailable(spdlog absl re2 nlohmann_json pthreadpool kleidiai)
 set(CMAKE_SKIP_INSTALL_RULES "${_MRUNTIME_PREV_SKIP_INSTALL_RULES}")
 
-# MLAS setup
-set(MLAS_DIR "${CMAKE_SOURCE_DIR}/MLAS")
-set(MLAS_INCLUDE_DIR "${MLAS_DIR}/include")
-set(MLAS_LIB_DIR "${MLAS_DIR}/install/lib")
-
 # Core library sources
 set(MRUNTIME_CORE_SOURCES
     src/core/tensor.cpp
     src/core/cpu_backend.cpp
+    src/core/kai_gemm.cpp
 )
 
 set(MRUNTIME_LOADER_SOURCES
@@ -110,12 +106,7 @@ target_include_directories(mruntime PUBLIC
 )
 
 target_include_directories(mruntime PRIVATE
-    ${MLAS_INCLUDE_DIR}
     ${CMAKE_SOURCE_DIR}
-)
-
-target_link_directories(mruntime PRIVATE
-    ${MLAS_LIB_DIR}
 )
 
 target_link_libraries(mruntime
@@ -126,9 +117,11 @@ target_link_libraries(mruntime
         kleidiai
     PRIVATE
         nlohmann_json::nlohmann_json
-        onnxruntime_mlas
-        onnxruntime_common
 )
+
+if((CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64" OR CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64") AND NOT MSVC)
+    set_source_files_properties(src/core/kai_gemm.cpp PROPERTIES COMPILE_OPTIONS "-march=armv8.2-a+fp16")
+endif()
 
 # Platform-specific settings
 if(APPLE)
@@ -157,6 +150,4 @@ if(MRUNTIME_BUILD_CLI)
         ${CMAKE_SOURCE_DIR}/include
         ${CMAKE_SOURCE_DIR}/src/tokenizer
     )
-    target_link_directories(mruntime_chat PRIVATE ${MLAS_LIB_DIR})
-    target_link_libraries(mruntime_chat PRIVATE onnxruntime_mlas onnxruntime_common)
 endif()

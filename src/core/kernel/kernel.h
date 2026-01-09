@@ -1,5 +1,7 @@
-#include "mlas.h"
-#include "mlas_float16.h"
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
 
 namespace mruntime {
 
@@ -23,10 +25,13 @@ struct FlashAttentionArgs {
     int strides_out[4];
 };
 
-void
-FlashAttentionStrided(
-    void* argptr,
-    uint64_t task_id
-);
+struct FlashAttentionStridedContext {
+    const FlashAttentionArgs* args = nullptr;
+    size_t task_count = 0;
+    float* buffer = nullptr;
+    size_t buffer_size_per_task = 0;  // bytes
+};
+
+void FlashAttentionStrided(void* argptr, size_t task_id);
 
 }  // namespace mruntime

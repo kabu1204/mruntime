@@ -1,65 +1,56 @@
 #include "kernel.h"
-#include "thread_pool.h"
+
+#include <algorithm>
+#include <cmath>
 #include <cstddef>
-#include <mlas.h>
+#include <limits>
 
 namespace mruntime {
 
-void
-FlashAttentionStrided(
-    const FlashAttentionArgs* args,
-    ptrdiff_t task_id,
-    ptrdiff_t task_count,
-    float* buffer,
-    ptrdiff_t buffer_size_per_task
-);
+namespace {
 
-class FlashAttentionStridedTask : public Task {
-public:
-    FlashAttentionStridedTask() : {}
-    void Run() override {
-        FlashAttentionStrided(args_, task_id_, 
-            task_count_, buffer_, 
-            buffer_size_per_task_);
+inline size_t idx4(const int strides[4], size_t i0, size_t i1, size_t i2, size_t i3) {
+    return static_cast<size_t>(strides[0]) * i0 + static_cast<size_t>(strides[1]) * i1 +
+           static_cast<size_t>(strides[2]) * i2 + static_cast<size_t>(strides[3]) * i3;
+}
+
+void FlashAttentionStridedImpl(
+    const FlashAttentionArgs* args,
+    size_t task_id,
+    size_t task_count,
+    float* buffer,
+    size_t buffer_size_per_task
+) {
+    if (args == nullptr || buffer == nullptr || task_count == 0) {
+        return;
     }
-private:
-    const FlashAttentionArgs* args_;
-    ptrdiff_t task_id_;
-    float* buffer_;
-    ptrdiff_t task_count_;
-    size_t buffer_size_per_task_;
-};
 
-// favor B,H,S,D layout
-void
-FlashAttentionStrided(
-    const FlashAttentionArgs* args,
-    ptrdiff_t task_id,
-    ptrdiff_t task_count,
-    float* buffer,
-    ptrdiff_t buffer_size_per_task
-)
-{
-    ptrdiff_t q_block_size = static_cast<ptrdiff_t>(args->q_block_size);
-    ptrdiff_t kv_block_size = static_cast<ptrdiff_t>(args->kv_block_size);
-    ptrdiff_t batch_size = static_cast<ptrdiff_t>(args->batch_size);
-    ptrdiff_t num_heads = static_cast<ptrdiff_t>(args->num_heads);
-    ptrdiff_t q_sequence_length = static_cast<ptrdiff_t>(args->q_sequence_length);
-    ptrdiff_t kv_sequence_length = static_cast<ptrdiff_t>(args->kv_sequence_length);
-    ptrdiff_t qk_head_size = static_cast<ptrdiff_t>(args->qk_head_size);
-    ptrdiff_t v_head_size = static_cast<ptrdiff_t>(args->v_head_size);
+    const size_t q_block_size = static_cast<size_t>(args->q_block_size);
+    const size_t kv_block_size = static_cast<size_t>(args->kv_block_size);
+    const size_t batch_size = static_cast<size_t>(args->batch_size);
+    const size_t num_heads = static_cast<size_t>(args->num_heads);
+    const size_t q_sequence_length = static_cast<size_t>(args->q_sequence_length);
+    const size_t kv_sequence_length = static_cast<size_t>(args->kv_sequence_length);
+    const size_t qk_head_size = static_cast<size_t>(args->qk_head_size);
+    const size_t v_head_size = static_cast<size_t>(args->v_head_size);
+
     const float* query = args->query;
     const float* key = args->key;
     const float* value = args->value;
     float* output = args->output;
 
-    ptrdiff_t q_chunk_count = (q_sequence_length + (q_block_size - 1)) / q_block_size;
+    if (q_block_size == 0 || kv_block_size == 0 || qk_head_size == 0 || v_head_size == 0) {
+        return;
+    }
 
-    ptrdiff_t task_start = 0;
-    ptrdiff_t task_end = 0;
-    ptrdiff_t total_task_count = batch_size * num_heads * q_chunk_count;
-    ptrdiff_t quotient = total_task_count / task_count;
-    ptrdiff_t remainder = total_task_count % task_count;
+    const size_t q_chunk_count = (q_sequence_length + q_block_size - 1) / q_block_size;
+    const size_t total_task_count = batch_size * num_heads * q_chunk_count;
+
+    const size_t quotient = total_task_count / task_count;
+    const size_t remainder = total_task_count % task_count;
+
+    size_t task_start = 0;
+    size_t task_end = 0;
     if (task_id < remainder) {
         task_start = (quotient + 1) * task_id;
         task_end = task_start + quotient + 1;
@@ -68,113 +59,115 @@ FlashAttentionStrided(
         task_end = task_start + quotient;
     }
 
-    for (ptrdiff_t task_index = task_start; task_index < task_end; ++task_index) {
-        ptrdiff_t batch_idx = task_index;
-        ptrdiff_t q_idx = (batch_idx % q_chunk_count) * q_block_size;
-        batch_idx /= q_chunk_count;
-        ptrdiff_t head_idx = batch_idx % num_heads;
-        batch_idx /= num_heads;
+    auto* buffer_current_task = reinterpret_cast<std::byte*>(buffer) + task_id * buffer_size_per_task;
+    float* l = reinterpret_cast<float*>(buffer_current_task);
+    float* m = l + q_block_size;
+    float* intermediate = m + q_block_size;
+    float* temp_output = intermediate + q_block_size * kv_block_size;
 
-        char* buffer_current_task = reinterpret_cast<char*>(buffer) + task_id * buffer_size_per_task;
-        float* l = reinterpret_cast<float*>(buffer_current_task);
-        float* m = l + q_block_size;
-        for (ptrdiff_t t = 0; t < q_block_size; ++t) {
-            m[t] = std::numeric_limits<float>::lowest();
+    for (size_t i = 0; i < q_block_size; ++i) {
+        l[i] = 0.0f;
+        m[i] = -std::numeric_limits<float>::infinity();
+    }
+    std::fill(temp_output, temp_output + (q_block_size * v_head_size), 0.0f);
+
+    for (size_t task_index = task_start; task_index < task_end; ++task_index) {
+        size_t t = task_index;
+        const size_t q_idx = (t % q_chunk_count) * q_block_size;
+        t /= q_chunk_count;
+        const size_t head_idx = t % num_heads;
+        const size_t batch_idx = t / num_heads;
+
+        const size_t row_size_q = std::min(q_block_size, q_sequence_length - q_idx);
+
+        // Reset per-chunk stats.
+        for (size_t i = 0; i < row_size_q; ++i) {
+            l[i] = 0.0f;
+            m[i] = -std::numeric_limits<float>::infinity();
         }
-        float* intermediate = m + q_block_size;
-        float* temp_output = intermediate + q_block_size * kv_block_size;
-        float negmax = 0;
+        std::fill(temp_output, temp_output + (row_size_q * v_head_size), 0.0f);
 
-        for (ptrdiff_t ir = 0; ir < kv_sequence_length; ir += kv_block_size) {
-            /*
-                S = Q[batch_idx, head_idx, q_idx:q_idx+q_block_size, :] * (K[batch_idx, head_idx, ir:ir+kv_block_size, :]).T
-                old_m = m
-                m = max(m, rowmax(S))
-                diff = old_m - m
-                S = exp(S - m)
-                l = exp(diff) * l + rowsum(S)
-                O = diag(exp(diff)) * O + S * V[batch_idx, head_idx, ir:ir+kv_block_size, :]
-            */
-            ptrdiff_t h = batch_idx * num_heads + head_idx;
-            const float* inputQ = query + (h * q_sequence_length + q_idx) * qk_head_size;
-            const float* inputK = key + (h * kv_sequence_length + ir) * qk_head_size;
-            const float* inputV = value + (h * kv_sequence_length + ir) * v_head_size;
+        for (size_t ir = 0; ir < kv_sequence_length; ir += kv_block_size) {
+            const size_t row_size_kv = std::min(kv_block_size, kv_sequence_length - ir);
 
-            size_t row_size_q_capped = static_cast<size_t>(std::min(q_block_size, q_sequence_length - q_idx));
-            size_t row_size_kv_capped = static_cast<size_t>(std::min(kv_block_size, kv_sequence_length - ir));
-
-            MlasSgemmOperation(CBLAS_TRANSPOSE::CblasNoTrans,
-                        CBLAS_TRANSPOSE::CblasTrans,
-                        row_size_q_capped,
-                        row_size_kv_capped,
-                        static_cast<size_t>(qk_head_size),
-                        args->scale,
-                        inputQ,
-                        static_cast<size_t>(qk_head_size),
-                        inputK,
-                        static_cast<size_t>(qk_head_size),
-                        0.0f,
-                        intermediate,
-                        row_size_kv_capped);
-
-            for (ptrdiff_t irow = 0; irow < static_cast<ptrdiff_t>(row_size_q_capped); ++irow) {
-                float* p = intermediate + irow * row_size_kv_capped;
-
-#if defined(MLAS_TARGET_AMD64) || defined(MLAS_TARGET_LARCH64)
-                float rowmax = mlas_platform.ReduceMaximumF32Kernel(p, row_size_kv_capped);
-#else
-                float rowmax = MlasReduceMaximumF32Kernel(p, row_size_kv_capped);
-#endif
-                float m_diff = m[irow];
-                m[irow] = std::max(m[irow], rowmax);  // new m
-                negmax = -m[irow];
-                m_diff -= m[irow];  // old - new (less than 0)
-
-#if defined(MLAS_TARGET_AMD64)
-                float rowsum = mlas_platform.ComputeSumExpF32Kernel(p, p, row_size_kv_capped, &negmax);
-#else
-                float rowsum = MlasComputeSumExpF32Kernel(p, p, row_size_kv_capped, &negmax);
-#endif
-
-                // Note: for ir == 0, there is actually no need to calculate exp_diff
-                if (ir != 0) {
-                    float exp_diff = std::exp(m_diff);
-                    l[irow] = exp_diff * l[irow] + rowsum;
-
-                    for (ptrdiff_t icol = 0; icol < v_head_size; ++icol) {
-                        temp_output[irow * v_head_size + icol] = exp_diff * temp_output[irow * v_head_size + icol];
+            // Compute scores S = scale * Q * K^T.
+            for (size_t irow = 0; irow < row_size_q; ++irow) {
+                float* p = intermediate + irow * row_size_kv;
+                for (size_t j = 0; j < row_size_kv; ++j) {
+                    float dot = 0.0f;
+                    for (size_t d = 0; d < qk_head_size; ++d) {
+                        const size_t q_off = idx4(args->strides_q, batch_idx, head_idx, q_idx + irow, d);
+                        const size_t k_off = idx4(args->strides_k, batch_idx, head_idx, ir + j, d);
+                        dot += query[q_off] * key[k_off];
                     }
-                } else {
-                    l[irow] = rowsum;
-                    // When ir == 0, there is no need to scale the old result because it is zero.
+                    p[j] = dot * args->scale;
                 }
             }
-            MlasSgemmOperation(CBLAS_TRANSPOSE::CblasNoTrans,
-                        CBLAS_TRANSPOSE::CblasNoTrans,
-                        row_size_q_capped,
-                        static_cast<size_t>(v_head_size),
-                        row_size_kv_capped,
-                        1.0f,
-                        intermediate,
-                        row_size_kv_capped,
-                        inputV,
-                        static_cast<size_t>(v_head_size),
-                        ir == 0 ? 0.0f : 1.0f,
-                        temp_output,
-                        static_cast<size_t>(v_head_size));
+
+            // Online softmax update.
+            for (size_t irow = 0; irow < row_size_q; ++irow) {
+                float* p = intermediate + irow * row_size_kv;
+
+                float rowmax = -std::numeric_limits<float>::infinity();
+                for (size_t j = 0; j < row_size_kv; ++j) {
+                    rowmax = std::max(rowmax, p[j]);
+                }
+
+                const float old_m = m[irow];
+                const float new_m = std::max(old_m, rowmax);
+                const float exp_diff = std::exp(old_m - new_m);
+                m[irow] = new_m;
+
+                float rowsum = 0.0f;
+                for (size_t j = 0; j < row_size_kv; ++j) {
+                    const float e = std::exp(p[j] - new_m);
+                    p[j] = e;
+                    rowsum += e;
+                }
+
+                l[irow] = exp_diff * l[irow] + rowsum;
+
+                float* out_row = temp_output + irow * v_head_size;
+                for (size_t d = 0; d < v_head_size; ++d) {
+                    out_row[d] *= exp_diff;
+                }
+            }
+
+            // Accumulate: O += S * V
+            for (size_t irow = 0; irow < row_size_q; ++irow) {
+                const float* p = intermediate + irow * row_size_kv;
+                float* out_row = temp_output + irow * v_head_size;
+                for (size_t j = 0; j < row_size_kv; ++j) {
+                    const float w = p[j];
+                    for (size_t d = 0; d < v_head_size; ++d) {
+                        const size_t v_off = idx4(args->strides_v, batch_idx, head_idx, ir + j, d);
+                        out_row[d] += w * value[v_off];
+                    }
+                }
+            }
         }
 
-        float* output_row = output + ((batch_idx * q_sequence_length + q_idx) * num_heads + head_idx) * v_head_size;
-        ptrdiff_t row_size_q_valid = std::min(q_block_size, q_sequence_length - q_idx);
-        // TODO: leverage advanced instruction sets
-        for (ptrdiff_t irow = 0; irow < row_size_q_valid; ++irow) {
-            for (ptrdiff_t icol = 0; icol < v_head_size; ++icol) {
-                output_row[icol] = temp_output[irow * v_head_size + icol] / l[irow];
+        // Write output: O = temp_output / l.
+        for (size_t irow = 0; irow < row_size_q; ++irow) {
+            const float inv_l = 1.0f / l[irow];
+            for (size_t d = 0; d < v_head_size; ++d) {
+                const size_t out_off = idx4(args->strides_out, batch_idx, head_idx, q_idx + irow, d);
+                output[out_off] = temp_output[irow * v_head_size + d] * inv_l;
             }
-            output_row += num_heads * v_head_size;
         }
     }
 }
-    
+
+}  // namespace
+
+void FlashAttentionStrided(void* argptr, size_t task_id) {
+    auto* ctx = static_cast<FlashAttentionStridedContext*>(argptr);
+    if (ctx == nullptr) {
+        return;
+    }
+
+    FlashAttentionStridedImpl(ctx->args, task_id, ctx->task_count, ctx->buffer, ctx->buffer_size_per_task);
+}
+
 
 }  // namespace mruntime
