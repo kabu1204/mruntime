@@ -87,7 +87,7 @@ private:
         const void* data = nullptr;
         size_t n = 0;
         size_t k = 0;
-        DType dtype = DType::FP32;
+        DType dtype = DType::FP16;
         std::vector<uint16_t> rhs_packed;
     };
 

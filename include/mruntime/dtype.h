@@ -166,4 +166,31 @@ inline float bf16_to_float(uint16_t bf16) {
     return f;
 }
 
+inline float load_scalar_as_fp32(const void* data, DType dtype, size_t index) {
+    switch (dtype) {
+        case DType::FP32:
+            return static_cast<const float*>(data)[index];
+        case DType::BF16:
+            return bf16_to_float(static_cast<const uint16_t*>(data)[index]);
+        case DType::FP16:
+            return fp16_bits_to_float(static_cast<const uint16_t*>(data)[index]);
+    }
+    throw std::invalid_argument("Unknown dtype");
+}
+
+inline void store_scalar_from_fp32(void* data, DType dtype, size_t index, float value) {
+    switch (dtype) {
+        case DType::FP32:
+            static_cast<float*>(data)[index] = value;
+            return;
+        case DType::BF16:
+            static_cast<uint16_t*>(data)[index] = float_to_bf16(value);
+            return;
+        case DType::FP16:
+            static_cast<uint16_t*>(data)[index] = float_to_fp16_bits(value);
+            return;
+    }
+    throw std::invalid_argument("Unknown dtype");
+}
+
 }  // namespace mruntime

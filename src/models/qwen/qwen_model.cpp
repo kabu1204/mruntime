@@ -59,7 +59,7 @@ void QwenEmbedding::load_weights(const SafeTensorsFile& file, const std::string&
 
 Tensor QwenEmbedding::forward(Backend& backend, const std::vector<int>& token_ids) {
     size_t hidden_size = embed_tokens_.dim(1);
-    Tensor output = Tensor::empty(Shape({1, token_ids.size(), hidden_size}), DType::FP32);
+    Tensor output = Tensor::empty(Shape({1, token_ids.size(), hidden_size}), RuntimeFormats::kActivation);
     backend.embedding_lookup(embed_tokens_, token_ids, output);
     return output;
 }
@@ -88,15 +88,16 @@ void QwenAttention::load_weights(const SafeTensorsFile& file, const std::string&
     v_proj_ = file.load_tensor_copy(prefix + ".v_proj.weight");
     o_proj_ = file.load_tensor_copy(prefix + ".o_proj.weight");
 
-    // Qwen2.5 includes q/k/v biases (BF16 in the provided model). Convert to FP32 once.
+    // Qwen2.5 includes q/k/v biases (BF16 in the provided model). Convert to the
+    // runtime activation dtype once.
     if (file.has_tensor(prefix + ".q_proj.bias")) {
-        q_bias_ = file.load_tensor_copy(prefix + ".q_proj.bias", DType::FP32);
+        q_bias_ = file.load_tensor_copy(prefix + ".q_proj.bias", RuntimeFormats::kActivation);
     }
     if (file.has_tensor(prefix + ".k_proj.bias")) {
-        k_bias_ = file.load_tensor_copy(prefix + ".k_proj.bias", DType::FP32);
+        k_bias_ = file.load_tensor_copy(prefix + ".k_proj.bias", RuntimeFormats::kActivation);
     }
     if (file.has_tensor(prefix + ".v_proj.bias")) {
-        v_bias_ = file.load_tensor_copy(prefix + ".v_proj.bias", DType::FP32);
+        v_bias_ = file.load_tensor_copy(prefix + ".v_proj.bias", RuntimeFormats::kActivation);
     }
 }
 
@@ -114,10 +115,13 @@ Tensor QwenAttention::forward(
     size_t num_kv_heads = config_.num_kv_heads;
     size_t head_dim = config_.head_dim();
 
+    assert(hidden_states.dtype() == RuntimeFormats::kActivation);
+    assert(batch == 1);
+
     // Compute Q, K, V projections
-    Tensor Q_proj = Tensor::empty(Shape({batch, seq_len, num_heads * head_dim}), DType::FP32);
-    Tensor K_proj = Tensor::empty(Shape({batch, seq_len, num_kv_heads * head_dim}), DType::FP32);
-    Tensor V_proj = Tensor::empty(Shape({batch, seq_len, num_kv_heads * head_dim}), DType::FP32);
+    Tensor Q_proj = Tensor::empty(Shape({batch, seq_len, num_heads * head_dim}), RuntimeFormats::kActivation);
+    Tensor K_proj = Tensor::empty(Shape({batch, seq_len, num_kv_heads * head_dim}), RuntimeFormats::kActivation);
+    Tensor V_proj = Tensor::empty(Shape({batch, seq_len, num_kv_heads * head_dim}), RuntimeFormats::kActivation);
 
     backend.gemm(hidden_states, q_proj_, Q_proj, 1.0f, 0.0f, false, true);
     backend.gemm(hidden_states, k_proj_, K_proj, 1.0f, 0.0f, false, true);
@@ -127,19 +131,21 @@ Tensor QwenAttention::forward(
         if (bias.data() == nullptr || bias.numel() == 0) {
             return;
         }
-        assert(out.dtype() == DType::FP32);
-        assert(bias.dtype() == DType::FP32);
         assert(bias.ndim() == 1);
         const size_t out_features = bias.dim(0);
         assert(out.dim(out.ndim() - 1) == out_features);
 
-        float* out_ptr = out.data_ptr<float>();
-        const float* b = bias.data_ptr<float>();
+        void* out_data = out.data();
+        const void* b_data = bias.data();
+        const DType out_dtype = out.dtype();
+        const DType b_dtype = bias.dtype();
         const size_t rows = out.numel() / out_features;
         for (size_t r = 0; r < rows; ++r) {
-            float* row = out_ptr + r * out_features;
             for (size_t i = 0; i < out_features; ++i) {
-                row[i] += b[i];
+                const size_t out_idx = r * out_features + i;
+                float v = load_scalar_as_fp32(out_data, out_dtype, out_idx);
+                v += load_scalar_as_fp32(b_data, b_dtype, i);
+                store_scalar_from_fp32(out_data, out_dtype, out_idx, v);
             }
         }
     };
@@ -150,27 +156,55 @@ Tensor QwenAttention::forward(
 
     // Reshape to [batch, seq_len, num_heads, head_dim] for RoPE
     // Note: from_buffer creates a non-owning view, but Q_proj/K_proj/V_proj stay alive
-    Tensor Q = Tensor::from_buffer(Q_proj.data(), Shape({batch, seq_len, num_heads, head_dim}), DType::FP32);
-    Tensor K = Tensor::from_buffer(K_proj.data(), Shape({batch, seq_len, num_kv_heads, head_dim}), DType::FP32);
-    Tensor V = Tensor::from_buffer(V_proj.data(), Shape({batch, seq_len, num_kv_heads, head_dim}), DType::FP32);
+    Tensor Q = Tensor::from_buffer(Q_proj.data(), Shape({batch, seq_len, num_heads, head_dim}), Q_proj.dtype());
+    Tensor K = Tensor::from_buffer(K_proj.data(), Shape({batch, seq_len, num_kv_heads, head_dim}), K_proj.dtype());
+    Tensor V = Tensor::from_buffer(V_proj.data(), Shape({batch, seq_len, num_kv_heads, head_dim}), V_proj.dtype());
 
     rope_.apply(backend, Q, K, position_offset);
 
     Tensor& key_cache = kv_cache.key_cache[layer_idx];
     Tensor& value_cache = kv_cache.value_cache[layer_idx];
 
-    float* k_cache_ptr = key_cache.data_ptr<float>();
-    float* v_cache_ptr = value_cache.data_ptr<float>();
-    const float* k_ptr = K.data_ptr<float>();
-    const float* v_ptr = V.data_ptr<float>();
+    assert(key_cache.dtype() == value_cache.dtype());
+    const DType cache_dtype = key_cache.dtype();
+    const DType k_dtype = K.dtype();
+    const DType v_dtype = V.dtype();
+
+    void* k_cache_ptr = key_cache.data();
+    void* v_cache_ptr = value_cache.data();
+    const void* k_ptr = K.data();
+    const void* v_ptr = V.data();
 
     size_t kv_cache_stride = key_cache.dim(2) * head_dim;
     for (size_t h = 0; h < num_kv_heads; ++h) {
         for (size_t s = 0; s < seq_len; ++s) {
             size_t cache_offset = h * kv_cache_stride + (position_offset + s) * head_dim;
             size_t input_offset = (s * num_kv_heads + h) * head_dim;
-            std::memcpy(k_cache_ptr + cache_offset, k_ptr + input_offset, head_dim * sizeof(float));
-            std::memcpy(v_cache_ptr + cache_offset, v_ptr + input_offset, head_dim * sizeof(float));
+            if (cache_dtype == k_dtype) {
+                std::memcpy(
+                    static_cast<char*>(k_cache_ptr) + cache_offset * dtype_size(cache_dtype),
+                    static_cast<const char*>(k_ptr) + input_offset * dtype_size(k_dtype),
+                    head_dim * dtype_size(cache_dtype)
+                );
+            } else {
+                for (size_t d = 0; d < head_dim; ++d) {
+                    float v = load_scalar_as_fp32(k_ptr, k_dtype, input_offset + d);
+                    store_scalar_from_fp32(k_cache_ptr, cache_dtype, cache_offset + d, v);
+                }
+            }
+
+            if (cache_dtype == v_dtype) {
+                std::memcpy(
+                    static_cast<char*>(v_cache_ptr) + cache_offset * dtype_size(cache_dtype),
+                    static_cast<const char*>(v_ptr) + input_offset * dtype_size(v_dtype),
+                    head_dim * dtype_size(cache_dtype)
+                );
+            } else {
+                for (size_t d = 0; d < head_dim; ++d) {
+                    float v = load_scalar_as_fp32(v_ptr, v_dtype, input_offset + d);
+                    store_scalar_from_fp32(v_cache_ptr, cache_dtype, cache_offset + d, v);
+                }
+            }
         }
     }
 
@@ -181,7 +215,7 @@ Tensor QwenAttention::forward(
     Tensor Q_heads = Q.permute({0, 2, 1, 3});
 
     size_t heads_per_kv = num_heads / num_kv_heads;
-    Tensor attn_output = Tensor::empty(Shape({batch, num_heads, seq_len, head_dim}), DType::FP32);
+    Tensor attn_output = Tensor::empty(Shape({batch, num_heads, seq_len, head_dim}), RuntimeFormats::kActivation);
 
     float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
 
@@ -189,12 +223,12 @@ Tensor QwenAttention::forward(
         // Get K, V slices from cache - key_cache shape is [batch, num_kv_heads, max_seq_len, head_dim]
         Tensor K_cache_slice = key_cache.slice(1, kv_h, kv_h + 1);
         Tensor K_slice = Tensor::from_buffer(K_cache_slice.data(),
-            Shape({batch, 1, key_cache.dim(2), head_dim}), DType::FP32);
+            Shape({batch, 1, key_cache.dim(2), head_dim}), key_cache.dtype());
         K_slice = K_slice.slice(2, 0, total_seq_len);
 
         Tensor V_cache_slice = value_cache.slice(1, kv_h, kv_h + 1);
         Tensor V_slice = Tensor::from_buffer(V_cache_slice.data(),
-            Shape({batch, 1, value_cache.dim(2), head_dim}), DType::FP32);
+            Shape({batch, 1, value_cache.dim(2), head_dim}), value_cache.dtype());
         V_slice = V_slice.slice(2, 0, total_seq_len);
 
         for (size_t h_offset = 0; h_offset < heads_per_kv; ++h_offset) {
@@ -202,11 +236,11 @@ Tensor QwenAttention::forward(
 
             Tensor Q_head_slice = Q_heads.slice(1, q_h, q_h + 1);
             Tensor Q_head = Tensor::from_buffer(Q_head_slice.data(),
-                Shape({batch, 1, seq_len, head_dim}), DType::FP32);
+                Shape({batch, 1, seq_len, head_dim}), Q_heads.dtype());
 
             Tensor out_slice = attn_output.slice(1, q_h, q_h + 1);
             Tensor out_head = Tensor::from_buffer(out_slice.data(),
-                Shape({batch, 1, seq_len, head_dim}), DType::FP32);
+                Shape({batch, 1, seq_len, head_dim}), attn_output.dtype());
 
             backend.flash_attention(Q_head, K_slice, V_slice, out_head, scale, true);
         }
@@ -216,9 +250,9 @@ Tensor QwenAttention::forward(
     // then reshape to [batch, seq_len, num_heads * head_dim]
     Tensor attn_transposed = attn_output.permute({0, 2, 1, 3});
     Tensor attn_flat = Tensor::from_buffer(attn_transposed.data(),
-        Shape({batch, seq_len, num_heads * head_dim}), DType::FP32);
+        Shape({batch, seq_len, num_heads * head_dim}), attn_transposed.dtype());
 
-    Tensor output = Tensor::empty(Shape({batch, seq_len, hidden_size}), DType::FP32);
+    Tensor output = Tensor::empty(Shape({batch, seq_len, hidden_size}), RuntimeFormats::kActivation);
     backend.gemm(attn_flat, o_proj_, output, 1.0f, 0.0f, false, true);
 
     return output;
@@ -238,19 +272,19 @@ Tensor QwenMLP::forward(Backend& backend, const Tensor& input) {
     size_t intermediate_size = config_.intermediate_size;
     size_t hidden_size = config_.hidden_size;
 
-    Tensor gate = Tensor::empty(Shape({batch, seq_len, intermediate_size}), DType::FP32);
-    Tensor up = Tensor::empty(Shape({batch, seq_len, intermediate_size}), DType::FP32);
+    Tensor gate = Tensor::empty(Shape({batch, seq_len, intermediate_size}), RuntimeFormats::kActivation);
+    Tensor up = Tensor::empty(Shape({batch, seq_len, intermediate_size}), RuntimeFormats::kActivation);
 
     backend.gemm(input, gate_proj_, gate, 1.0f, 0.0f, false, true);
     backend.gemm(input, up_proj_, up, 1.0f, 0.0f, false, true);
 
-    Tensor gate_activated = Tensor::empty(gate.shape(), DType::FP32);
+    Tensor gate_activated = Tensor::empty(gate.shape(), RuntimeFormats::kActivation);
     backend.silu(gate, gate_activated);
 
-    Tensor gated = Tensor::empty(gate.shape(), DType::FP32);
+    Tensor gated = Tensor::empty(gate.shape(), RuntimeFormats::kActivation);
     backend.elementwise_mul(gate_activated, up, gated);
 
-    Tensor output = Tensor::empty(Shape({batch, seq_len, hidden_size}), DType::FP32);
+    Tensor output = Tensor::empty(Shape({batch, seq_len, hidden_size}), RuntimeFormats::kActivation);
     backend.gemm(gated, down_proj_, output, 1.0f, 0.0f, false, true);
 
     return output;
@@ -273,20 +307,20 @@ Tensor QwenBlock::forward(
     size_t layer_idx,
     size_t position_offset
 ) {
-    Tensor normed = Tensor::empty(hidden_states.shape(), DType::FP32);
+    Tensor normed = Tensor::empty(hidden_states.shape(), RuntimeFormats::kActivation);
     input_layernorm_.forward(backend, hidden_states, normed, config_.rms_norm_eps);
 
     Tensor attn_output = self_attn_.forward(backend, normed, kv_cache, layer_idx, position_offset);
 
-    Tensor residual1 = Tensor::empty(hidden_states.shape(), DType::FP32);
+    Tensor residual1 = Tensor::empty(hidden_states.shape(), RuntimeFormats::kActivation);
     backend.add(hidden_states, attn_output, residual1);
 
-    Tensor normed2 = Tensor::empty(residual1.shape(), DType::FP32);
+    Tensor normed2 = Tensor::empty(residual1.shape(), RuntimeFormats::kActivation);
     post_attention_layernorm_.forward(backend, residual1, normed2, config_.rms_norm_eps);
 
     Tensor mlp_output = mlp_.forward(backend, normed2);
 
-    Tensor output = Tensor::empty(hidden_states.shape(), DType::FP32);
+    Tensor output = Tensor::empty(hidden_states.shape(), RuntimeFormats::kActivation);
     backend.add(residual1, mlp_output, output);
 
     return output;
@@ -331,12 +365,12 @@ Tensor QwenModel::forward(
         hidden_states = layers_[i].forward(backend, hidden_states, kv_cache, i, position_offset);
     }
 
-    Tensor normed = Tensor::empty(hidden_states.shape(), DType::FP32);
+    Tensor normed = Tensor::empty(hidden_states.shape(), RuntimeFormats::kActivation);
     norm_.forward(backend, hidden_states, normed, config_.rms_norm_eps);
 
     size_t batch = normed.dim(0);
     size_t seq_len = normed.dim(1);
-    Tensor logits = Tensor::empty(Shape({batch, seq_len, config_.vocab_size}), DType::FP32);
+    Tensor logits = Tensor::empty(Shape({batch, seq_len, config_.vocab_size}), RuntimeFormats::kLogits);
     backend.gemm(normed, lm_head_, logits, 1.0f, 0.0f, false, true);
 
     return logits;

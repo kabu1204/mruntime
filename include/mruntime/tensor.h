@@ -122,7 +122,7 @@ private:
           data_(data), owns_data_(owns_data) {}
 
     Shape shape_;
-    DType dtype_ = DType::FP32;
+    DType dtype_ = DType::FP16;
     std::shared_ptr<std::byte[]> storage_;
     void* data_ = nullptr;
     bool owns_data_ = false;

@@ -7,9 +7,9 @@
 using namespace mruntime;
 
 double benchmark_gemm(CpuBackend& backend, size_t M, size_t N, size_t K, int iterations) {
-    Tensor A = Tensor::zeros(Shape({M, K}), DType::FP32);
-    Tensor B = Tensor::zeros(Shape({K, N}), DType::FP32);
-    Tensor C = Tensor::zeros(Shape({M, N}), DType::FP32);
+    Tensor A = Tensor::zeros(Shape({M, K}), DType::FP16);
+    Tensor B = Tensor::zeros(Shape({K, N}), DType::FP16);
+    Tensor C = Tensor::zeros(Shape({M, N}), DType::FP16);
 
     backend.gemm(A, B, C);
 
@@ -23,9 +23,9 @@ double benchmark_gemm(CpuBackend& backend, size_t M, size_t N, size_t K, int ite
 }
 
 double benchmark_rmsnorm(CpuBackend& backend, size_t batch, size_t seq_len, size_t hidden_size, int iterations) {
-    Tensor input = Tensor::zeros(Shape({batch, seq_len, hidden_size}), DType::FP32);
-    Tensor weight = Tensor::zeros(Shape({hidden_size}), DType::FP32);
-    Tensor output = Tensor::zeros(Shape({batch, seq_len, hidden_size}), DType::FP32);
+    Tensor input = Tensor::zeros(Shape({batch, seq_len, hidden_size}), DType::FP16);
+    Tensor weight = Tensor::zeros(Shape({hidden_size}), DType::FP16);
+    Tensor output = Tensor::zeros(Shape({batch, seq_len, hidden_size}), DType::FP16);
 
     backend.rmsnorm(input, weight, output, 1e-6f);
 

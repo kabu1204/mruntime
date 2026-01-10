@@ -55,7 +55,7 @@ void test_kv_cache_allocation() {
 
     KVCache cache;
     size_t max_seq_len = 128;
-    cache.allocate(config, max_seq_len, DType::FP32);
+    cache.allocate(config, max_seq_len);
 
     assert(cache.key_cache.size() == config.num_layers);
     assert(cache.value_cache.size() == config.num_layers);
@@ -100,7 +100,7 @@ void test_model_forward_shapes() {
     CpuBackend backend;
     KVCache cache;
     size_t max_seq_len = 128;
-    cache.allocate(config, max_seq_len, DType::FP32);
+    cache.allocate(config, max_seq_len);
 
     // Test with a small sequence
     std::vector<int> token_ids = {1, 2, 3, 4, 5};
@@ -111,7 +111,7 @@ void test_model_forward_shapes() {
     assert(logits.dim(0) == 1);
     assert(logits.dim(1) == token_ids.size());
     assert(logits.dim(2) == config.vocab_size);
-    assert(logits.dtype() == DType::FP32);
+    assert(logits.dtype() == RuntimeFormats::kLogits);
 
     // Check KV cache was updated
     assert(cache.seq_len == token_ids.size());
@@ -129,22 +129,24 @@ void test_model_forward_values() {
 
     CpuBackend backend;
     KVCache cache;
-    cache.allocate(config, 64, DType::FP32);
+    cache.allocate(config, 64);
 
     std::vector<int> token_ids = {151643};  // BOS token
     Tensor logits = model.forward(backend, token_ids, cache);
 
-    const float* logits_data = logits.data_ptr<float>();
+    const void* logits_data = logits.data();
+    const DType logits_dtype = logits.dtype();
 
     // Verify logits are finite and reasonable
     bool has_positive = false, has_negative = false;
     float max_val = -1e30f, min_val = 1e30f;
     for (size_t i = 0; i < config.vocab_size; ++i) {
-        assert(std::isfinite(logits_data[i]));
-        if (logits_data[i] > 0) has_positive = true;
-        if (logits_data[i] < 0) has_negative = true;
-        max_val = std::max(max_val, logits_data[i]);
-        min_val = std::min(min_val, logits_data[i]);
+        float v = load_scalar_as_fp32(logits_data, logits_dtype, i);
+        assert(std::isfinite(v));
+        if (v > 0) has_positive = true;
+        if (v < 0) has_negative = true;
+        max_val = std::max(max_val, v);
+        min_val = std::min(min_val, v);
     }
 
     assert(has_positive && has_negative);  // Should have varied outputs
@@ -163,7 +165,7 @@ void test_incremental_decoding() {
 
     CpuBackend backend;
     KVCache cache;
-    cache.allocate(config, 64, DType::FP32);
+    cache.allocate(config, 64);
 
     // Prefill with prompt
     std::vector<int> prompt = {151643, 100, 200};
@@ -203,7 +205,7 @@ void test_tied_embeddings() {
 
     CpuBackend backend;
     KVCache cache;
-    cache.allocate(config, 32, DType::FP32);
+    cache.allocate(config, 32);
 
     std::vector<int> tokens = {151643};
     Tensor logits = model.forward(backend, tokens, cache);

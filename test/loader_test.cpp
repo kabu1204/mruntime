@@ -71,18 +71,19 @@ void test_load_tensor_copy() {
     assert(copy_native.dtype() == DType::BF16);
     assert(copy_native.owns_data());
 
-    // Load with conversion to FP32
-    Tensor copy_fp32 = file->load_tensor_copy("model.norm.weight", DType::FP32);
-    assert(copy_fp32.dtype() == DType::FP32);
-    assert(copy_fp32.owns_data());
-    assert(copy_fp32.dim(0) == 896);
+    // Load with conversion to FP16 (runtime activation dtype)
+    Tensor copy_fp16 = file->load_tensor_copy("model.norm.weight", DType::FP16);
+    assert(copy_fp16.dtype() == DType::FP16);
+    assert(copy_fp16.owns_data());
+    assert(copy_fp16.dim(0) == 896);
 
     // Verify conversion produces reasonable values
-    const float* fp32_data = copy_fp32.data_ptr<float>();
+    const uint16_t* fp16_data = copy_fp16.data_ptr<uint16_t>();
     bool has_nonzero = false;
-    for (size_t i = 0; i < copy_fp32.numel(); ++i) {
-        assert(std::isfinite(fp32_data[i]));
-        if (fp32_data[i] != 0.0f) has_nonzero = true;
+    for (size_t i = 0; i < copy_fp16.numel(); ++i) {
+        float v = fp16_bits_to_float(fp16_data[i]);
+        assert(std::isfinite(v));
+        if (v != 0.0f) has_nonzero = true;
     }
     assert(has_nonzero);  // Weight should have non-zero values
 

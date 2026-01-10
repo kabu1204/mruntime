@@ -101,11 +101,22 @@ Tensor Tensor::to(DType target_dtype) const {
             dst_ptr[i] = bf16_to_float(src_ptr[i]);
         }
     }
-    // FP16 <-> BF16 (via FP32 intermediate)
-    else if ((dtype_ == DType::FP16 && target_dtype == DType::BF16) ||
-             (dtype_ == DType::BF16 && target_dtype == DType::FP16)) {
-        Tensor fp32 = src.to(DType::FP32);
-        return fp32.to(target_dtype);
+    // FP16 <-> BF16
+    else if (dtype_ == DType::FP16 && target_dtype == DType::BF16) {
+        const uint16_t* src_ptr = src.data_ptr<uint16_t>();
+        uint16_t* dst_ptr = result.data_ptr<uint16_t>();
+        for (size_t i = 0; i < n; ++i) {
+            float f = fp16_bits_to_float(src_ptr[i]);
+            dst_ptr[i] = float_to_bf16(f);
+        }
+    }
+    else if (dtype_ == DType::BF16 && target_dtype == DType::FP16) {
+        const uint16_t* src_ptr = src.data_ptr<uint16_t>();
+        uint16_t* dst_ptr = result.data_ptr<uint16_t>();
+        for (size_t i = 0; i < n; ++i) {
+            float f = bf16_to_float(src_ptr[i]);
+            dst_ptr[i] = float_to_fp16_bits(f);
+        }
     }
     else {
         throw std::runtime_error("Unsupported dtype conversion");

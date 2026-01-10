@@ -5,6 +5,7 @@
 
 #include "mruntime/backend.h"
 #include "mruntime/qwen_config.h"
+#include "mruntime/runtime_formats.h"
 #include "mruntime/safetensors.h"
 #include "mruntime/tensor.h"
 
@@ -15,7 +16,7 @@ struct KVCache {
     std::vector<Tensor> value_cache;
     size_t seq_len = 0;
 
-    void allocate(const QwenConfig& config, size_t max_seq_len, DType dtype = DType::FP32);
+    void allocate(const QwenConfig& config, size_t max_seq_len, DType dtype = RuntimeFormats::kKvCache);
     void reset() { seq_len = 0; }
 };
 
@@ -62,7 +63,7 @@ private:
     QwenConfig config_;
     Tensor q_proj_, k_proj_, v_proj_, o_proj_;
     // Qwen2.5 uses biases for q/k/v projections (o_proj has no bias).
-    // Store these as FP32 for compute convenience (they're tiny).
+    // Store these in the runtime activation dtype (they're tiny).
     Tensor q_bias_, k_bias_, v_bias_;
     QwenRotaryEmbedding rope_;
 };

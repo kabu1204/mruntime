@@ -31,7 +31,7 @@ public:
     );
 
 private:
-    int sample(const float* logits, size_t vocab_size, const GenerationConfig& config);
+    int sample(const Tensor& logits, const GenerationConfig& config);
 
     QwenModel& model_;
     Backend& backend_;

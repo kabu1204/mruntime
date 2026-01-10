@@ -31,7 +31,7 @@ std::vector<int> InferenceEngine::generate(
 
     const QwenConfig& model_config = model_.config();
     size_t max_seq_len = prompt_tokens.size() + config.max_new_tokens;
-    kv_cache_.allocate(model_config, max_seq_len, DType::FP32);
+    kv_cache_.allocate(model_config, max_seq_len);
 
     std::vector<int> output_tokens = prompt_tokens;
 
@@ -47,13 +47,10 @@ std::vector<int> InferenceEngine::generate(
         logits = model_.forward(backend_, {prompt_tokens[i]}, kv_cache_);
     }
 
-    const size_t vocab_size = logits.dim(2);
-    const float* logits_ptr = logits.data_ptr<float>();
-
     for (size_t i = 0; i < config.max_new_tokens; ++i) {
         // Sample/select next token from the current logits (which correspond to
         // the last token in the context).
-        int next_token = sample(logits_ptr, vocab_size, config);
+        int next_token = sample(logits, config);
         MRUNTIME_LOG_INFO("next_token: {}", next_token);
         output_tokens.push_back(next_token);
 
@@ -64,24 +61,47 @@ std::vector<int> InferenceEngine::generate(
         // Advance the KV-cache with the selected token, and get logits for the
         // next step.
         logits = model_.forward(backend_, {next_token}, kv_cache_);
-        logits_ptr = logits.data_ptr<float>();
     }
 
     return output_tokens;
 }
 
-int InferenceEngine::sample(const float* logits, size_t vocab_size, const GenerationConfig& config) {
+int InferenceEngine::sample(const Tensor& logits, const GenerationConfig& config) {
+    assert(logits.ndim() == 3);
+    assert(logits.dim(0) == 1);
+    assert(logits.dim(1) >= 1);
+
+    const size_t vocab_size = logits.dim(2);
+    const size_t seq_len = logits.dim(1);
+    const size_t base = (seq_len - 1) * vocab_size;
+    const void* logits_data = logits.data();
+    const DType logits_dtype = logits.dtype();
+
+    auto logit_at = [&](size_t i) -> float {
+        return load_scalar_as_fp32(logits_data, logits_dtype, base + i);
+    };
+
     if (config.greedy || config.temperature == 0.0f) {
-        return static_cast<int>(
-            std::max_element(logits, logits + vocab_size) - logits
-        );
+        float best = -std::numeric_limits<float>::infinity();
+        size_t best_idx = 0;
+        for (size_t i = 0; i < vocab_size; ++i) {
+            float v = logit_at(i);
+            if (v > best) {
+                best = v;
+                best_idx = i;
+            }
+        }
+        return static_cast<int>(best_idx);
     }
 
     std::vector<float> probs(vocab_size);
-    float max_logit = *std::max_element(logits, logits + vocab_size);
+    float max_logit = -std::numeric_limits<float>::infinity();
+    for (size_t i = 0; i < vocab_size; ++i) {
+        max_logit = std::max(max_logit, logit_at(i));
+    }
 
     for (size_t i = 0; i < vocab_size; ++i) {
-        probs[i] = (logits[i] - max_logit) / config.temperature;
+        probs[i] = (logit_at(i) - max_logit) / config.temperature;
     }
 
     for (size_t i = 0; i < vocab_size; ++i) {
@@ -136,9 +156,16 @@ int InferenceEngine::sample(const float* logits, size_t vocab_size, const Genera
     float sum = std::accumulate(probs.begin(), probs.end(), 0.0f);
     if (sum <= 0.0f) {
         // Fallback to greedy if filtering zeroed everything.
-        return static_cast<int>(
-            std::max_element(logits, logits + vocab_size) - logits
-        );
+        float best = -std::numeric_limits<float>::infinity();
+        size_t best_idx = 0;
+        for (size_t i = 0; i < vocab_size; ++i) {
+            float v = logit_at(i);
+            if (v > best) {
+                best = v;
+                best_idx = i;
+            }
+        }
+        return static_cast<int>(best_idx);
     }
     for (float& p : probs) {
         p /= sum;
