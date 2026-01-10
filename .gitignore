@@ -1,0 +1,31 @@
+# macOS
+.DS_Store
+
+# CMake / build artifacts
+/build/
+/cmake-build-*/
+compile_commands.json
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+
+# Tooling caches
+/.cache/
+/.claude/
+
+# Local agent instructions (kept out of git)
+# NOTE: `git clean -fd` keeps ignored files; `git clean -fdx` removes them.
+/AGENTS.md
+# Local model assets
+/models/
+
+# Optional external experiments / vendored repos cloned locally
+/MLAS/
+
+# Editor settings
+.vscode/
+.idea/
+*.code-workspace
+
+# Debug symbols
+*.dSYM/
