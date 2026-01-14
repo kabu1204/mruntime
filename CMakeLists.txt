@@ -67,23 +67,18 @@ set(CMAKE_SKIP_INSTALL_RULES TRUE)
 FetchContent_MakeAvailable(spdlog absl re2 nlohmann_json pthreadpool kleidiai)
 set(CMAKE_SKIP_INSTALL_RULES "${_MRUNTIME_PREV_SKIP_INSTALL_RULES}")
 
-# Core library sources
+# Core library sources (bare-metal API)
 set(MRUNTIME_CORE_SOURCES
-    src/core/tensor.cpp
-    src/core/cpu_backend.cpp
     src/core/kai_gemm.cpp
+    src/qwen_config.cpp
+    src/qwen2_ops.cpp
+    src/qwen2_weights.cpp
+    src/qwen2_forward.cpp
+    src/qwen2_generate.cpp
 )
 
 set(MRUNTIME_LOADER_SOURCES
     src/loader/safetensors.cpp
-)
-
-set(MRUNTIME_MODEL_SOURCES
-    src/models/qwen/qwen_model.cpp
-)
-
-set(MRUNTIME_ENGINE_SOURCES
-    src/engine/inference_engine.cpp
 )
 
 set(MRUNTIME_TOKENIZER_SOURCES
@@ -95,8 +90,6 @@ set(MRUNTIME_TOKENIZER_SOURCES
 add_library(mruntime STATIC
     ${MRUNTIME_CORE_SOURCES}
     ${MRUNTIME_LOADER_SOURCES}
-    ${MRUNTIME_MODEL_SOURCES}
-    ${MRUNTIME_ENGINE_SOURCES}
     ${MRUNTIME_TOKENIZER_SOURCES}
 )
 
@@ -107,6 +100,7 @@ target_include_directories(mruntime PUBLIC
 
 target_include_directories(mruntime PRIVATE
     ${CMAKE_SOURCE_DIR}
+    ${CMAKE_SOURCE_DIR}/src/core
 )
 
 target_link_libraries(mruntime
@@ -144,7 +138,7 @@ endif()
 
 # CLI tools
 if(MRUNTIME_BUILD_CLI)
-    add_executable(mruntime_chat cli/mruntime_chat.cpp)
+    add_executable(mruntime_chat cli/mruntime_chat_lite.cpp)
     target_link_libraries(mruntime_chat PRIVATE mruntime)
     target_include_directories(mruntime_chat PRIVATE
         ${CMAKE_SOURCE_DIR}/include

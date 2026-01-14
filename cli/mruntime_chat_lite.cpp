@@ -2,16 +2,15 @@
 #include <cstdint>
 #include <fstream>
 #include <iostream>
-#include <optional>
 #include <sstream>
 #include <string>
-#include <utility>
 #include <vector>
 
-#include "mruntime/cpu_backend.h"
-#include "mruntime/inference_engine.h"
-#include "mruntime/profiling_backend.h"
-#include "mruntime/qwen_model.h"
+#include "mruntime/arena.h"
+#include "mruntime/qwen_config.h"
+#include "mruntime/qwen2_forward.h"
+#include "mruntime/qwen2_generate.h"
+#include "mruntime/qwen2_weights.h"
 #include "mruntime/safetensors.h"
 
 #include "qwen2_tokenizer.h"
@@ -75,10 +74,9 @@ struct Args {
     float top_p = 0.8f;
     bool greedy = false;
     uint64_t seed = 42;
-    int eos_token_id = 151645;  // <|im_end|>
-
-    bool profile_backend = false;
-    std::string profile_backend_trace_path;
+    int32_t eos_token_id = 151645;  // <|im_end|>
+    size_t max_seq_len = 2048;
+    size_t num_threads = 0;  // 0 = auto-detect
 };
 
 auto print_usage(const char* argv0) -> void {
@@ -88,14 +86,14 @@ auto print_usage(const char* argv0) -> void {
         << "  --model-dir PATH        Path to model directory (default: auto-detect)\n"
         << "  --system TEXT           System prompt (default: \"You are a helpful assistant.\")\n"
         << "  --max-new-tokens N      Max new tokens to generate (default: 256)\n"
+        << "  --max-seq-len N         Max sequence length (default: 2048)\n"
         << "  --temperature T         Sampling temperature (default: 0.7)\n"
         << "  --top-k N               Top-k sampling (default: 20)\n"
         << "  --top-p P               Top-p sampling (default: 0.8)\n"
         << "  --greedy                Greedy decoding\n"
         << "  --seed N                RNG seed (default: 42)\n"
         << "  --eos-token-id ID       Stop token id (default: 151645 = <|im_end|>)\n"
-        << "  --profile-backend       Print per-op backend timing summary\n"
-        << "  --profile-backend-trace PATH  Write Chrome trace JSON for backend ops\n"
+        << "  --threads N             Number of threads (default: auto-detect)\n"
         << "  -h, --help              Show this help\n";
 }
 
@@ -119,6 +117,8 @@ auto parse_args(int argc, char** argv) -> Args {
             args.system_prompt = require_value("--system");
         } else if (a == "--max-new-tokens") {
             args.max_new_tokens = static_cast<size_t>(std::stoull(require_value("--max-new-tokens")));
+        } else if (a == "--max-seq-len") {
+            args.max_seq_len = static_cast<size_t>(std::stoull(require_value("--max-seq-len")));
         } else if (a == "--temperature") {
             args.temperature = std::stof(require_value("--temperature"));
         } else if (a == "--top-k") {
@@ -131,11 +131,8 @@ auto parse_args(int argc, char** argv) -> Args {
             args.seed = static_cast<uint64_t>(std::stoull(require_value("--seed")));
         } else if (a == "--eos-token-id") {
             args.eos_token_id = std::stoi(require_value("--eos-token-id"));
-        } else if (a == "--profile-backend") {
-            args.profile_backend = true;
-        } else if (a == "--profile-backend-trace") {
-            args.profile_backend = true;
-            args.profile_backend_trace_path = require_value("--profile-backend-trace");
+        } else if (a == "--threads") {
+            args.num_threads = static_cast<size_t>(std::stoull(require_value("--threads")));
         } else {
             throw std::runtime_error("Unknown argument: " + a);
         }
@@ -177,54 +174,75 @@ int main(int argc, char** argv) {
         Args args = parse_args(argc, argv);
         const std::string model_dir = resolve_model_dir(args.model_dir);
 
-        const std::string config_json = read_text_file(join_path(model_dir, "config.json"));
-        const mruntime::QwenConfig model_config = mruntime::QwenConfig::from_json(config_json);
+        std::cout << "Loading model from: " << model_dir << "\n";
 
-        auto weights = mruntime::SafeTensorsFile::open(join_path(model_dir, "model.safetensors"));
-        if (!weights) {
+        // Load config
+        const std::string config_json = read_text_file(join_path(model_dir, "config.json"));
+        const mruntime::QwenConfig cfg = mruntime::QwenConfig::from_json(config_json);
+
+        std::cout << "Model config: " << cfg.num_layers << " layers, "
+                  << cfg.hidden_size << " hidden, "
+                  << cfg.vocab_size << " vocab\n";
+
+        // Calculate memory requirements
+        const size_t max_batch_tokens = 64;  // Max tokens per forward call
+        mruntime::Qwen2MemorySizes sizes = mruntime::qwen2_memory_sizes(cfg, args.max_seq_len, max_batch_tokens);
+
+        std::cout << "Memory: weights=" << sizes.weights_bytes / 1024 / 1024 << "MB, "
+                  << "kv_cache=" << sizes.kv_cache_bytes / 1024 / 1024 << "MB, "
+                  << "scratch=" << sizes.scratch_bytes / 1024 / 1024 << "MB\n";
+
+        // Allocate arenas
+        mruntime::Qwen2Arenas arenas = mruntime::create_qwen2_arenas(
+            sizes.weights_bytes + sizes.packed_weights_bytes,
+            sizes.kv_cache_bytes,
+            sizes.scratch_bytes
+        );
+
+        // Load weights
+        std::cout << "Loading weights...\n";
+        auto st = mruntime::SafeTensorsFile::open(join_path(model_dir, "model.safetensors"));
+        if (!st) {
             throw std::runtime_error("Failed to open model weights");
         }
+        mruntime::Qwen2Weights weights = mruntime::qwen2_load_weights(cfg, *st, arenas.weights, true);
 
-        mruntime::QwenModel model(model_config);
-        model.load_weights(*weights);
+        // Initialize KV cache and scratch
+        mruntime::Qwen2KVCache kv_cache = mruntime::qwen2_init_kv_cache(cfg, arenas.kv_cache, args.max_seq_len);
+        mruntime::Qwen2Scratch scratch = mruntime::qwen2_init_scratch(cfg, arenas.scratch, max_batch_tokens);
 
-        mruntime::CpuBackend cpu_backend(8);
+        // Create thread pool
+        mruntime::PThreadPool pool = mruntime::PThreadPool::Create(args.num_threads);
+        std::cout << "Using " << pool.threads_count() << " threads\n";
 
-        std::optional<mruntime::ProfilingBackend> profiling_backend;
-        mruntime::Backend* backend = &cpu_backend;
-        if (args.profile_backend) {
-            mruntime::ProfilingBackend::Options opts;
-            opts.enabled = true;
-            opts.trace_enabled = !args.profile_backend_trace_path.empty();
-            opts.trace_path = args.profile_backend_trace_path;
-            profiling_backend.emplace(cpu_backend, opts);
-            backend = &*profiling_backend;
-        }
-
+        // Load tokenizer
         const auto tokenizer = mruntime::Qwen2Tokenizer::from_files(
             join_path(model_dir, "vocab.json"),
             join_path(model_dir, "merges.txt"),
             join_path(model_dir, "tokenizer_config.json")
         );
 
-        mruntime::GenerationConfig gen;
-        gen.max_new_tokens = args.max_new_tokens;
-        gen.temperature = args.temperature;
-        gen.top_k = args.top_k;
-        gen.top_p = args.top_p;
-        gen.greedy = args.greedy;
-        gen.seed = args.seed;
-        gen.eos_token_id = args.eos_token_id;
+        // Set up generation config
+        mruntime::Qwen2GenerateConfig gen_cfg;
+        gen_cfg.max_new_tokens = args.max_new_tokens;
+        gen_cfg.temperature = args.temperature;
+        gen_cfg.top_k = args.top_k;
+        gen_cfg.top_p = args.top_p;
+        gen_cfg.greedy = args.greedy;
+        gen_cfg.seed = args.seed;
+        gen_cfg.eos_token_id = args.eos_token_id;
 
+        // Chat history
         std::vector<Message> history;
         if (!args.system_prompt.empty()) {
             history.push_back({"system", args.system_prompt});
         }
 
-        mruntime::InferenceEngine engine(model, *backend);
-
-        std::cout << "mruntime Qwen2 chat\n";
+        std::cout << "\nmruntime Qwen2 chat (bare-metal API)\n";
         std::cout << "Type /exit to quit, /reset to clear conversation.\n";
+
+        // Allocate output buffer
+        std::vector<int32_t> output_tokens(args.max_seq_len + args.max_new_tokens);
 
         while (true) {
             std::cout << "\n> " << std::flush;
@@ -242,6 +260,7 @@ int main(int argc, char** argv) {
                 if (!args.system_prompt.empty()) {
                     history.push_back({"system", args.system_prompt});
                 }
+                mruntime::qwen2_reset_kv_cache(kv_cache);
                 continue;
             }
             if (user.empty()) {
@@ -250,36 +269,57 @@ int main(int argc, char** argv) {
 
             history.push_back({"user", user});
 
+            // Apply chat template
             const std::string prompt = apply_qwen2_chat_template(history, /*add_generation_prompt=*/true);
-            const std::vector<int> prompt_tokens = tokenizer.encode(prompt);
+            const std::vector<int> prompt_tokens_int = tokenizer.encode(prompt);
 
-            const std::vector<int> all_tokens = engine.generate(prompt_tokens, gen);
-            if (all_tokens.size() < prompt_tokens.size()) {
-                throw std::runtime_error("Internal error: generated token list shorter than prompt");
+            // Convert to int32_t
+            std::vector<int32_t> prompt_tokens(prompt_tokens_int.begin(), prompt_tokens_int.end());
+
+            // Check sequence length
+            if (prompt_tokens.size() > args.max_seq_len) {
+                std::cerr << "Warning: Prompt too long (" << prompt_tokens.size() << " tokens), truncating.\n";
+                prompt_tokens.resize(args.max_seq_len);
             }
 
-            std::vector<int> gen_tokens(all_tokens.begin() + static_cast<long>(prompt_tokens.size()), all_tokens.end());
-            auto eos_it = std::find(gen_tokens.begin(), gen_tokens.end(), gen.eos_token_id);
-            std::vector<int> reply_tokens(gen_tokens.begin(), eos_it);
+            // Reset KV cache for new conversation turn
+            mruntime::qwen2_reset_kv_cache(kv_cache);
 
-            const std::string reply = tokenizer.decode(reply_tokens);
+            // Generate
+            size_t total_len = mruntime::qwen2_generate(
+                cfg,
+                weights,
+                kv_cache,
+                scratch,
+                prompt_tokens.data(),
+                prompt_tokens.size(),
+                output_tokens.data(),
+                gen_cfg,
+                &pool
+            );
+
+            // Extract generated tokens
+            if (total_len <= prompt_tokens.size()) {
+                std::cerr << "Warning: No tokens generated\n";
+                continue;
+            }
+
+            std::vector<int> gen_tokens_int;
+            for (size_t i = prompt_tokens.size(); i < total_len; ++i) {
+                int32_t tok = output_tokens[i];
+                if (tok == gen_cfg.eos_token_id) break;
+                gen_tokens_int.push_back(static_cast<int>(tok));
+            }
+
+            // Decode and print
+            const std::string reply = tokenizer.decode(gen_tokens_int);
             std::cout << reply << "\n";
-
-            if (profiling_backend) {
-                std::cout << "\n" << profiling_backend->profiler().format_report();
-            }
 
             history.push_back({"assistant", reply});
         }
 
-        if (profiling_backend && !args.profile_backend_trace_path.empty()) {
-            std::string err;
-            if (!profiling_backend->flush_trace_to_file(&err)) {
-                std::cerr << "WARN: " << err << "\n";
-            } else {
-                std::cout << "\nWrote backend trace to: " << args.profile_backend_trace_path << "\n";
-            }
-        }
+        // Cleanup
+        mruntime::destroy_qwen2_arenas(arenas);
 
         return 0;
     } catch (const std::exception& e) {
@@ -287,5 +327,3 @@ int main(int argc, char** argv) {
         return 1;
     }
 }
-
-

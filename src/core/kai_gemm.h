@@ -4,8 +4,6 @@
 #include <cstdint>
 #include <vector>
 
-#include "mruntime/tensor.h"
-
 namespace mruntime {
 
 struct KaiPackedRhsFp16 {

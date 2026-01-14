@@ -157,26 +157,9 @@ std::vector<std::string> SafeTensorsFile::tensor_names() const {
     return names;
 }
 
-Tensor SafeTensorsFile::load_tensor_view(const std::string& name) const {
+const void* SafeTensorsFile::tensor_data(const std::string& name) const {
     const TensorInfo& info = tensor_info(name);
-    void* data = static_cast<char*>(mapped_data_) + data_offset_ + info.data_offset;
-    return Tensor::from_buffer(data, Shape(info.shape), info.dtype, false);
-}
-
-Tensor SafeTensorsFile::load_tensor_copy(const std::string& name) const {
-    const TensorInfo& info = tensor_info(name);
-    Tensor result = Tensor::empty(Shape(info.shape), info.dtype);
-    const void* src = static_cast<const char*>(mapped_data_) + data_offset_ + info.data_offset;
-    std::memcpy(result.data(), src, info.data_size);
-    return result;
-}
-
-Tensor SafeTensorsFile::load_tensor_copy(const std::string& name, DType target_dtype) const {
-    Tensor result = load_tensor_copy(name);
-    if (target_dtype != result.dtype()) {
-        result = result.to(target_dtype);
-    }
-    return result;
+    return static_cast<const char*>(mapped_data_) + data_offset_ + info.data_offset;
 }
 
 }  // namespace mruntime

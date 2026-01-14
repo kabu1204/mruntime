@@ -6,7 +6,7 @@
 #include <string>
 #include <vector>
 
-#include "mruntime/tensor.h"
+#include "mruntime/dtype.h"
 
 namespace mruntime {
 
@@ -32,12 +32,8 @@ public:
     const TensorInfo& tensor_info(const std::string& name) const;
     std::vector<std::string> tensor_names() const;
 
-    // Zero-copy view into mmap'd file (read-only, valid while file is open)
-    Tensor load_tensor_view(const std::string& name) const;
-
-    // Owning copy with optional dtype conversion
-    Tensor load_tensor_copy(const std::string& name, DType target_dtype) const;
-    Tensor load_tensor_copy(const std::string& name) const;  // Keep original dtype
+    // Raw data access (zero-copy, read-only, valid while file is open)
+    const void* tensor_data(const std::string& name) const;
 
 private:
     SafeTensorsFile() = default;

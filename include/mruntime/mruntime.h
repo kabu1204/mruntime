@@ -1,10 +1,10 @@
 #pragma once
 
+#include "mruntime/arena.h"
 #include "mruntime/dtype.h"
-#include "mruntime/tensor.h"
-#include "mruntime/backend.h"
-#include "mruntime/cpu_backend.h"
-#include "mruntime/safetensors.h"
 #include "mruntime/qwen_config.h"
-#include "mruntime/qwen_model.h"
-#include "mruntime/inference_engine.h"
+#include "mruntime/qwen2_forward.h"
+#include "mruntime/qwen2_generate.h"
+#include "mruntime/qwen2_ops.h"
+#include "mruntime/qwen2_weights.h"
+#include "mruntime/safetensors.h"
