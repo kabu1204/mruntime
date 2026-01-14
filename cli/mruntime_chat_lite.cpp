@@ -12,6 +12,7 @@
 #include "mruntime/qwen2_generate.h"
 #include "mruntime/qwen2_weights.h"
 #include "mruntime/safetensors.h"
+#include "mruntime/trace.h"
 
 #include "qwen2_tokenizer.h"
 
@@ -170,6 +171,8 @@ auto resolve_model_dir(const std::string& user_model_dir) -> std::string {
 }  // namespace
 
 int main(int argc, char** argv) {
+    mruntime::TraceCollector::instance().set_enabled(true);
+    mruntime::TraceCollector::instance().reset();
     try {
         Args args = parse_args(argc, argv);
         const std::string model_dir = resolve_model_dir(args.model_dir);
@@ -320,6 +323,10 @@ int main(int argc, char** argv) {
 
         // Cleanup
         mruntime::destroy_qwen2_arenas(arenas);
+
+        // Export trace
+        mruntime::TraceCollector::instance().print_summary();
+        mruntime::TraceCollector::instance().export_chrome_json("trace.json");
 
         return 0;
     } catch (const std::exception& e) {

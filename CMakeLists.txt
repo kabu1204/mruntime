@@ -70,6 +70,7 @@ set(CMAKE_SKIP_INSTALL_RULES "${_MRUNTIME_PREV_SKIP_INSTALL_RULES}")
 # Core library sources (bare-metal API)
 set(MRUNTIME_CORE_SOURCES
     src/core/kai_gemm.cpp
+    src/core/trace.cpp
     src/qwen_config.cpp
     src/qwen2_ops.cpp
     src/qwen2_weights.cpp
