@@ -39,6 +39,7 @@ void qwen2_layer_forward(
     uint16_t* k_cache,            // This layer's K cache [num_kv_heads, max_seq_len, head_dim]
     uint16_t* v_cache,            // This layer's V cache [num_kv_heads, max_seq_len, head_dim]
     size_t kv_seq_len,            // Current KV cache length (before this forward)
+    size_t max_seq_len,           // Maximum sequence length (cache dimension)
     const uint16_t* hidden_in,    // [num_tokens, hidden_size]
     uint16_t* hidden_out,         // [num_tokens, hidden_size]
     Qwen2Scratch& scratch,

@@ -130,6 +130,9 @@ void qwen2_attention(
     const size_t num_kv_heads = cfg.num_kv_heads;
     const size_t head_dim = cfg.head_dim();
     const size_t position_offset = kv_seq_len;
+    if (position_offset > max_seq_len || num_tokens > (max_seq_len - position_offset)) {
+        throw std::runtime_error("qwen2_attention: KV cache overflow (kv_seq_len + num_tokens > max_seq_len)");
+    }
 
     // Q projection: [num_tokens, hidden] @ [num_heads*head_dim, hidden]^T -> [num_tokens, num_heads*head_dim]
     {
@@ -313,6 +316,7 @@ void qwen2_layer_forward(
     uint16_t* k_cache,
     uint16_t* v_cache,
     size_t kv_seq_len,
+    size_t max_seq_len,
     const uint16_t* hidden_in,
     uint16_t* hidden_out,
     Qwen2Scratch& scratch,
@@ -339,7 +343,7 @@ void qwen2_layer_forward(
         k_cache,
         v_cache,
         kv_seq_len,
-        scratch.max_tokens > 0 ? scratch.max_tokens : kv_seq_len + num_tokens,  // Estimate max_seq_len from scratch
+        max_seq_len,
         scratch.normed,
         scratch.residual,  // Use residual buffer for attention output
         scratch,
