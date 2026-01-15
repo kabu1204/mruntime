@@ -537,7 +537,13 @@ uint16_t* qwen2_forward(
 
     // LM head projection: [num_tokens, hidden] @ [vocab, hidden]^T -> [num_tokens, vocab]
     {
-        TRACE_SCOPE_CAT("lm_head", "gemm");
+        TRACE_SCOPE_ARGS_CAT(
+            "lm_head",
+            "gemm",
+            ::mruntime::trace_arg("m", static_cast<int64_t>(num_tokens)),
+            ::mruntime::trace_arg("n", static_cast<int64_t>(cfg.vocab_size)),
+            ::mruntime::trace_arg("k", static_cast<int64_t>(hidden_size))
+        );
         qwen2_gemm_fp16(
             scratch.normed,
             weights.lm_head,

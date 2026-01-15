@@ -8,6 +8,7 @@
 #include "mruntime/dtype.h"
 #include "mruntime/qwen2_ops.h"
 #include "mruntime/safetensors.h"
+#include "mruntime/trace.h"
 
 namespace mruntime {
 
@@ -270,6 +271,7 @@ Qwen2Weights qwen2_load_weights(
 
         // Pack weights for KleidiAI if requested
         if (pack_for_kai) {
+            TRACE_SCOPE("kai_pack_weights");
             // Q projection: [num_heads * head_dim, hidden_size]
             size_t q_packed_size = qwen2_packed_weight_size_fp16(
                 cfg.num_attention_heads * head_dim, cfg.hidden_size);
