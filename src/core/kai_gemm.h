@@ -10,10 +10,19 @@ struct KaiPackedRhsFp16 {
     size_t n = 0;
     size_t k = 0;
     std::vector<uint16_t> rhs_packed;
-    std::vector<uint16_t> rhs_kxn_fp16;
 };
 
 bool kai_has_fp16();
+
+size_t kai_rhs_packed_size_fp16_kxn_with_zero_bias(size_t n, size_t k);
+
+void kai_pack_rhs_fp16_kxn_with_zero_bias(
+    const uint16_t* rhs_kxn_fp16,
+    size_t n,
+    size_t k,
+    uint16_t* rhs_packed_out,
+    size_t rhs_packed_bytes
+);
 
 KaiPackedRhsFp16 kai_pack_rhs_fp16_kxn_with_zero_bias(const uint16_t* rhs_kxn_fp16, size_t n, size_t k);
 

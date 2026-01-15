@@ -29,3 +29,5 @@ Makefile
 
 # Debug symbols
 *.dSYM/
+
+**/trace.json

@@ -41,6 +41,7 @@ struct Qwen2Weights {
     const uint16_t* embed_tokens;       // [vocab_size, hidden_size]
     const uint16_t* final_norm;         // [hidden_size]
     const uint16_t* lm_head;            // [vocab_size, hidden_size]
+    const uint16_t* lm_head_packed;     // KleidiAI packed RHS (may be nullptr)
 
     Qwen2LayerWeights* layers;          // [num_layers]
     size_t num_layers;

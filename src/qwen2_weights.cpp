@@ -82,6 +82,7 @@ Qwen2MemorySizes qwen2_memory_sizes(
         qwen2_packed_weight_size_fp16(cfg.intermediate_size, cfg.hidden_size) +
         qwen2_packed_weight_size_fp16(cfg.hidden_size, cfg.intermediate_size)
     );
+    sizes.packed_weights_bytes += qwen2_packed_weight_size_fp16(cfg.vocab_size, cfg.hidden_size);
 
     return sizes;
 }
@@ -192,6 +193,16 @@ Qwen2Weights qwen2_load_weights(
     } else {
         // Tied embeddings - reuse embed_tokens
         weights.lm_head = weights.embed_tokens;
+    }
+
+    // Pack lm_head for KleidiAI.
+    weights.lm_head_packed = nullptr;
+    if (pack_for_kai) {
+        TRACE_SCOPE("kai_pack_lm_head");
+        const size_t packed_size_bytes = qwen2_packed_weight_size_fp16(cfg.vocab_size, cfg.hidden_size);
+        uint16_t* packed = weights_arena.alloc_array<uint16_t>(packed_size_bytes / sizeof(uint16_t));
+        qwen2_pack_weight_fp16(weights.lm_head, packed, cfg.vocab_size, cfg.hidden_size);
+        weights.lm_head_packed = packed;
     }
 
     // Allocate layer weights array

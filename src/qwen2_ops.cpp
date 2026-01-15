@@ -21,9 +21,13 @@ bool qwen2_has_kai_fp16() {
 }
 
 size_t qwen2_packed_weight_size_fp16(size_t N, size_t K) {
-    // Size needed for KleidiAI packed format
-    // This is an approximation; actual size comes from KleidiAI
-    // For now, allocate extra space to be safe
+    // Size needed for KleidiAI packed format.
+    // Prefer the exact size when KleidiAI FP16 is available.
+    if (qwen2_has_kai_fp16()) {
+        return kai_rhs_packed_size_fp16_kxn_with_zero_bias(N, K);
+    }
+
+    // Conservative fallback (unused when KleidiAI isn't active).
     return (N * K + N * 16) * sizeof(uint16_t);
 }
 
@@ -32,17 +36,19 @@ void qwen2_pack_weight_fp16(
     uint16_t* packed,
     size_t N, size_t K
 ) {
+    if (!qwen2_has_kai_fp16()) return;
+
     // Transpose B from NxK to KxN for KleidiAI
     std::vector<uint16_t> b_kxn(K * N);
-    for (size_t row = 0; row < N; ++row) {
-        for (size_t col = 0; col < K; ++col) {
+    for (size_t col = 0; col < K; ++col) {
+        for (size_t row = 0; row < N; ++row) {
             b_kxn[col * N + row] = B[row * K + col];
         }
     }
 
     // Pack using KleidiAI
-    KaiPackedRhsFp16 result = kai_pack_rhs_fp16_kxn_with_zero_bias(b_kxn.data(), N, K);
-    std::memcpy(packed, result.rhs_packed.data(), result.rhs_packed.size() * sizeof(uint16_t));
+    const size_t packed_size = qwen2_packed_weight_size_fp16(N, K);
+    kai_pack_rhs_fp16_kxn_with_zero_bias(b_kxn.data(), N, K, packed, packed_size);
 }
 
 void qwen2_gemm_fp16(

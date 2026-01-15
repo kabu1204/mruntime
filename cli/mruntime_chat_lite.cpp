@@ -189,9 +189,11 @@ int main(int argc, char** argv) {
 
         // Calculate memory requirements
         const size_t max_batch_tokens = 64;  // Max tokens per forward call
-        mruntime::Qwen2MemorySizes sizes = mruntime::qwen2_memory_sizes(cfg, args.max_seq_len, max_batch_tokens);
+        mruntime::Qwen2MemorySizes sizes =
+            mruntime::qwen2_memory_sizes(cfg, args.max_seq_len, max_batch_tokens);
 
         std::cout << "Memory: weights=" << sizes.weights_bytes / 1024 / 1024 << "MB, "
+                  << "packed=" << sizes.packed_weights_bytes / 1024 / 1024 << "MB, "
                   << "kv_cache=" << sizes.kv_cache_bytes / 1024 / 1024 << "MB, "
                   << "scratch=" << sizes.scratch_bytes / 1024 / 1024 << "MB\n";
 
@@ -208,7 +210,8 @@ int main(int argc, char** argv) {
         if (!st) {
             throw std::runtime_error("Failed to open model weights");
         }
-        mruntime::Qwen2Weights weights = mruntime::qwen2_load_weights(cfg, *st, arenas.weights, true);
+        mruntime::Qwen2Weights weights =
+            mruntime::qwen2_load_weights(cfg, *st, arenas.weights, /*pack_for_kai=*/true);
 
         // Initialize KV cache and scratch
         mruntime::Qwen2KVCache kv_cache = mruntime::qwen2_init_kv_cache(cfg, arenas.kv_cache, args.max_seq_len);

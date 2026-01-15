@@ -1,5 +1,6 @@
 #include "kai_gemm.h"
 
+#include <cassert>
 #include <limits>
 
 #if defined(__aarch64__)
@@ -17,16 +18,22 @@ bool kai_has_fp16() {
 #endif
 }
 
-KaiPackedRhsFp16 kai_pack_rhs_fp16_kxn_with_zero_bias(const uint16_t* rhs_kxn_fp16, size_t n, size_t k) {
-    KaiPackedRhsFp16 out;
-    out.n = n;
-    out.k = k;
+size_t kai_rhs_packed_size_fp16_kxn_with_zero_bias(size_t n, size_t k) {
+    return kai_get_rhs_packed_size_rhs_pack_kxn_f16p16x1biasf16_f16_f16_neon(n, k);
+}
 
-    // KleidiAI expects RHS as KxN (row-major), with row stride in bytes.
-    // It also requires a bias vector of length N (fp16).
+void kai_pack_rhs_fp16_kxn_with_zero_bias(
+    const uint16_t* rhs_kxn_fp16,
+    size_t n,
+    size_t k,
+    uint16_t* rhs_packed_out,
+    size_t rhs_packed_bytes
+) {
     const size_t rhs_stride_bytes = n * sizeof(uint16_t);
-    const size_t packed_size = kai_get_rhs_packed_size_rhs_pack_kxn_f16p16x1biasf16_f16_f16_neon(n, k);
-    out.rhs_packed.resize(packed_size / sizeof(uint16_t));
+    const size_t packed_size = kai_rhs_packed_size_fp16_kxn_with_zero_bias(n, k);
+    assert(rhs_packed_bytes >= packed_size && "rhs_packed_out too small for Kai packed RHS");
+    (void)rhs_packed_bytes;
+    (void)packed_size;
 
     std::vector<uint16_t> bias_fp16(n, static_cast<uint16_t>(0));
 
@@ -41,10 +48,23 @@ KaiPackedRhsFp16 kai_pack_rhs_fp16_kxn_with_zero_bias(const uint16_t* rhs_kxn_fp
         rhs_kxn_fp16,
         bias_fp16.data(),
         nullptr,
-        out.rhs_packed.data(),
+        rhs_packed_out,
         0,
         nullptr
     );
+}
+
+KaiPackedRhsFp16 kai_pack_rhs_fp16_kxn_with_zero_bias(const uint16_t* rhs_kxn_fp16, size_t n, size_t k) {
+    KaiPackedRhsFp16 out;
+    out.n = n;
+    out.k = k;
+
+    // KleidiAI expects RHS as KxN (row-major), with row stride in bytes.
+    // It also requires a bias vector of length N (fp16).
+    const size_t packed_size = kai_rhs_packed_size_fp16_kxn_with_zero_bias(n, k);
+    out.rhs_packed.resize(packed_size / sizeof(uint16_t));
+    kai_pack_rhs_fp16_kxn_with_zero_bias(
+        rhs_kxn_fp16, n, k, out.rhs_packed.data(), packed_size);
 
     return out;
 }
@@ -83,6 +103,13 @@ namespace mruntime {
 
 bool kai_has_fp16() {
     return false;
+}
+
+size_t kai_rhs_packed_size_fp16_kxn_with_zero_bias(size_t, size_t) {
+    return 0;
+}
+
+void kai_pack_rhs_fp16_kxn_with_zero_bias(const uint16_t*, size_t, size_t, uint16_t*, size_t) {
 }
 
 KaiPackedRhsFp16 kai_pack_rhs_fp16_kxn_with_zero_bias(const uint16_t*, size_t, size_t) {

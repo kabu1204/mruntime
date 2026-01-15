@@ -553,7 +553,7 @@ uint16_t* qwen2_forward(
             weights.lm_head,
             scratch.logits,
             num_tokens, cfg.vocab_size, hidden_size,
-            nullptr,  // No packed weights for lm_head (too large)
+            weights.lm_head_packed,
             pool
         );
     }
