@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <cstddef>
 #include <cstring>
 #include <limits>
 #include <vector>
@@ -59,16 +60,44 @@ void qwen2_gemm_fp16(
     const uint16_t* packed_B,
     PThreadPool* pool
 ) {
-    // KleidiAI fast path (Arm64 with FP16)
+    // if (pool == nullptr && qwen2_has_kai_fp16() && packed_B != nullptr) {
+    //     kai_matmul_fp16_packed_rhs(
+    //         M, N, K,
+    //         A,
+    //         K * sizeof(uint16_t),
+    //         packed_B,
+    //         C,
+    //         N * sizeof(uint16_t)
+    //     );
+    //     return;
+    // }
+
+    // KleidiAI multi-threaded fast path (Arm64 with FP16)
     if (qwen2_has_kai_fp16() && packed_B != nullptr) {
-        kai_matmul_fp16_packed_rhs(
-            M, N, K,
-            A,
-            K * sizeof(uint16_t),
-            packed_B,
-            C,
-            N * sizeof(uint16_t)
-        );
+        const size_t m_step = kai_get_m_step_fp16();
+        const size_t n_step = kai_get_n_step_fp16();
+
+        const size_t m_tiles = (M + m_step - 1) / m_step;
+        const size_t n_tiles = (N + n_step - 1) / n_step;
+        const size_t total_tiles = m_tiles * n_tiles;
+
+        auto tile_worker = [&](size_t tile_idx) {
+            size_t m_start = (tile_idx / n_tiles) * m_step;
+            size_t n_start = (tile_idx % n_tiles) * n_step;
+            kai_matmul_fp16_tile(
+                m_start, n_start,
+                M, N, K,
+                A, K * sizeof(uint16_t),
+                packed_B,
+                C, N * sizeof(uint16_t)
+            );
+        };
+
+        if (pool) {
+            pool->parallelize_1d(total_tiles, tile_worker);
+        } else {
+            for (size_t i = 0; i < total_tiles; ++i) tile_worker(i);
+        }
         return;
     }
 

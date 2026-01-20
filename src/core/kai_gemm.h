@@ -37,4 +37,20 @@ void kai_matmul_fp16_packed_rhs(
     size_t dst_stride_row_bytes
 );
 
+// Tile stepping info for parallelization
+size_t kai_get_m_step_fp16();
+size_t kai_get_n_step_fp16();
+
+// Compute a single tile at (m_start, n_start)
+void kai_matmul_fp16_tile(
+    size_t m_start,
+    size_t n_start,
+    size_t M, size_t N, size_t K,
+    const uint16_t* lhs,
+    size_t lhs_stride_bytes,
+    const uint16_t* rhs_packed,
+    uint16_t* dst,
+    size_t dst_stride_row_bytes
+);
+
 }  // namespace mruntime

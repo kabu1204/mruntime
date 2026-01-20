@@ -8,7 +8,37 @@
 
 using namespace mruntime;
 
-double benchmark_gemm(size_t M, size_t N, size_t K, int iterations, PThreadPool* pool) {
+double benchmark_gemm_packed(size_t M, size_t N, size_t K, int iterations, PThreadPool* pool) {
+    size_t A_size = M * K;
+    size_t C_size = M * N;
+    size_t packed_B_size = qwen2_packed_weight_size_fp16(N, K);
+
+    uint16_t* A = static_cast<uint16_t*>(std::aligned_alloc(64, A_size * sizeof(uint16_t)));
+    uint16_t* packed_B = static_cast<uint16_t*>(std::aligned_alloc(64, packed_B_size * sizeof(uint16_t)));
+    uint16_t* C = static_cast<uint16_t*>(std::aligned_alloc(64, C_size * sizeof(uint16_t)));
+
+    // Initialize to zero
+    std::memset(A, 0, A_size * sizeof(uint16_t));
+    std::memset(packed_B, 0, packed_B_size * sizeof(uint16_t));
+    std::memset(C, 0, C_size * sizeof(uint16_t));
+
+    // Warmup
+    qwen2_gemm_fp16(A, nullptr, C, M, N, K, packed_B, pool);
+    auto start = std::chrono::steady_clock::now();
+    for (int i = 0; i < iterations; ++i) {
+        qwen2_gemm_fp16(A, nullptr, C, M, N, K, packed_B, pool);
+    }
+    auto end = std::chrono::steady_clock::now();
+    std::chrono::duration<double, std::milli> elapsed = end - start;
+
+    std::free(A);
+    std::free(packed_B);
+    std::free(C);
+
+    return elapsed.count() / iterations;
+}
+
+double benchmark_gemm_single_thread(size_t M, size_t N, size_t K, int iterations, PThreadPool* pool) {
     size_t A_size = M * K;
     size_t B_size = K * N;
     size_t C_size = M * N;
@@ -68,17 +98,31 @@ double benchmark_rmsnorm(size_t num_tokens, size_t hidden_size, int iterations, 
 }
 
 int main() {
-    PThreadPool pool = PThreadPool::Create(0);  // Use all cores
+    PThreadPool pool = PThreadPool::Create(10);  // Use all cores
     const int iterations = 10;
 
     std::cout << "mruntime Performance Benchmarks (bare-metal API)\n";
     std::cout << "=================================================\n\n";
 
-    std::cout << "GEMM Benchmarks:\n";
-    double gemm_512 = benchmark_gemm(512, 512, 512, iterations, &pool);
+    std::cout << "GEMM Benchmarks (single-threaded):\n";
+    double gemm_512 = benchmark_gemm_single_thread(512, 512, 512, iterations, &pool);
     std::cout << "  512x512x512: " << gemm_512 << " ms\n";
 
-    double gemm_1024 = benchmark_gemm(1024, 1024, 1024, iterations, &pool);
+    double gemm_1024 = benchmark_gemm_single_thread(1024, 1024, 1024, iterations, &pool);
+    std::cout << "  1024x1024x1024: " << gemm_1024 << " ms\n";
+
+    std::cout << "\nGEMM Benchmarks (single-threaded, packed B):\n";
+    gemm_512 = benchmark_gemm_packed(512, 512, 512, iterations, nullptr);
+    std::cout << "  512x512x512: " << gemm_512 << " ms\n";
+
+    gemm_1024 = benchmark_gemm_packed(1024, 1024, 1024, iterations, nullptr);
+    std::cout << "  1024x1024x1024: " << gemm_1024 << " ms\n";
+
+    std::cout << "\nGEMM Benchmarks (multi-threaded, packed B):\n";
+    gemm_512 = benchmark_gemm_packed(512, 512, 512, iterations, &pool);
+    std::cout << "  512x512x512: " << gemm_512 << " ms\n";
+
+    gemm_1024 = benchmark_gemm_packed(1024, 1024, 1024, iterations, &pool);
     std::cout << "  1024x1024x1024: " << gemm_1024 << " ms\n";
 
     std::cout << "\nRMSNorm Benchmarks:\n";

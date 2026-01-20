@@ -10,6 +10,23 @@
 
 namespace mruntime {
 
+// Include micro-kernel variants
+#include "kai/ukernels/matmul/matmul_clamp_f16_f16_f16p/kai_matmul_clamp_f16_f16_f16p16x1biasf16_6x16x8_neon_mla.h"
+#include "kai/ukernels/matmul/matmul_clamp_f16_f16_f16p/kai_matmul_clamp_f16_f16_f16p_interface.h"
+
+constexpr struct kai_matmul_clamp_f16_f16_f16p_ukernel ukernel {
+    .get_m_step = kai_get_m_step_matmul_clamp_f16_f16_f16p16x1biasf16_6x16x8_neon_mla,
+    .get_n_step = kai_get_n_step_matmul_clamp_f16_f16_f16p16x1biasf16_6x16x8_neon_mla,
+    .get_nr = kai_get_nr_matmul_clamp_f16_f16_f16p16x1biasf16_6x16x8_neon_mla,
+    .get_kr = kai_get_kr_matmul_clamp_f16_f16_f16p16x1biasf16_6x16x8_neon_mla,
+    .get_sr = kai_get_sr_matmul_clamp_f16_f16_f16p16x1biasf16_6x16x8_neon_mla,
+    .get_lhs_packed_offset = kai_get_lhs_offset_matmul_clamp_f16_f16_f16p16x1biasf16_6x16x8_neon_mla,
+    .get_rhs_packed_offset = kai_get_rhs_packed_offset_matmul_clamp_f16_f16_f16p16x1biasf16_6x16x8_neon_mla,
+    .get_dst_offset = kai_get_dst_offset_matmul_clamp_f16_f16_f16p16x1biasf16_6x16x8_neon_mla,
+    .get_dst_size = kai_get_dst_size_matmul_clamp_f16_f16_f16p16x1biasf16_6x16x8_neon_mla,
+    .run_matmul = kai_run_matmul_clamp_f16_f16_f16p16x1biasf16_6x16x8_neon_mla
+};
+
 bool kai_has_fp16() {
 #if defined(__ARM_FEATURE_FP16_SCALAR_ARITHMETIC) && defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
     return true;
@@ -95,6 +112,44 @@ void kai_matmul_fp16_packed_rhs(
     );
 }
 
+size_t kai_get_m_step_fp16() {
+    return ukernel.get_m_step();
+}
+
+size_t kai_get_n_step_fp16() {
+    return ukernel.get_n_step();
+}
+
+void kai_matmul_fp16_tile(
+    size_t m_start,
+    size_t n_start,
+    size_t M, size_t N, size_t K,
+    const uint16_t* lhs,
+    size_t lhs_stride_bytes,
+    const uint16_t* rhs_packed,
+    uint16_t* dst,
+    size_t dst_stride_row_bytes
+) {
+    const size_t m_step = ukernel.get_m_step();
+    const size_t n_step = ukernel.get_n_step();
+
+    const uint8_t* lhs_ptr = (const uint8_t*)lhs + ukernel.get_lhs_packed_offset(m_start, lhs_stride_bytes);
+    const uint8_t* rhs_ptr = (const uint8_t*)rhs_packed + ukernel.get_rhs_packed_offset(n_start, K);
+    uint8_t* dst_ptr = (uint8_t*)dst + ukernel.get_dst_offset(m_start, n_start, dst_stride_row_bytes);
+
+    const size_t actual_m = std::min(M - m_start, m_step);
+    const size_t actual_n = std::min(N - n_start, n_step);
+
+    ukernel.run_matmul(
+        actual_m, actual_n, K,
+        lhs_ptr, lhs_stride_bytes,
+        rhs_ptr,
+        dst_ptr, dst_stride_row_bytes, sizeof(__fp16),
+        static_cast<__fp16>(-std::numeric_limits<float>::infinity()),
+        static_cast<__fp16>(std::numeric_limits<float>::infinity())
+    );
+}
+
 }  // namespace mruntime
 
 #else
@@ -125,6 +180,23 @@ void kai_matmul_fp16_packed_rhs(
     const uint16_t*,
     uint16_t*,
     size_t
+) {
+}
+
+size_t kai_get_m_step_fp16() {
+    return 0;
+}
+
+size_t kai_get_n_step_fp16() {
+    return 0;
+}
+
+void kai_matmul_fp16_tile(
+    size_t, size_t,
+    size_t, size_t, size_t,
+    const uint16_t*, size_t,
+    const uint16_t*,
+    uint16_t*, size_t
 ) {
 }
 
