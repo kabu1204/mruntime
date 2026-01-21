@@ -116,6 +116,7 @@ target_link_libraries(mruntime
 
 if((CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64" OR CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64") AND NOT MSVC)
     set_source_files_properties(src/core/kai_gemm.cpp PROPERTIES COMPILE_OPTIONS "-march=armv8.2-a+fp16")
+    set_source_files_properties(src/qwen2_ops.cpp PROPERTIES COMPILE_OPTIONS "-march=armv8.2-a+fp16")
 endif()
 
 # Platform-specific settings

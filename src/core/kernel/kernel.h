@@ -2,6 +2,9 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cmath>
+#include "mruntime/dtype.h"
+#include "neon.h"
 
 namespace mruntime {
 
@@ -33,5 +36,153 @@ struct FlashAttentionStridedContext {
 };
 
 void FlashAttentionStrided(void* argptr, size_t task_id);
+
+inline void silu_fp16_neon(const __fp16* x, __fp16* output, size_t n) {
+#if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+    size_t i = 0;
+
+    // Software-pipelined main loop:
+    // preload next vector while computing/storing current one.
+    if (n >= 16) {
+        float16x8_t vx = vld1q_f16(x);
+        for (; i + 16 <= n; i += 8) {
+            const float16x8_t vx_next = vld1q_f16(x + i + 8);
+            const float16x8_t vy = ::silu_fp16_neon(vx);
+            vst1q_f16(output + i, vy);
+            vx = vx_next;
+        }
+        const float16x8_t vy = ::silu_fp16_neon(vx);
+        vst1q_f16(output + i, vy);
+        i += 8;
+    } else {
+        for (; i + 8 <= n; i += 8) {
+            const float16x8_t vx = vld1q_f16(x + i);
+            const float16x8_t vy = ::silu_fp16_neon(vx);
+            vst1q_f16(output + i, vy);
+        }
+    }
+
+    // Tail: still route through the same vector kernel.
+    if (i < n) {
+        __fp16 tmp_in[8] = {};
+        __fp16 tmp_out[8];
+        const size_t r = n - i;
+        for (size_t j = 0; j < r; ++j) {
+            tmp_in[j] = x[i + j];
+        }
+        const float16x8_t vx = vld1q_f16(tmp_in);
+        const float16x8_t vy = ::silu_fp16_neon(vx);
+        vst1q_f16(tmp_out, vy);
+        for (size_t j = 0; j < r; ++j) {
+            output[i + j] = tmp_out[j];
+        }
+    }
+#else
+    (void)x;
+    (void)output;
+    (void)n;
+#endif
+}
+inline void fast_exp_fp16_neon(const __fp16* x, __fp16* output, size_t n) {
+#if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+    size_t i = 0;
+
+    // Software-pipelined main loop:
+    // preload next vector while computing/storing current one.
+    if (n >= 16) {
+        float16x8_t vx = vld1q_f16(x);
+        for (; i + 16 <= n; i += 8) {
+            const float16x8_t vx_next = vld1q_f16(x + i + 8);
+            const float16x8_t vy = ::fast_exp_fp16_neon(vx);
+            vst1q_f16(output + i, vy);
+            vx = vx_next;
+        }
+        const float16x8_t vy = ::fast_exp_fp16_neon(vx);
+        vst1q_f16(output + i, vy);
+        i += 8;
+    } else {
+        for (; i + 8 <= n; i += 8) {
+            const float16x8_t vx = vld1q_f16(x + i);
+            const float16x8_t vy = ::fast_exp_fp16_neon(vx);
+            vst1q_f16(output + i, vy);
+        }
+    }
+
+    // Tail: still route through the same vector kernel.
+    if (i < n) {
+        __fp16 tmp_in[8] = {};
+        __fp16 tmp_out[8];
+        const size_t r = n - i;
+        for (size_t j = 0; j < r; ++j) {
+            tmp_in[j] = x[i + j];
+        }
+        const float16x8_t vx = vld1q_f16(tmp_in);
+        const float16x8_t vy = ::fast_exp_fp16_neon(vx);
+        vst1q_f16(tmp_out, vy);
+        for (size_t j = 0; j < r; ++j) {
+            output[i + j] = tmp_out[j];
+        }
+    }
+#else
+    (void)x;
+    (void)output;
+    (void)n;
+#endif
+}
+
+inline void silu_mul_fp16_neon(const __fp16* gate, const __fp16* up, __fp16* output, size_t n) {
+#if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+    size_t i = 0;
+
+    // Software-pipelined main loop:
+    // preload next vectors while computing/storing current one.
+    if (n >= 16) {
+        float16x8_t vg = vld1q_f16(gate);
+        float16x8_t vu = vld1q_f16(up);
+        for (; i + 16 <= n; i += 8) {
+            const float16x8_t vg_next = vld1q_f16(gate + i + 8);
+            const float16x8_t vu_next = vld1q_f16(up + i + 8);
+            const float16x8_t vy = ::silu_mul_fp16_neon(vg, vu);
+            vst1q_f16(output + i, vy);
+            vg = vg_next;
+            vu = vu_next;
+        }
+        const float16x8_t vy = ::silu_mul_fp16_neon(vg, vu);
+        vst1q_f16(output + i, vy);
+        i += 8;
+    } else {
+        for (; i + 8 <= n; i += 8) {
+            const float16x8_t vg = vld1q_f16(gate + i);
+            const float16x8_t vu = vld1q_f16(up + i);
+            const float16x8_t vy = ::silu_mul_fp16_neon(vg, vu);
+            vst1q_f16(output + i, vy);
+        }
+    }
+
+    // Tail: still route through the same vector kernel.
+    if (i < n) {
+        __fp16 tmp_g[8] = {};
+        __fp16 tmp_u[8] = {};
+        __fp16 tmp_out[8];
+        const size_t r = n - i;
+        for (size_t j = 0; j < r; ++j) {
+            tmp_g[j] = gate[i + j];
+            tmp_u[j] = up[i + j];
+        }
+        const float16x8_t vg = vld1q_f16(tmp_g);
+        const float16x8_t vu = vld1q_f16(tmp_u);
+        const float16x8_t vy = ::silu_mul_fp16_neon(vg, vu);
+        vst1q_f16(tmp_out, vy);
+        for (size_t j = 0; j < r; ++j) {
+            output[i + j] = tmp_out[j];
+        }
+    }
+#else
+    (void)gate;
+    (void)up;
+    (void)output;
+    (void)n;
+#endif
+}
 
 }  // namespace mruntime

@@ -9,6 +9,9 @@
 #include <vector>
 
 #include "mruntime/dtype.h"
+#if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+#include "kernel/kernel.h"
+#endif
 #include "kai_gemm.h"
 
 namespace mruntime {
@@ -350,6 +353,31 @@ void qwen2_silu_fp16(
     size_t n,
     PThreadPool* pool
 ) {
+#if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+    auto worker_range = [&](size_t start, size_t len) {
+        // Runtime FP16 is stored as raw IEEE754 binary16 bits (uint16_t).
+        // On Arm with FP16 vector arithmetic, this matches __fp16 in-memory
+        // representation, so we can reinterpret and use the NEON wrapper.
+        const __fp16* in = reinterpret_cast<const __fp16*>(input + start);
+        __fp16* out = reinterpret_cast<__fp16*>(output + start);
+        silu_fp16_neon(in, out, len);
+    };
+
+    if (pool) {
+        constexpr size_t kGrain = 4096;  // elements
+        const size_t task_count = (n + kGrain - 1) / kGrain;
+        auto worker = [&](size_t task_id) {
+            const size_t start = task_id * kGrain;
+            const size_t len = std::min(kGrain, n - start);
+            worker_range(start, len);
+        };
+        pool->parallelize_1d(task_count, worker);
+    } else {
+        worker_range(0, n);
+    }
+    return;
+#endif
+
     auto worker = [&](size_t i) {
         float x = fp16_bits_to_float(input[i]);
         float result = x / (1.0f + std::exp(-x));
@@ -390,6 +418,29 @@ void qwen2_silu_mul_fp16(
     size_t n,
     PThreadPool* pool
 ) {
+#if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+    auto worker_range = [&](size_t start, size_t len) {
+        const __fp16* g = reinterpret_cast<const __fp16*>(gate + start);
+        const __fp16* u = reinterpret_cast<const __fp16*>(up + start);
+        __fp16* out = reinterpret_cast<__fp16*>(output + start);
+        silu_mul_fp16_neon(g, u, out, len);
+    };
+
+    if (pool) {
+        constexpr size_t kGrain = 4096;  // elements
+        const size_t task_count = (n + kGrain - 1) / kGrain;
+        auto worker = [&](size_t task_id) {
+            const size_t start = task_id * kGrain;
+            const size_t len = std::min(kGrain, n - start);
+            worker_range(start, len);
+        };
+        pool->parallelize_1d(task_count, worker);
+    } else {
+        worker_range(0, n);
+    }
+    return;
+#endif
+
     auto worker = [&](size_t i) {
         float g = fp16_bits_to_float(gate[i]);
         float u = fp16_bits_to_float(up[i]);
