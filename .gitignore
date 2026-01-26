@@ -30,4 +30,4 @@ Makefile
 # Debug symbols
 *.dSYM/
 
-**/trace.json
+**/trace*.json

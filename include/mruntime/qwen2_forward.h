@@ -26,6 +26,30 @@ uint16_t* qwen2_forward(
     PThreadPool* pool
 );
 
+// Prefill only (process prompt, reset+fill KV cache, no generation).
+// Returns pointer to logits for the last prompt token [vocab_size].
+const uint16_t* qwen2_prefill(
+    const QwenConfig& cfg,
+    const Qwen2Weights& weights,
+    Qwen2KVCache& kv_cache,
+    Qwen2Scratch& scratch,
+    const int32_t* prompt_tokens,
+    size_t prompt_len,
+    PThreadPool* pool
+);
+
+// Decode logits for a single token (for streaming generation).
+// Input: `input_token` (the token appended to the sequence).
+// Output: logits [vocab_size] for sampling the next token.
+uint16_t* qwen2_decode(
+    const QwenConfig& cfg,
+    const Qwen2Weights& weights,
+    Qwen2KVCache& kv_cache,
+    Qwen2Scratch& scratch,
+    int32_t input_token,
+    PThreadPool* pool
+);
+
 // ============================================================================
 // Layer-Level Functions (for debugging/profiling)
 // ============================================================================

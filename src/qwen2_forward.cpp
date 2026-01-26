@@ -1,5 +1,6 @@
 #include "mruntime/qwen2_forward.h"
 
+#include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <cstring>
@@ -11,12 +12,9 @@
 
 namespace mruntime {
 
-// ============================================================================
-// Internal Helper: Add bias to projection output
-// ============================================================================
-
 namespace {
 
+// Internal Helper: Add bias to projection output
 void add_bias_fp16(
     uint16_t* output,           // [num_tokens, out_features]
     const uint16_t* bias,       // [out_features] (may be nullptr)
@@ -32,6 +30,228 @@ void add_bias_fp16(
             output[t * out_features + i] = float_to_fp16_bits(v);
         }
     }
+}
+
+uint16_t* qwen2_forward_hidden(
+    const QwenConfig& cfg,
+    const Qwen2Weights& weights,
+    Qwen2KVCache& kv_cache,
+    Qwen2Scratch& scratch,
+    const int32_t* token_ids,
+    size_t num_tokens,
+    PThreadPool* pool
+) {
+    const size_t hidden_size = cfg.hidden_size;
+    const size_t head_dim = cfg.head_dim();
+    const size_t position_offset = kv_cache.seq_len;
+
+    // Embedding lookup
+    {
+        TRACE_SCOPE_CAT("embedding", "forward");
+        qwen2_embedding_lookup_fp16(
+            weights.embed_tokens,
+            token_ids,
+            scratch.hidden,
+            num_tokens,
+            cfg.vocab_size,
+            hidden_size
+        );
+    }
+
+    // Process each transformer layer
+    uint16_t* current_hidden = scratch.hidden;
+    uint16_t* next_hidden = scratch.residual;
+
+    for (size_t layer_idx = 0; layer_idx < cfg.num_layers; ++layer_idx) {
+        TRACE_SCOPE_CAT("layer", "forward");
+
+        const Qwen2LayerWeights& layer = weights.layers[layer_idx];
+
+        uint16_t* k_cache_layer = kv_cache.k_layer(layer_idx, cfg.num_kv_heads, head_dim);
+        uint16_t* v_cache_layer = kv_cache.v_layer(layer_idx, cfg.num_kv_heads, head_dim);
+
+        // Input LayerNorm
+        {
+            TRACE_SCOPE_CAT("input_norm", "norm");
+            qwen2_rmsnorm_fp16(
+                current_hidden,
+                layer.input_norm,
+                scratch.normed,
+                num_tokens,
+                hidden_size,
+                cfg.rms_norm_eps,
+                pool
+            );
+        }
+
+        // Self-attention
+        qwen2_attention(
+            cfg,
+            layer,
+            k_cache_layer,
+            v_cache_layer,
+            position_offset,
+            kv_cache.max_seq_len,
+            scratch.normed,
+            scratch.attn_out,  // Reuse attn_out as temp storage for attention output
+            scratch,
+            num_tokens,
+            pool
+        );
+
+        // First residual: next_hidden = current_hidden + attn_out
+        {
+            TRACE_SCOPE_CAT("residual_add", "elementwise");
+            // Reinterpret attn_out as [num_tokens, hidden_size] for the add
+            qwen2_add_fp16(
+                current_hidden,
+                scratch.attn_out,
+                next_hidden,
+                num_tokens * hidden_size,
+                pool
+            );
+        }
+
+        // Post-attention LayerNorm
+        {
+            TRACE_SCOPE_CAT("post_attn_norm", "norm");
+            qwen2_rmsnorm_fp16(
+                next_hidden,
+                layer.post_attn_norm,
+                scratch.normed,
+                num_tokens,
+                hidden_size,
+                cfg.rms_norm_eps,
+                pool
+            );
+        }
+
+        // MLP
+        qwen2_mlp(
+            cfg,
+            layer,
+            scratch.normed,
+            scratch.mlp_out,
+            scratch,
+            num_tokens,
+            pool
+        );
+
+        // Second residual: current_hidden = next_hidden + mlp_out
+        {
+            TRACE_SCOPE_CAT("residual_add", "elementwise");
+            qwen2_add_fp16(
+                next_hidden,
+                scratch.mlp_out,
+                current_hidden,
+                num_tokens * hidden_size,
+                pool
+            );
+        }
+    }
+
+    // Update KV cache sequence length
+    kv_cache.seq_len = position_offset + num_tokens;
+
+    return current_hidden;
+}
+
+uint16_t* forward_chunk_last_logits(
+    const QwenConfig& cfg,
+    const Qwen2Weights& weights,
+    Qwen2KVCache& kv_cache,
+    Qwen2Scratch& scratch,
+    const int32_t* token_ids,
+    size_t num_tokens,
+    PThreadPool* pool
+) {
+    TRACE_SCOPE_CAT("qwen2_forward_chunk_last_logits", "forward");
+
+    assert(num_tokens > 0);
+    assert(num_tokens <= scratch.max_tokens);
+    if (num_tokens > scratch.max_tokens) {
+        throw std::runtime_error(
+            "qwen2_forward_chunk_last_logits: num_tokens exceeds scratch.max_tokens; increase max_batch_tokens"
+        );
+    }
+
+    const size_t hidden_size = cfg.hidden_size;
+    const uint16_t* current_hidden = qwen2_forward_hidden(
+        cfg,
+        weights,
+        kv_cache,
+        scratch,
+        token_ids,
+        num_tokens,
+        pool
+    );
+
+    const uint16_t* last_hidden = current_hidden + (num_tokens - 1) * hidden_size;
+
+    // Final LayerNorm (last token only)
+    {
+        TRACE_SCOPE_CAT("final_norm", "norm");
+        qwen2_rmsnorm_fp16(
+            last_hidden,
+            weights.final_norm,
+            scratch.normed,
+            1,
+            hidden_size,
+            cfg.rms_norm_eps,
+            pool
+        );
+    }
+
+    // LM head projection (last token only): [1, hidden] @ [vocab, hidden]^T -> [1, vocab]
+    {
+        TRACE_SCOPE_ARGS_CAT(
+            "lm_head",
+            "gemm",
+            ::mruntime::trace_arg("m", 1),
+            ::mruntime::trace_arg("n", static_cast<int64_t>(cfg.vocab_size)),
+            ::mruntime::trace_arg("k", static_cast<int64_t>(hidden_size))
+        );
+        qwen2_gemm_fp16(
+            scratch.normed,
+            weights.lm_head,
+            scratch.logits,
+            1, cfg.vocab_size, hidden_size,
+            weights.lm_head_packed,
+            pool
+        );
+    }
+
+    return scratch.logits;
+}
+
+void forward_chunk_no_logits(
+    const QwenConfig& cfg,
+    const Qwen2Weights& weights,
+    Qwen2KVCache& kv_cache,
+    Qwen2Scratch& scratch,
+    const int32_t* token_ids,
+    size_t num_tokens,
+    PThreadPool* pool
+) {
+    TRACE_SCOPE_CAT("qwen2_forward_chunk_no_logits", "forward");
+
+    assert(num_tokens > 0);
+    assert(num_tokens <= scratch.max_tokens);
+    if (num_tokens > scratch.max_tokens) {
+        throw std::runtime_error(
+            "qwen2_forward_chunk_no_logits: num_tokens exceeds scratch.max_tokens; increase max_batch_tokens"
+        );
+    }
+
+    (void)qwen2_forward_hidden(
+        cfg,
+        weights,
+        kv_cache,
+        scratch,
+        token_ids,
+        num_tokens,
+        pool
+    );
 }
 
 }  // namespace
@@ -414,116 +634,15 @@ uint16_t* qwen2_forward(
     }
 
     const size_t hidden_size = cfg.hidden_size;
-    const size_t head_dim = cfg.head_dim();
-    const size_t position_offset = kv_cache.seq_len;
-
-    // Embedding lookup
-    {
-        TRACE_SCOPE_CAT("embedding", "forward");
-        qwen2_embedding_lookup_fp16(
-            weights.embed_tokens,
-            token_ids,
-            scratch.hidden,
-            num_tokens,
-            cfg.vocab_size,
-            hidden_size
-        );
-    }
-
-    // Process each transformer layer
-    uint16_t* current_hidden = scratch.hidden;
-    uint16_t* next_hidden = scratch.residual;
-
-    for (size_t layer_idx = 0; layer_idx < cfg.num_layers; ++layer_idx) {
-        TRACE_SCOPE_CAT("layer", "forward");
-
-        const Qwen2LayerWeights& layer = weights.layers[layer_idx];
-
-        uint16_t* k_cache_layer = kv_cache.k_layer(layer_idx, cfg.num_kv_heads, head_dim);
-        uint16_t* v_cache_layer = kv_cache.v_layer(layer_idx, cfg.num_kv_heads, head_dim);
-
-        // Input LayerNorm
-        {
-            TRACE_SCOPE_CAT("input_norm", "norm");
-            qwen2_rmsnorm_fp16(
-                current_hidden,
-                layer.input_norm,
-                scratch.normed,
-                num_tokens,
-                hidden_size,
-                cfg.rms_norm_eps,
-                pool
-            );
-        }
-
-        // Self-attention
-        qwen2_attention(
-            cfg,
-            layer,
-            k_cache_layer,
-            v_cache_layer,
-            position_offset,
-            kv_cache.max_seq_len,
-            scratch.normed,
-            scratch.attn_out,  // Reuse attn_out as temp storage for attention output
-            scratch,
-            num_tokens,
-            pool
-        );
-
-        // First residual: next_hidden = current_hidden + attn_out
-        {
-            TRACE_SCOPE_CAT("residual_add", "elementwise");
-            // Reinterpret attn_out as [num_tokens, hidden_size] for the add
-            qwen2_add_fp16(
-                current_hidden,
-                scratch.attn_out,
-                next_hidden,
-                num_tokens * hidden_size,
-                pool
-            );
-        }
-
-        // Post-attention LayerNorm
-        {
-            TRACE_SCOPE_CAT("post_attn_norm", "norm");
-            qwen2_rmsnorm_fp16(
-                next_hidden,
-                layer.post_attn_norm,
-                scratch.normed,
-                num_tokens,
-                hidden_size,
-                cfg.rms_norm_eps,
-                pool
-            );
-        }
-
-        // MLP
-        qwen2_mlp(
-            cfg,
-            layer,
-            scratch.normed,
-            scratch.mlp_out,
-            scratch,
-            num_tokens,
-            pool
-        );
-
-        // Second residual: current_hidden = next_hidden + mlp_out
-        {
-            TRACE_SCOPE_CAT("residual_add", "elementwise");
-            qwen2_add_fp16(
-                next_hidden,
-                scratch.mlp_out,
-                current_hidden,
-                num_tokens * hidden_size,
-                pool
-            );
-        }
-    }
-
-    // Update KV cache sequence length
-    kv_cache.seq_len = position_offset + num_tokens;
+    const uint16_t* current_hidden = qwen2_forward_hidden(
+        cfg,
+        weights,
+        kv_cache,
+        scratch,
+        token_ids,
+        num_tokens,
+        pool
+    );
 
     // Final LayerNorm
     {
@@ -559,6 +678,81 @@ uint16_t* qwen2_forward(
     }
 
     return scratch.logits;
+}
+
+const uint16_t* qwen2_prefill(
+    const QwenConfig& cfg,
+    const Qwen2Weights& weights,
+    Qwen2KVCache& kv_cache,
+    Qwen2Scratch& scratch,
+    const int32_t* prompt_tokens,
+    size_t prompt_len,
+    PThreadPool* pool
+) {
+    TRACE_SCOPE_CAT("qwen2_prefill", "forward");
+
+    if (prompt_len == 0) {
+        return nullptr;
+    }
+
+    // Reset KV cache for new sequence.
+    qwen2_reset_kv_cache(kv_cache);
+
+    size_t processed = 0;
+    const uint16_t* last_logits = nullptr;
+
+    // Process prompt in chunks to stay within scratch.max_tokens.
+    while (processed < prompt_len) {
+        const size_t chunk = std::min(scratch.max_tokens, prompt_len - processed);
+        const bool is_last_chunk = (processed + chunk == prompt_len);
+
+        if (is_last_chunk) {
+            last_logits = forward_chunk_last_logits(
+                cfg,
+                weights,
+                kv_cache,
+                scratch,
+                prompt_tokens + processed,
+                chunk,
+                pool
+            );
+        } else {
+            forward_chunk_no_logits(
+                cfg,
+                weights,
+                kv_cache,
+                scratch,
+                prompt_tokens + processed,
+                chunk,
+                pool
+            );
+        }
+
+        processed += chunk;
+    }
+
+    return last_logits;
+}
+
+uint16_t* qwen2_decode(
+    const QwenConfig& cfg,
+    const Qwen2Weights& weights,
+    Qwen2KVCache& kv_cache,
+    Qwen2Scratch& scratch,
+    int32_t input_token,
+    PThreadPool* pool
+) {
+    TRACE_SCOPE_CAT("qwen2_decode", "forward");
+
+    return qwen2_forward(
+        cfg,
+        weights,
+        kv_cache,
+        scratch,
+        &input_token,
+        1,
+        pool
+    );
 }
 
 }  // namespace mruntime

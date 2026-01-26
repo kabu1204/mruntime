@@ -145,79 +145,6 @@ int32_t qwen2_sample(
 }
 
 // ============================================================================
-// Prefill
-// ============================================================================
-
-const uint16_t* qwen2_prefill(
-    const QwenConfig& cfg,
-    const Qwen2Weights& weights,
-    Qwen2KVCache& kv_cache,
-    Qwen2Scratch& scratch,
-    const int32_t* prompt_tokens,
-    size_t prompt_len,
-    PThreadPool* pool
-) {
-    if (prompt_len == 0) {
-        return nullptr;
-    }
-
-    // Reset KV cache for new sequence
-    qwen2_reset_kv_cache(kv_cache);
-
-    size_t processed = 0;
-    const uint16_t* last_logits = nullptr;
-
-    // Process prompt in chunks to stay within scratch.max_tokens
-    while (processed < prompt_len) {
-        const size_t chunk = std::min(scratch.max_tokens, prompt_len - processed);
-
-        uint16_t* logits = qwen2_forward(
-            cfg,
-            weights,
-            kv_cache,
-            scratch,
-            prompt_tokens + processed,
-            chunk,
-            pool
-        );
-
-        processed += chunk;
-        last_logits = logits + (chunk - 1) * cfg.vocab_size;
-    }
-
-    return last_logits;
-}
-
-// ============================================================================
-// Decode Step
-// ============================================================================
-
-int32_t qwen2_decode_step(
-    const QwenConfig& cfg,
-    const Qwen2Weights& weights,
-    Qwen2KVCache& kv_cache,
-    Qwen2Scratch& scratch,
-    int32_t input_token,
-    const Qwen2GenerateConfig& gen_cfg,
-    uint64_t* rng_state,
-    PThreadPool* pool
-) {
-    // Forward pass for single token
-    uint16_t* logits = qwen2_forward(
-        cfg,
-        weights,
-        kv_cache,
-        scratch,
-        &input_token,
-        1,
-        pool
-    );
-
-    // Sample next token from logits
-    return qwen2_sample(logits, cfg.vocab_size, gen_cfg, rng_state);
-}
-
-// ============================================================================
 // Full Generation
 // ============================================================================
 
@@ -266,16 +193,15 @@ size_t qwen2_generate(
 
     // Autoregressive decoding
     for (size_t i = 1; i < gen_cfg.max_new_tokens; ++i) {
-        next_token = qwen2_decode_step(
+        const uint16_t* logits = qwen2_decode(
             cfg,
             weights,
             kv_cache,
             scratch,
             next_token,
-            gen_cfg,
-            &rng_state,
             pool
         );
+        next_token = qwen2_sample(logits, cfg.vocab_size, gen_cfg, &rng_state);
 
         output_tokens[total_len] = next_token;
         total_len++;

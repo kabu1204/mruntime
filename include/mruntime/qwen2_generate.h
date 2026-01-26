@@ -61,33 +61,4 @@ int32_t qwen2_argmax_fp16(
     size_t vocab_size
 );
 
-// ============================================================================
-// Streaming Generation
-// ============================================================================
-
-// Prefill only (process prompt, fill KV cache, no generation)
-// Returns pointer to logits for the last token
-const uint16_t* qwen2_prefill(
-    const QwenConfig& cfg,
-    const Qwen2Weights& weights,
-    Qwen2KVCache& kv_cache,
-    Qwen2Scratch& scratch,
-    const int32_t* prompt_tokens,
-    size_t prompt_len,
-    PThreadPool* pool
-);
-
-// Single decode step (for streaming generation)
-// Returns the sampled token id
-int32_t qwen2_decode_step(
-    const QwenConfig& cfg,
-    const Qwen2Weights& weights,
-    Qwen2KVCache& kv_cache,
-    Qwen2Scratch& scratch,
-    int32_t input_token,
-    const Qwen2GenerateConfig& gen_cfg,
-    uint64_t* rng_state,
-    PThreadPool* pool
-);
-
 }  // namespace mruntime
