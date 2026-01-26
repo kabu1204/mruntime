@@ -462,6 +462,29 @@ void qwen2_add_fp16(
     size_t n,
     PThreadPool* pool
 ) {
+#if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+    auto worker_range = [&](size_t start, size_t len) {
+        const __fp16* in_a = reinterpret_cast<const __fp16*>(a + start);
+        const __fp16* in_b = reinterpret_cast<const __fp16*>(b + start);
+        __fp16* out = reinterpret_cast<__fp16*>(output + start);
+        add_fp16_neon(in_a, in_b, out, len);
+    };
+
+    if (pool) {
+        constexpr size_t kGrain = 4096;  // elements
+        const size_t task_count = (n + kGrain - 1) / kGrain;
+        auto worker = [&](size_t task_id) {
+            const size_t start = task_id * kGrain;
+            const size_t len = std::min(kGrain, n - start);
+            worker_range(start, len);
+        };
+        pool->parallelize_1d(task_count, worker);
+    } else {
+        worker_range(0, n);
+    }
+    return;
+#endif
+
     auto worker = [&](size_t i) {
         float av = fp16_bits_to_float(a[i]);
         float bv = fp16_bits_to_float(b[i]);

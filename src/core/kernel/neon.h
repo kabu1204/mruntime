@@ -134,4 +134,8 @@ static inline float16x8_t silu_mul_fp16_neon(float16x8_t gate, float16x8_t up) {
     return vmulq_f16(silu_fp16_neon(gate), up);
 }
 
+static inline float16x8_t add_fp16_neon(float16x8_t a, float16x8_t b) {
+    return vaddq_f16(a, b);
+}
+
 #endif

@@ -185,4 +185,59 @@ inline void silu_mul_fp16_neon(const __fp16* gate, const __fp16* up, __fp16* out
 #endif
 }
 
+inline void add_fp16_neon(const __fp16* a, const __fp16* b, __fp16* output, size_t n) {
+#if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+    size_t i = 0;
+
+    // Software-pipelined main loop:
+    // preload next vectors while computing/storing current one.
+    if (n >= 16) {
+        float16x8_t va = vld1q_f16(a);
+        float16x8_t vb = vld1q_f16(b);
+        for (; i + 16 <= n; i += 8) {
+            const float16x8_t va_next = vld1q_f16(a + i + 8);
+            const float16x8_t vb_next = vld1q_f16(b + i + 8);
+            const float16x8_t vy = ::add_fp16_neon(va, vb);
+            vst1q_f16(output + i, vy);
+            va = va_next;
+            vb = vb_next;
+        }
+        const float16x8_t vy = ::add_fp16_neon(va, vb);
+        vst1q_f16(output + i, vy);
+        i += 8;
+    } else {
+        for (; i + 8 <= n; i += 8) {
+            const float16x8_t va = vld1q_f16(a + i);
+            const float16x8_t vb = vld1q_f16(b + i);
+            const float16x8_t vy = ::add_fp16_neon(va, vb);
+            vst1q_f16(output + i, vy);
+        }
+    }
+
+    // Tail: still route through the same vector kernel.
+    if (i < n) {
+        __fp16 tmp_a[8] = {};
+        __fp16 tmp_b[8] = {};
+        __fp16 tmp_out[8];
+        const size_t r = n - i;
+        for (size_t j = 0; j < r; ++j) {
+            tmp_a[j] = a[i + j];
+            tmp_b[j] = b[i + j];
+        }
+        const float16x8_t va = vld1q_f16(tmp_a);
+        const float16x8_t vb = vld1q_f16(tmp_b);
+        const float16x8_t vy = ::add_fp16_neon(va, vb);
+        vst1q_f16(tmp_out, vy);
+        for (size_t j = 0; j < r; ++j) {
+            output[i + j] = tmp_out[j];
+        }
+    }
+#else
+    (void)a;
+    (void)b;
+    (void)output;
+    (void)n;
+#endif
+}
+
 }  // namespace mruntime
