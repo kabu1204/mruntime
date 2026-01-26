@@ -77,18 +77,29 @@ void qwen2_gemm_fp16(
 
     // KleidiAI multi-threaded fast path (Arm64 with FP16)
     if (qwen2_has_kai_fp16() && packed_B != nullptr) {
-        const size_t m_step = kai_get_m_step_fp16();
         const size_t n_step = kai_get_n_step_fp16();
 
-        const size_t m_tiles = (M + m_step - 1) / m_step;
         const size_t n_tiles = (N + n_step - 1) / n_step;
-        const size_t total_tiles = m_tiles * n_tiles;
+        if (pool == nullptr || pool->threads_count() <= 1 || n_tiles <= 1) {
+            kai_matmul_fp16_packed_rhs(
+                M, N, K,
+                A, K * sizeof(uint16_t),
+                packed_B,
+                C, N * sizeof(uint16_t)
+            );
+            return;
+        }
 
-        auto tile_worker = [&](size_t tile_idx) {
-            size_t m_start = (tile_idx / n_tiles) * m_step;
-            size_t n_start = (tile_idx % n_tiles) * n_step;
-            kai_matmul_fp16_tile(
-                m_start, n_start,
+        const size_t stripe_count = std::min(n_tiles, pool->threads_count() * size_t{4});
+        auto stripe_worker = [&](size_t stripe_id) {
+            const size_t tile_begin = stripe_id * n_tiles / stripe_count;
+            const size_t tile_end = (stripe_id + 1) * n_tiles / stripe_count;
+
+            const size_t n_start = tile_begin * n_step;
+            const size_t n_end = std::min(N, tile_end * n_step);
+
+            kai_matmul_fp16_packed_rhs_stripe(
+                n_start, n_end - n_start,
                 M, N, K,
                 A, K * sizeof(uint16_t),
                 packed_B,
@@ -96,11 +107,7 @@ void qwen2_gemm_fp16(
             );
         };
 
-        if (pool) {
-            pool->parallelize_1d(total_tiles, tile_worker);
-        } else {
-            for (size_t i = 0; i < total_tiles; ++i) tile_worker(i);
-        }
+        pool->parallelize_1d(stripe_count, stripe_worker);
         return;
     }
 

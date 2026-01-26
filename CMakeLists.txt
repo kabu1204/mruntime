@@ -47,7 +47,13 @@ FetchContent_Declare(
 FetchContent_Declare(
     kleidiai
     GIT_REPOSITORY https://github.com/ARM-software/kleidiai.git
-    GIT_TAG v0.1.0
+    GIT_TAG v1.20.0
+    GIT_SHALLOW TRUE
+)
+FetchContent_Declare(
+    googletest
+    GIT_REPOSITORY https://github.com/google/googletest.git
+    GIT_TAG v1.15.2
     GIT_SHALLOW TRUE
 )
 set(ABSL_BUILD_TESTING OFF CACHE BOOL "Disable Abseil tests")
@@ -62,6 +68,8 @@ set(PTHREADPOOL_BUILD_SHARED_LIBRARY OFF CACHE BOOL "Build pthreadpool as a shar
 set(KLEIDIAI_BUILD_TESTS OFF CACHE BOOL "Disable KleidiAI tests")
 set(KLEIDIAI_BUILD_BENCHMARK OFF CACHE BOOL "Disable KleidiAI benchmark tool")
 set(KLEIDIAI_ENABLE_CLANG_TIDY OFF CACHE BOOL "Disable KleidiAI clang-tidy checks")
+set(BUILD_GMOCK OFF CACHE BOOL "Disable gMock")
+set(INSTALL_GTEST OFF CACHE BOOL "Disable googletest install rules")
 set(_MRUNTIME_PREV_SKIP_INSTALL_RULES "${CMAKE_SKIP_INSTALL_RULES}")
 set(CMAKE_SKIP_INSTALL_RULES TRUE)
 FetchContent_MakeAvailable(spdlog absl re2 nlohmann_json pthreadpool kleidiai)
@@ -130,6 +138,7 @@ endif()
 # Tests
 if(MRUNTIME_BUILD_TESTS)
     enable_testing()
+    FetchContent_MakeAvailable(googletest)
     add_subdirectory(test)
 endif()
 

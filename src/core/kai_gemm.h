@@ -37,6 +37,21 @@ void kai_matmul_fp16_packed_rhs(
     size_t dst_stride_row_bytes
 );
 
+// Compute a contiguous N stripe [n_start, n_start + n_len) for all M rows.
+// n_start must be divisible by kai_get_n_step_fp16().
+void kai_matmul_fp16_packed_rhs_stripe(
+    size_t n_start,
+    size_t n_len,
+    size_t M,
+    size_t N,
+    size_t K,
+    const uint16_t* lhs,
+    size_t lhs_stride_bytes,
+    const uint16_t* rhs_packed,
+    uint16_t* dst,
+    size_t dst_stride_row_bytes
+);
+
 // Tile stepping info for parallelization
 size_t kai_get_m_step_fp16();
 size_t kai_get_n_step_fp16();
