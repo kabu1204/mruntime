@@ -193,4 +193,8 @@ inline void store_scalar_from_fp32(void* data, DType dtype, size_t index, float 
     throw std::invalid_argument("Unknown dtype");
 }
 
+// Bulk conversion utilities (SIMD-accelerated when available).
+void fp16_bits_to_fp32(const uint16_t* src, float* dst, size_t n);
+void fp32_to_fp16_bits(const float* src, uint16_t* dst, size_t n);
+
 }  // namespace mruntime

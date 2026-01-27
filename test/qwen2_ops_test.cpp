@@ -1,5 +1,11 @@
 #include <gtest/gtest.h>
 
+#include <cmath>
+#include <cstdint>
+#include <cstring>
+#include <limits>
+#include <vector>
+
 #include "mruntime/arena.h"
 #include "mruntime/dtype.h"
 #include "mruntime/qwen2_ops.h"
@@ -182,4 +188,68 @@ TEST(Qwen2OpsTest, Argmax) {
 
     int32_t result = qwen2_argmax_fp16(logits.data(), vocab_size);
     EXPECT_EQ(result, 1);
+}
+
+TEST(DTypeTest, Fp32ToFp16BitsBulkMatchesScalar) {
+    const std::vector<float> src = {
+        0.0f,
+        -0.0f,
+        1.0f,
+        -1.0f,
+        0.001f,
+        123.456f,
+        -789.0f,
+        65504.0f,   // max finite FP16
+        70000.0f,   // overflow -> +inf
+        -70000.0f,  // overflow -> -inf
+        std::numeric_limits<float>::infinity(),
+        -std::numeric_limits<float>::infinity(),
+        42.0f,
+        -42.0f,
+        3.1415926f,
+        -2.7182818f,
+        16.0f,  // tail coverage (17 elems)
+    };
+
+    std::vector<uint16_t> dst(src.size());
+    fp32_to_fp16_bits(src.data(), dst.data(), dst.size());
+
+    for (size_t i = 0; i < src.size(); ++i) {
+        EXPECT_EQ(dst[i], float_to_fp16_bits(src[i])) << "i=" << i;
+    }
+}
+
+TEST(DTypeTest, Fp16BitsToFp32BulkMatchesScalar) {
+    const std::vector<uint16_t> src = {
+        0x0000u,  // +0
+        0x8000u,  // -0
+        0x3C00u,  // +1
+        0xBC00u,  // -1
+        0x7BFFu,  // max finite
+        0x0400u,  // min normal
+        0x7C00u,  // +inf
+        0xFC00u,  // -inf
+        0x7E00u,  // NaN
+        0x3555u,
+        0xB555u,
+        0x2A66u,
+        0xAA66u,  // tail coverage (13 elems)
+    };
+
+    std::vector<float> dst(src.size());
+    fp16_bits_to_fp32(src.data(), dst.data(), dst.size());
+
+    for (size_t i = 0; i < src.size(); ++i) {
+        const float expected = fp16_bits_to_float(src[i]);
+        if (std::isnan(expected)) {
+            EXPECT_TRUE(std::isnan(dst[i])) << "i=" << i;
+            continue;
+        }
+
+        uint32_t expected_bits = 0;
+        uint32_t actual_bits = 0;
+        std::memcpy(&expected_bits, &expected, sizeof(expected_bits));
+        std::memcpy(&actual_bits, &dst[i], sizeof(actual_bits));
+        EXPECT_EQ(actual_bits, expected_bits) << "i=" << i;
+    }
 }

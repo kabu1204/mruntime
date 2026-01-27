@@ -132,9 +132,7 @@ uint16_t* load_tensor_to_arena(
     } else if (info.dtype == DType::FP32) {
         // Convert FP32 to FP16
         const float* src_fp32 = static_cast<const float*>(src);
-        for (size_t i = 0; i < numel; ++i) {
-            dst[i] = float_to_fp16_bits(src_fp32[i]);
-        }
+        fp32_to_fp16_bits(src_fp32, dst, numel);
     } else {
         throw std::runtime_error("Unsupported dtype for tensor: " + name);
     }

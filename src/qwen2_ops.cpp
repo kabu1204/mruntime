@@ -16,6 +16,26 @@
 
 namespace mruntime {
 
+void fp16_bits_to_fp32(const uint16_t* src, float* dst, size_t n) {
+#if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+    ::fp16_bits_to_fp32_neon(src, dst, n);
+    return;
+#endif
+    for (size_t i = 0; i < n; ++i) {
+        dst[i] = fp16_bits_to_float(src[i]);
+    }
+}
+
+void fp32_to_fp16_bits(const float* src, uint16_t* dst, size_t n) {
+#if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+    ::fp32_to_fp16_bits_neon(src, dst, n);
+    return;
+#endif
+    for (size_t i = 0; i < n; ++i) {
+        dst[i] = float_to_fp16_bits(src[i]);
+    }
+}
+
 // ============================================================================
 // GEMM
 // ============================================================================

@@ -1,4 +1,8 @@
 #pragma once
+
+#include <cstddef>
+#include <cstdint>
+
 #if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
 
 #include <arm_neon.h>
@@ -136,6 +140,66 @@ static inline float16x8_t silu_mul_fp16_neon(float16x8_t gate, float16x8_t up) {
 
 static inline float16x8_t add_fp16_neon(float16x8_t a, float16x8_t b) {
     return vaddq_f16(a, b);
+}
+
+static inline void fp16_bits_to_fp32_neon(const uint16_t* src, float* dst, size_t n) {
+    size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        const uint16x8_t bits = vld1q_u16(src + i);
+        const float16x8_t half = vreinterpretq_f16_u16(bits);
+        const float32x4_t lo = vcvt_f32_f16(vget_low_f16(half));
+        const float32x4_t hi = vcvt_f32_f16(vget_high_f16(half));
+        vst1q_f32(dst + i, lo);
+        vst1q_f32(dst + i + 4, hi);
+    }
+
+    if (i < n) {
+        uint16_t tmp_in[8] = {};
+        float tmp_out[8];
+        const size_t r = n - i;
+        for (size_t j = 0; j < r; ++j) {
+            tmp_in[j] = src[i + j];
+        }
+
+        const uint16x8_t bits = vld1q_u16(tmp_in);
+        const float16x8_t half = vreinterpretq_f16_u16(bits);
+        const float32x4_t lo = vcvt_f32_f16(vget_low_f16(half));
+        const float32x4_t hi = vcvt_f32_f16(vget_high_f16(half));
+        vst1q_f32(tmp_out, lo);
+        vst1q_f32(tmp_out + 4, hi);
+
+        for (size_t j = 0; j < r; ++j) {
+            dst[i + j] = tmp_out[j];
+        }
+    }
+}
+
+static inline void fp32_to_fp16_bits_neon(const float* src, uint16_t* dst, size_t n) {
+    size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        const float32x4_t lo = vld1q_f32(src + i);
+        const float32x4_t hi = vld1q_f32(src + i + 4);
+        const float16x8_t half = vcombine_f16(vcvt_f16_f32(lo), vcvt_f16_f32(hi));
+        vst1q_u16(dst + i, vreinterpretq_u16_f16(half));
+    }
+
+    if (i < n) {
+        float tmp_in[8] = {};
+        uint16_t tmp_out[8];
+        const size_t r = n - i;
+        for (size_t j = 0; j < r; ++j) {
+            tmp_in[j] = src[i + j];
+        }
+
+        const float32x4_t lo = vld1q_f32(tmp_in);
+        const float32x4_t hi = vld1q_f32(tmp_in + 4);
+        const float16x8_t half = vcombine_f16(vcvt_f16_f32(lo), vcvt_f16_f32(hi));
+        vst1q_u16(tmp_out, vreinterpretq_u16_f16(half));
+
+        for (size_t j = 0; j < r; ++j) {
+            dst[i + j] = tmp_out[j];
+        }
+    }
 }
 
 #endif
