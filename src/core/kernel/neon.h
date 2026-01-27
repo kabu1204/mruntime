@@ -142,6 +142,40 @@ static inline float16x8_t add_fp16_neon(float16x8_t a, float16x8_t b) {
     return vaddq_f16(a, b);
 }
 
+// Apply rotary position embedding to one [head_dim] vector in-place.
+// Layout: x[0:half_dim] is real, x[half_dim:2*half_dim] is imag.
+// cos_sin is interleaved: [cos0, sin0, cos1, sin1, ...] for this position.
+// Returns the number of rotary pairs processed (multiple of 8).
+static inline size_t rope_fp16_bits_inplace_neon(uint16_t* x, const float* cos_sin, size_t half_dim) {
+    size_t i = 0;
+    for (; i + 8 <= half_dim; i += 8) {
+        const float32x4x2_t cs0 = vld2q_f32(cos_sin + i * 2);
+        const float32x4x2_t cs1 = vld2q_f32(cos_sin + (i + 4) * 2);
+
+        const uint16x8_t x0u = vld1q_u16(x + i);
+        const uint16x8_t x1u = vld1q_u16(x + half_dim + i);
+        const float16x8_t x0h = vreinterpretq_f16_u16(x0u);
+        const float16x8_t x1h = vreinterpretq_f16_u16(x1u);
+
+        const float32x4_t x0_lo = vcvt_f32_f16(vget_low_f16(x0h));
+        const float32x4_t x0_hi = vcvt_f32_f16(vget_high_f16(x0h));
+        const float32x4_t x1_lo = vcvt_f32_f16(vget_low_f16(x1h));
+        const float32x4_t x1_hi = vcvt_f32_f16(vget_high_f16(x1h));
+
+        const float32x4_t out0_lo = vfmsq_f32(vmulq_f32(x0_lo, cs0.val[0]), x1_lo, cs0.val[1]);
+        const float32x4_t out1_lo = vfmaq_f32(vmulq_f32(x0_lo, cs0.val[1]), x1_lo, cs0.val[0]);
+        const float32x4_t out0_hi = vfmsq_f32(vmulq_f32(x0_hi, cs1.val[0]), x1_hi, cs1.val[1]);
+        const float32x4_t out1_hi = vfmaq_f32(vmulq_f32(x0_hi, cs1.val[1]), x1_hi, cs1.val[0]);
+
+        const float16x8_t out0h = vcombine_f16(vcvt_f16_f32(out0_lo), vcvt_f16_f32(out0_hi));
+        const float16x8_t out1h = vcombine_f16(vcvt_f16_f32(out1_lo), vcvt_f16_f32(out1_hi));
+
+        vst1q_u16(x + i, vreinterpretq_u16_f16(out0h));
+        vst1q_u16(x + half_dim + i, vreinterpretq_u16_f16(out1h));
+    }
+    return i;
+}
+
 static inline void fp16_bits_to_fp32_neon(const uint16_t* src, float* dst, size_t n) {
     size_t i = 0;
     for (; i + 8 <= n; i += 8) {

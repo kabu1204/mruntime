@@ -71,7 +71,8 @@ void qwen2_rope_fp16(
     size_t num_kv_heads,
     size_t head_dim,
     size_t position_offset,
-    float theta,
+    const float* rope_cos_sin,     // [rope_max_seq_len, head_dim/2, 2] interleaved (cos, sin)
+    size_t rope_max_seq_len,
     PThreadPool* pool
 );
 

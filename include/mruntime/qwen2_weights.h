@@ -11,6 +11,17 @@ namespace mruntime {
 
 class SafeTensorsFile;
 
+// Precomputed RoPE cos/sin cache for a single model configuration.
+// cos_sin layout: [max_seq_len, half_dim, 2] interleaved (cos, sin).
+struct Qwen2RopeCache {
+    const float* inv_freq = nullptr;  // [half_dim]
+    const float* cos_sin = nullptr;   // [max_seq_len * half_dim * 2]
+    size_t max_seq_len = 0;
+    size_t head_dim = 0;
+    size_t half_dim = 0;
+    float theta = 0.0f;
+};
+
 // Per-layer weight pointers (all FP16)
 struct Qwen2LayerWeights {
     const uint16_t* input_norm;         // [hidden_size]
@@ -53,6 +64,7 @@ struct Qwen2KVCache {
     uint16_t* v_cache;                  // [num_layers, batch, num_kv_heads, max_seq_len, head_dim]
     size_t seq_len;                     // Current sequence length in cache
     size_t max_seq_len;                 // Maximum sequence length
+    Qwen2RopeCache rope;                // Precomputed RoPE cos/sin table
 
     // Helper to get per-layer cache pointers
     uint16_t* k_layer(size_t layer, size_t num_kv_heads, size_t head_dim) const {
@@ -118,6 +130,14 @@ Qwen2KVCache qwen2_init_kv_cache(
     const QwenConfig& cfg,
     Arena& kv_arena,
     size_t max_seq_len
+);
+
+// Precompute RoPE tables in `arena` and return a cache referencing them.
+Qwen2RopeCache qwen2_init_rope_cache(
+    size_t head_dim,
+    size_t max_seq_len,
+    float theta,
+    Arena& arena
 );
 
 // Initialize scratch buffers in arena

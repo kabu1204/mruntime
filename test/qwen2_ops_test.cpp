@@ -114,6 +114,116 @@ TEST(Qwen2OpsTest, RmsNorm) {
     }
 }
 
+namespace {
+
+void rope_reference_fp16(
+    uint16_t* data,
+    size_t batch,
+    size_t seq_len,
+    size_t num_heads,
+    size_t head_dim,
+    size_t position_offset,
+    float theta
+) {
+    const size_t half_dim = head_dim / 2;
+
+    std::vector<float> inv_freq(half_dim);
+    const float two_over_head_dim = 2.0f / static_cast<float>(head_dim);
+    for (size_t i = 0; i < half_dim; ++i) {
+        inv_freq[i] = 1.0f / std::pow(theta, static_cast<float>(i) * two_over_head_dim);
+    }
+
+    for (size_t b = 0; b < batch; ++b) {
+        for (size_t s = 0; s < seq_len; ++s) {
+            const size_t pos = position_offset + s;
+            const float pos_f = static_cast<float>(pos);
+
+            const size_t token_base = ((b * seq_len + s) * num_heads) * head_dim;
+            for (size_t h = 0; h < num_heads; ++h) {
+                const size_t base = token_base + h * head_dim;
+                for (size_t i = 0; i < half_dim; ++i) {
+                    const float angle = pos_f * inv_freq[i];
+                    const float cos_val = std::cos(angle);
+                    const float sin_val = std::sin(angle);
+
+                    const float x0 = fp16_bits_to_float(data[base + i]);
+                    const float x1 = fp16_bits_to_float(data[base + i + half_dim]);
+
+                    data[base + i] = float_to_fp16_bits(x0 * cos_val - x1 * sin_val);
+                    data[base + i + half_dim] = float_to_fp16_bits(x0 * sin_val + x1 * cos_val);
+                }
+            }
+        }
+    }
+}
+
+}  // namespace
+
+TEST(Qwen2OpsTest, Rope) {
+    const size_t batch = 1;
+    const size_t seq_len = 2;
+    const size_t num_q_heads = 2;
+    const size_t num_kv_heads = 1;
+    const size_t head_dim = 4;
+    const size_t position_offset = 0;
+    const float theta = 10000.0f;
+
+    Arena arena = create_arena(4096);
+    const Qwen2RopeCache rope_cache = qwen2_init_rope_cache(head_dim, /*max_seq_len=*/seq_len, theta, arena);
+
+    std::vector<uint16_t> Q(batch * seq_len * num_q_heads * head_dim);
+    std::vector<uint16_t> K(batch * seq_len * num_kv_heads * head_dim);
+
+    for (size_t i = 0; i < Q.size(); ++i) {
+        Q[i] = float_to_fp16_bits(static_cast<float>(i) * 0.125f - 1.0f);
+    }
+    for (size_t i = 0; i < K.size(); ++i) {
+        K[i] = float_to_fp16_bits(static_cast<float>(i) * 0.25f + 0.5f);
+    }
+
+    const std::vector<uint16_t> Q_input = Q;
+    const std::vector<uint16_t> K_input = K;
+
+    std::vector<uint16_t> Q_expected = Q;
+    std::vector<uint16_t> K_expected = K;
+
+    rope_reference_fp16(Q_expected.data(), batch, seq_len, num_q_heads, head_dim, position_offset, theta);
+    rope_reference_fp16(K_expected.data(), batch, seq_len, num_kv_heads, head_dim, position_offset, theta);
+
+    qwen2_rope_fp16(
+        Q.data(),
+        K.data(),
+        batch,
+        seq_len,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+        position_offset,
+        rope_cache.cos_sin,
+        rope_cache.max_seq_len,
+        nullptr
+    );
+
+    // pos=0 should be identity.
+    for (size_t i = 0; i < num_q_heads * head_dim; ++i) {
+        EXPECT_EQ(Q[i], Q_input[i]) << "Q i=" << i;
+    }
+    for (size_t i = 0; i < num_kv_heads * head_dim; ++i) {
+        EXPECT_EQ(K[i], K_input[i]) << "K i=" << i;
+    }
+
+    // Full compare vs reference for the entire tensor.
+    constexpr float kTol = 5e-3f;
+    for (size_t i = 0; i < Q.size(); ++i) {
+        EXPECT_NEAR(fp16_bits_to_float(Q[i]), fp16_bits_to_float(Q_expected[i]), kTol) << "Q i=" << i;
+    }
+    for (size_t i = 0; i < K.size(); ++i) {
+        EXPECT_NEAR(fp16_bits_to_float(K[i]), fp16_bits_to_float(K_expected[i]), kTol) << "K i=" << i;
+    }
+
+    destroy_arena(arena);
+}
+
 TEST(Qwen2OpsTest, SiluMul) {
     const size_t n = 4;
 

@@ -64,6 +64,7 @@ void qwen2_layer_forward(
     uint16_t* v_cache,            // This layer's V cache [num_kv_heads, max_seq_len, head_dim]
     size_t kv_seq_len,            // Current KV cache length (before this forward)
     size_t max_seq_len,           // Maximum sequence length (cache dimension)
+    const float* rope_cos_sin,    // [max_seq_len, head_dim/2, 2] interleaved (cos, sin)
     const uint16_t* hidden_in,    // [num_tokens, hidden_size]
     uint16_t* hidden_out,         // [num_tokens, hidden_size]
     Qwen2Scratch& scratch,
@@ -81,6 +82,7 @@ void qwen2_attention(
     uint16_t* v_cache,            // [num_kv_heads, max_seq_len, head_dim]
     size_t kv_seq_len,            // Current KV cache length
     size_t max_seq_len,           // Maximum sequence length (cache dimension)
+    const float* rope_cos_sin,    // [max_seq_len, head_dim/2, 2] interleaved (cos, sin)
     const uint16_t* normed_input, // [num_tokens, hidden_size]
     uint16_t* attn_output,        // [num_tokens, hidden_size]
     Qwen2Scratch& scratch,

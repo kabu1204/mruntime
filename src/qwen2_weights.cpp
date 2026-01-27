@@ -1,6 +1,7 @@
 #include "mruntime/qwen2_weights.h"
 
 #include <cassert>
+#include <cmath>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -56,6 +57,12 @@ Qwen2MemorySizes qwen2_memory_sizes(
     size_t kv_per_layer = cfg.num_kv_heads * max_seq_len * head_dim * elem_size;
     sizes.kv_cache_bytes = 2 * cfg.num_layers * kv_per_layer;  // K and V
 
+    // RoPE cache (fp32): inv_freq [half_dim] + cos/sin table [max_seq_len, half_dim, 2]
+    assert(head_dim % 2 == 0);
+    const size_t half_dim = head_dim / 2;
+    const size_t rope_floats = half_dim + (max_seq_len * half_dim * 2);
+    sizes.kv_cache_bytes += rope_floats * sizeof(float);
+
     // Scratch space for forward pass
     size_t hidden_buf = max_batch_tokens * cfg.hidden_size * elem_size;
     size_t q_proj_buf = max_batch_tokens * cfg.num_attention_heads * head_dim * elem_size;
@@ -85,6 +92,46 @@ Qwen2MemorySizes qwen2_memory_sizes(
     sizes.packed_weights_bytes += qwen2_packed_weight_size_fp16(cfg.vocab_size, cfg.hidden_size);
 
     return sizes;
+}
+
+Qwen2RopeCache qwen2_init_rope_cache(
+    size_t head_dim,
+    size_t max_seq_len,
+    float theta,
+    Arena& arena
+) {
+    assert(head_dim > 0);
+    assert(head_dim % 2 == 0);
+    assert(max_seq_len > 0);
+    assert(theta > 0.0f);
+
+    Qwen2RopeCache rope;
+    rope.head_dim = head_dim;
+    rope.half_dim = head_dim / 2;
+    rope.max_seq_len = max_seq_len;
+    rope.theta = theta;
+
+    float* inv_freq = arena.alloc_array<float>(rope.half_dim);
+    float* cos_sin = arena.alloc_array<float>(rope.max_seq_len * rope.half_dim * 2);
+
+    const float two_over_head_dim = 2.0f / static_cast<float>(head_dim);
+    for (size_t i = 0; i < rope.half_dim; ++i) {
+        inv_freq[i] = 1.0f / std::pow(theta, static_cast<float>(i) * two_over_head_dim);
+    }
+
+    for (size_t pos = 0; pos < rope.max_seq_len; ++pos) {
+        float* cs = cos_sin + pos * rope.half_dim * 2;
+        const float pos_f = static_cast<float>(pos);
+        for (size_t i = 0; i < rope.half_dim; ++i) {
+            const float angle = pos_f * inv_freq[i];
+            cs[i * 2] = std::cos(angle);
+            cs[i * 2 + 1] = std::sin(angle);
+        }
+    }
+
+    rope.inv_freq = inv_freq;
+    rope.cos_sin = cos_sin;
+    return rope;
 }
 
 // ============================================================================
@@ -365,6 +412,8 @@ Qwen2KVCache qwen2_init_kv_cache(
     // Zero-initialize
     std::memset(kv.k_cache, 0, cfg.num_layers * kv_per_layer * sizeof(uint16_t));
     std::memset(kv.v_cache, 0, cfg.num_layers * kv_per_layer * sizeof(uint16_t));
+
+    kv.rope = qwen2_init_rope_cache(head_dim, max_seq_len, cfg.rope_theta, kv_arena);
 
     return kv;
 }

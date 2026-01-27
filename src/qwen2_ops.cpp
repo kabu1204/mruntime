@@ -233,46 +233,69 @@ void qwen2_rope_fp16(
     size_t num_kv_heads,
     size_t head_dim,
     size_t position_offset,
-    float theta,
+    const float* rope_cos_sin,
+    size_t rope_max_seq_len,
     PThreadPool* pool
 ) {
+    assert(Q != nullptr);
+    assert(K != nullptr);
+    assert(rope_cos_sin != nullptr);
+    assert(batch > 0);
+    assert(seq_len > 0);
+    assert(num_q_heads > 0);
+    assert(num_kv_heads > 0);
+    assert(head_dim > 0);
+    assert(head_dim % 2 == 0);
+    assert(rope_max_seq_len > 0);
+    if (position_offset + seq_len > rope_max_seq_len) {
+        assert(false && "qwen2_rope_fp16: position_offset + seq_len exceeds rope_max_seq_len");
+        return;
+    }
+
     const size_t half_dim = head_dim / 2;
+    const size_t floats_per_pos = half_dim * 2;
 
-    auto apply_rope = [&](uint16_t* data, size_t num_heads) {
-        const size_t total_heads = batch * seq_len * num_heads;
-        auto worker = [&](size_t idx) {
-            size_t tmp = idx;
-            size_t h = tmp % num_heads;
-            tmp /= num_heads;
-            size_t s = tmp % seq_len;
-            size_t b = tmp / seq_len;
+    // Parallelize over (batch, seq_len). Each task handles all heads at one position.
+    const size_t task_count = batch * seq_len;
+    auto worker = [&](size_t task_id) {
+        const size_t s = task_id % seq_len;
+        const size_t b = task_id / seq_len;
 
-            size_t pos = position_offset + s;
-            const size_t base = ((b * seq_len + s) * num_heads + h) * head_dim;
+        const size_t pos = position_offset + s;
+        const float* cs = rope_cos_sin + pos * floats_per_pos;
 
-            for (size_t i = 0; i < half_dim; ++i) {
-                float freq = 1.0f / std::pow(theta, static_cast<float>(2 * i) / static_cast<float>(head_dim));
-                float angle = static_cast<float>(pos) * freq;
-                float cos_val = std::cos(angle);
-                float sin_val = std::sin(angle);
+        const size_t q_token_base = ((b * seq_len + s) * num_q_heads) * head_dim;
+        const size_t k_token_base = ((b * seq_len + s) * num_kv_heads) * head_dim;
 
-                float x0 = fp16_bits_to_float(data[base + i]);
-                float x1 = fp16_bits_to_float(data[base + i + half_dim]);
+        auto apply_rope_heads = [&](uint16_t* data, size_t token_base, size_t num_heads) {
+            for (size_t h = 0; h < num_heads; ++h) {
+                const size_t base = token_base + h * head_dim;
+                size_t i = 0;
 
-                data[base + i] = float_to_fp16_bits(x0 * cos_val - x1 * sin_val);
-                data[base + i + half_dim] = float_to_fp16_bits(x0 * sin_val + x1 * cos_val);
+#if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+                i = ::rope_fp16_bits_inplace_neon(data + base, cs, half_dim);
+#endif
+
+                for (; i < half_dim; ++i) {
+                    const float cos_val = cs[i * 2];
+                    const float sin_val = cs[i * 2 + 1];
+                    const float x0 = fp16_bits_to_float(data[base + i]);
+                    const float x1 = fp16_bits_to_float(data[base + i + half_dim]);
+                    data[base + i] = float_to_fp16_bits(x0 * cos_val - x1 * sin_val);
+                    data[base + i + half_dim] = float_to_fp16_bits(x0 * sin_val + x1 * cos_val);
+                }
             }
         };
 
-        if (pool) {
-            pool->parallelize_1d(total_heads, worker);
-        } else {
-            for (size_t i = 0; i < total_heads; ++i) worker(i);
-        }
+        apply_rope_heads(Q, q_token_base, num_q_heads);
+        apply_rope_heads(K, k_token_base, num_kv_heads);
     };
 
-    apply_rope(Q, num_q_heads);
-    apply_rope(K, num_kv_heads);
+    if (pool) {
+        pool->parallelize_1d(task_count, worker);
+    } else {
+        for (size_t i = 0; i < task_count; ++i) worker(i);
+    }
 }
 
 // ============================================================================

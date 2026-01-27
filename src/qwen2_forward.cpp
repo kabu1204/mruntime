@@ -92,6 +92,7 @@ uint16_t* qwen2_forward_hidden(
             v_cache_layer,
             position_offset,
             kv_cache.max_seq_len,
+            kv_cache.rope.cos_sin,
             scratch.normed,
             scratch.attn_out,  // Reuse attn_out as temp storage for attention output
             scratch,
@@ -337,6 +338,7 @@ void qwen2_attention(
     uint16_t* v_cache,
     size_t kv_seq_len,
     size_t max_seq_len,
+    const float* rope_cos_sin,
     const uint16_t* normed_input,
     uint16_t* attn_output,
     Qwen2Scratch& scratch,
@@ -410,7 +412,8 @@ void qwen2_attention(
             num_kv_heads,
             head_dim,
             position_offset,
-            cfg.rope_theta,
+            rope_cos_sin,
+            max_seq_len,
             pool
         );
     }
@@ -537,6 +540,7 @@ void qwen2_layer_forward(
     uint16_t* v_cache,
     size_t kv_seq_len,
     size_t max_seq_len,
+    const float* rope_cos_sin,
     const uint16_t* hidden_in,
     uint16_t* hidden_out,
     Qwen2Scratch& scratch,
@@ -564,6 +568,7 @@ void qwen2_layer_forward(
         v_cache,
         kv_seq_len,
         max_seq_len,
+        rope_cos_sin,
         scratch.normed,
         scratch.residual,  // Use residual buffer for attention output
         scratch,
