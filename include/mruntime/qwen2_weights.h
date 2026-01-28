@@ -25,13 +25,11 @@ struct Qwen2RopeCache {
 // Per-layer weight pointers (all FP16)
 struct Qwen2LayerWeights {
     const uint16_t* input_norm;         // [hidden_size]
-    const uint16_t* q_proj;             // [num_heads * head_dim, hidden_size]
-    const uint16_t* k_proj;             // [num_kv_heads * head_dim, hidden_size]
-    const uint16_t* v_proj;             // [num_kv_heads * head_dim, hidden_size]
+    // Fused QKV projection: [q_dim + k_dim + v_dim, hidden_size]
+    // Row-major, with Q rows first, then K, then V.
+    const uint16_t* qkv_proj;
+    const uint16_t* qkv_bias;           // [q_dim + k_dim + v_dim] (nullptr if no biases)
     const uint16_t* o_proj;             // [hidden_size, num_heads * head_dim]
-    const uint16_t* q_bias;             // [num_heads * head_dim] (may be nullptr)
-    const uint16_t* k_bias;             // [num_kv_heads * head_dim] (may be nullptr)
-    const uint16_t* v_bias;             // [num_kv_heads * head_dim] (may be nullptr)
     const uint16_t* post_attn_norm;     // [hidden_size]
     // Fused (gate + up) projection weights: [2 * intermediate_size, hidden_size].
     // Row-major, with first intermediate_size rows = gate, second = up.
@@ -39,9 +37,7 @@ struct Qwen2LayerWeights {
     const uint16_t* down_proj;          // [hidden_size, intermediate_size]
 
     // Pre-packed weights for KleidiAI (may be nullptr if not packed)
-    const uint16_t* q_proj_packed;
-    const uint16_t* k_proj_packed;
-    const uint16_t* v_proj_packed;
+    const uint16_t* qkv_proj_packed;
     const uint16_t* o_proj_packed;
     // Pre-packed concatenation of gate+up along N: [2*intermediate_size, hidden_size].
     // When present, qwen2_mlp can compute both projections in one GEMM.
@@ -82,6 +78,7 @@ struct Qwen2Scratch {
     uint16_t* hidden;           // [max_tokens, hidden_size]
     uint16_t* residual;         // [max_tokens, hidden_size]
     uint16_t* normed;           // [max_tokens, hidden_size]
+    uint16_t* qkv_out;          // [max_tokens, q_dim + k_dim + v_dim] (fused QKV GEMM output)
     uint16_t* q_proj;           // [max_tokens, num_heads * head_dim]
     uint16_t* k_proj;           // [max_tokens, num_kv_heads * head_dim]
     uint16_t* v_proj;           // [max_tokens, num_kv_heads * head_dim]

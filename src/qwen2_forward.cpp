@@ -338,51 +338,37 @@ void qwen2_attention(
     const size_t num_heads = cfg.num_attention_heads;
     const size_t num_kv_heads = cfg.num_kv_heads;
     const size_t head_dim = cfg.head_dim();
+    const size_t q_dim = num_heads * head_dim;
+    const size_t kv_dim = num_kv_heads * head_dim;
+    const size_t qkv_dim = q_dim + 2 * kv_dim;
     const size_t position_offset = kv_seq_len;
     if (position_offset > max_seq_len || num_tokens > (max_seq_len - position_offset)) {
         throw std::runtime_error("qwen2_attention: KV cache overflow (kv_seq_len + num_tokens > max_seq_len)");
     }
 
-    // Q projection: [num_tokens, hidden] @ [num_heads*head_dim, hidden]^T -> [num_tokens, num_heads*head_dim]
+    // Fused QKV projection: [num_tokens, hidden] @ [qkv_dim, hidden]^T -> [num_tokens, qkv_dim]
     {
-        TRACE_SCOPE_CAT("q_proj", "gemm");
+        TRACE_SCOPE_CAT("qkv_proj", "gemm");
         qwen2_gemm_fp16(
             normed_input,
-            layer.q_proj,
-            scratch.q_proj,
-            num_tokens, num_heads * head_dim, hidden_size,
-            layer.q_proj_packed,
+            layer.qkv_proj,
+            scratch.qkv_out,
+            num_tokens, qkv_dim, hidden_size,
+            layer.qkv_proj_packed,
             pool
         );
-        add_bias_fp16(scratch.q_proj, layer.q_bias, num_tokens, num_heads * head_dim);
+        add_bias_fp16(scratch.qkv_out, layer.qkv_bias, num_tokens, qkv_dim);
     }
 
-    // K projection: [num_tokens, hidden] @ [num_kv_heads*head_dim, hidden]^T -> [num_tokens, num_kv_heads*head_dim]
+    // Split fused QKV output to separate Q, K, V buffers (required for RoPE/KV cache)
     {
-        TRACE_SCOPE_CAT("k_proj", "gemm");
-        qwen2_gemm_fp16(
-            normed_input,
-            layer.k_proj,
-            scratch.k_proj,
-            num_tokens, num_kv_heads * head_dim, hidden_size,
-            layer.k_proj_packed,
-            pool
-        );
-        add_bias_fp16(scratch.k_proj, layer.k_bias, num_tokens, num_kv_heads * head_dim);
-    }
-
-    // V projection: [num_tokens, hidden] @ [num_kv_heads*head_dim, hidden]^T -> [num_tokens, num_kv_heads*head_dim]
-    {
-        TRACE_SCOPE_CAT("v_proj", "gemm");
-        qwen2_gemm_fp16(
-            normed_input,
-            layer.v_proj,
-            scratch.v_proj,
-            num_tokens, num_kv_heads * head_dim, hidden_size,
-            layer.v_proj_packed,
-            pool
-        );
-        add_bias_fp16(scratch.v_proj, layer.v_bias, num_tokens, num_kv_heads * head_dim);
+        TRACE_SCOPE_CAT("qkv_split", "elementwise");
+        for (size_t t = 0; t < num_tokens; ++t) {
+            const uint16_t* src = scratch.qkv_out + t * qkv_dim;
+            std::memcpy(scratch.q_proj + t * q_dim, src, q_dim * sizeof(uint16_t));
+            std::memcpy(scratch.k_proj + t * kv_dim, src + q_dim, kv_dim * sizeof(uint16_t));
+            std::memcpy(scratch.v_proj + t * kv_dim, src + q_dim + kv_dim, kv_dim * sizeof(uint16_t));
+        }
     }
 
     // Apply RoPE to Q and K

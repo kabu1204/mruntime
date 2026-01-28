@@ -33,18 +33,22 @@ Qwen2MemorySizes qwen2_memory_sizes(
     size_t head_dim = cfg.head_dim();
     size_t q_proj_size = cfg.num_attention_heads * head_dim * cfg.hidden_size * elem_size;
     size_t kv_proj_size = cfg.num_kv_heads * head_dim * cfg.hidden_size * elem_size;
+    // Fused QKV projection: [q_dim + k_dim + v_dim, hidden_size]
+    size_t qkv_proj_size = q_proj_size + 2 * kv_proj_size;
     size_t o_proj_size = cfg.hidden_size * cfg.num_attention_heads * head_dim * elem_size;
     size_t gate_up_proj_size = 2 * cfg.intermediate_size * cfg.hidden_size * elem_size;
     size_t down_proj_size = cfg.hidden_size * cfg.intermediate_size * elem_size;
     size_t norm_size = cfg.hidden_size * elem_size;
 
     // Bias sizes (optional, may be zero if not present)
+    // Fused QKV bias: [q_dim + k_dim + v_dim]
     size_t q_bias_size = cfg.num_attention_heads * head_dim * elem_size;
     size_t kv_bias_size = cfg.num_kv_heads * head_dim * elem_size;
+    size_t qkv_bias_size = q_bias_size + 2 * kv_bias_size;
 
-    size_t layer_weights_size = 2 * norm_size + q_proj_size + 2 * kv_proj_size + o_proj_size +
+    size_t layer_weights_size = 2 * norm_size + qkv_proj_size + o_proj_size +
                                 gate_up_proj_size + down_proj_size +
-                                q_bias_size + 2 * kv_bias_size;
+                                qkv_bias_size;
 
     // Add space for layer pointers array
     size_t layer_pointers_size = cfg.num_layers * sizeof(Qwen2LayerWeights);
@@ -66,11 +70,14 @@ Qwen2MemorySizes qwen2_memory_sizes(
     size_t hidden_buf = max_batch_tokens * cfg.hidden_size * elem_size;
     size_t q_proj_buf = max_batch_tokens * cfg.num_attention_heads * head_dim * elem_size;
     size_t kv_proj_buf = max_batch_tokens * cfg.num_kv_heads * head_dim * elem_size;
+    // Fused QKV output buffer: [max_batch_tokens, q_dim + k_dim + v_dim]
+    size_t qkv_out_buf = q_proj_buf + 2 * kv_proj_buf;
     size_t attn_out_buf = max_batch_tokens * cfg.num_attention_heads * head_dim * elem_size;
     size_t gate_buf = max_batch_tokens * cfg.intermediate_size * elem_size;
     size_t logits_buf = max_batch_tokens * cfg.vocab_size * elem_size;
 
     sizes.scratch_bytes = hidden_buf * 3 +  // hidden, residual, normed
+                          qkv_out_buf +     // fused QKV output
                           q_proj_buf * 2 +  // q_proj, q_transposed
                           kv_proj_buf * 2 + // k_proj, v_proj
                           attn_out_buf +
@@ -80,9 +87,9 @@ Qwen2MemorySizes qwen2_memory_sizes(
 
     // Packed weights (optional, for KleidiAI)
     // Each packed weight is roughly the same size as unpacked
+    const size_t qkv_dim = cfg.num_attention_heads * head_dim + 2 * cfg.num_kv_heads * head_dim;
     sizes.packed_weights_bytes = cfg.num_layers * (
-        qwen2_packed_weight_size_fp16(cfg.num_attention_heads * head_dim, cfg.hidden_size) +
-        2 * qwen2_packed_weight_size_fp16(cfg.num_kv_heads * head_dim, cfg.hidden_size) +
+        qwen2_packed_weight_size_fp16(qkv_dim, cfg.hidden_size) +
         qwen2_packed_weight_size_fp16(cfg.hidden_size, cfg.num_attention_heads * head_dim) +
         qwen2_packed_weight_size_fp16(cfg.intermediate_size * 2, cfg.hidden_size) +
         qwen2_packed_weight_size_fp16(cfg.hidden_size, cfg.intermediate_size)
@@ -201,19 +208,6 @@ uint16_t* load_tensor_to_arena(
     return dst;
 }
 
-// Try to load bias (may not exist)
-uint16_t* try_load_bias(
-    const SafeTensorsFile& file,
-    const std::string& name,
-    Arena& arena,
-    size_t expected_numel
-) {
-    if (!file.has_tensor(name)) {
-        return nullptr;
-    }
-    return load_tensor_to_arena(file, name, arena, expected_numel);
-}
-
 }  // namespace
 
 // ============================================================================
@@ -278,37 +272,50 @@ Qwen2Weights qwen2_load_weights(
             cfg.hidden_size
         );
 
-        // Attention projections
-        layer.q_proj = load_tensor_to_arena(
-            file, prefix + ".self_attn.q_proj.weight", weights_arena,
-            cfg.num_attention_heads * head_dim * cfg.hidden_size
-        );
-        layer.k_proj = load_tensor_to_arena(
-            file, prefix + ".self_attn.k_proj.weight", weights_arena,
-            cfg.num_kv_heads * head_dim * cfg.hidden_size
-        );
-        layer.v_proj = load_tensor_to_arena(
-            file, prefix + ".self_attn.v_proj.weight", weights_arena,
-            cfg.num_kv_heads * head_dim * cfg.hidden_size
-        );
+        // Fused QKV projection: load Q, K, V into contiguous buffer [Q rows, K rows, V rows]
+        const size_t q_dim = cfg.num_attention_heads * head_dim;
+        const size_t kv_dim = cfg.num_kv_heads * head_dim;
+        const size_t qkv_dim = q_dim + 2 * kv_dim;
+        const size_t q_numel = q_dim * cfg.hidden_size;
+        const size_t kv_numel = kv_dim * cfg.hidden_size;
+        uint16_t* qkv = weights_arena.alloc_array<uint16_t>(qkv_dim * cfg.hidden_size);
+        if (!load_tensor_to_fp16_buffer(file, prefix + ".self_attn.q_proj.weight", qkv, q_numel)) {
+            throw std::runtime_error("Missing tensor: " + prefix + ".self_attn.q_proj.weight");
+        }
+        if (!load_tensor_to_fp16_buffer(file, prefix + ".self_attn.k_proj.weight", qkv + q_numel, kv_numel)) {
+            throw std::runtime_error("Missing tensor: " + prefix + ".self_attn.k_proj.weight");
+        }
+        if (!load_tensor_to_fp16_buffer(file, prefix + ".self_attn.v_proj.weight", qkv + q_numel + kv_numel, kv_numel)) {
+            throw std::runtime_error("Missing tensor: " + prefix + ".self_attn.v_proj.weight");
+        }
+        layer.qkv_proj = qkv;
+
         layer.o_proj = load_tensor_to_arena(
             file, prefix + ".self_attn.o_proj.weight", weights_arena,
             cfg.hidden_size * cfg.num_attention_heads * head_dim
         );
 
-        // Biases (optional)
-        layer.q_bias = try_load_bias(
-            file, prefix + ".self_attn.q_proj.bias", weights_arena,
-            cfg.num_attention_heads * head_dim
-        );
-        layer.k_bias = try_load_bias(
-            file, prefix + ".self_attn.k_proj.bias", weights_arena,
-            cfg.num_kv_heads * head_dim
-        );
-        layer.v_bias = try_load_bias(
-            file, prefix + ".self_attn.v_proj.bias", weights_arena,
-            cfg.num_kv_heads * head_dim
-        );
+        // Fused QKV bias (optional): create fused bias if any bias exists
+        const bool has_q_bias = file.has_tensor(prefix + ".self_attn.q_proj.bias");
+        const bool has_k_bias = file.has_tensor(prefix + ".self_attn.k_proj.bias");
+        const bool has_v_bias = file.has_tensor(prefix + ".self_attn.v_proj.bias");
+        if (has_q_bias || has_k_bias || has_v_bias) {
+            uint16_t* qkv_bias = weights_arena.alloc_array<uint16_t>(qkv_dim);
+            // Zero-initialize in case some biases are missing
+            std::memset(qkv_bias, 0, qkv_dim * sizeof(uint16_t));
+            if (has_q_bias) {
+                load_tensor_to_fp16_buffer(file, prefix + ".self_attn.q_proj.bias", qkv_bias, q_dim);
+            }
+            if (has_k_bias) {
+                load_tensor_to_fp16_buffer(file, prefix + ".self_attn.k_proj.bias", qkv_bias + q_dim, kv_dim);
+            }
+            if (has_v_bias) {
+                load_tensor_to_fp16_buffer(file, prefix + ".self_attn.v_proj.bias", qkv_bias + q_dim + kv_dim, kv_dim);
+            }
+            layer.qkv_bias = qkv_bias;
+        } else {
+            layer.qkv_bias = nullptr;
+        }
 
         // Post-attention norm
         layer.post_attn_norm = load_tensor_to_arena(
@@ -332,9 +339,7 @@ Qwen2Weights qwen2_load_weights(
         );
 
         // Initialize packed pointers to nullptr
-        layer.q_proj_packed = nullptr;
-        layer.k_proj_packed = nullptr;
-        layer.v_proj_packed = nullptr;
+        layer.qkv_proj_packed = nullptr;
         layer.o_proj_packed = nullptr;
         layer.gate_up_proj_packed = nullptr;
         layer.down_proj_packed = nullptr;
@@ -342,29 +347,11 @@ Qwen2Weights qwen2_load_weights(
         // Pack weights for KleidiAI if requested
         if (pack_for_kai) {
             TRACE_SCOPE("kai_pack_weights");
-            // Q projection: [num_heads * head_dim, hidden_size]
-            size_t q_packed_size = qwen2_packed_weight_size_fp16(
-                cfg.num_attention_heads * head_dim, cfg.hidden_size);
-            uint16_t* q_packed = weights_arena.alloc_array<uint16_t>(q_packed_size / sizeof(uint16_t));
-            qwen2_pack_weight_fp16(layer.q_proj, q_packed,
-                cfg.num_attention_heads * head_dim, cfg.hidden_size);
-            layer.q_proj_packed = q_packed;
-
-            // K projection: [num_kv_heads * head_dim, hidden_size]
-            size_t k_packed_size = qwen2_packed_weight_size_fp16(
-                cfg.num_kv_heads * head_dim, cfg.hidden_size);
-            uint16_t* k_packed = weights_arena.alloc_array<uint16_t>(k_packed_size / sizeof(uint16_t));
-            qwen2_pack_weight_fp16(layer.k_proj, k_packed,
-                cfg.num_kv_heads * head_dim, cfg.hidden_size);
-            layer.k_proj_packed = k_packed;
-
-            // V projection: [num_kv_heads * head_dim, hidden_size]
-            size_t v_packed_size = qwen2_packed_weight_size_fp16(
-                cfg.num_kv_heads * head_dim, cfg.hidden_size);
-            uint16_t* v_packed = weights_arena.alloc_array<uint16_t>(v_packed_size / sizeof(uint16_t));
-            qwen2_pack_weight_fp16(layer.v_proj, v_packed,
-                cfg.num_kv_heads * head_dim, cfg.hidden_size);
-            layer.v_proj_packed = v_packed;
+            // Fused QKV projection: [qkv_dim, hidden_size]
+            size_t qkv_packed_size = qwen2_packed_weight_size_fp16(qkv_dim, cfg.hidden_size);
+            uint16_t* qkv_packed = weights_arena.alloc_array<uint16_t>(qkv_packed_size / sizeof(uint16_t));
+            qwen2_pack_weight_fp16(layer.qkv_proj, qkv_packed, qkv_dim, cfg.hidden_size);
+            layer.qkv_proj_packed = qkv_packed;
 
             // O projection: [hidden_size, num_heads * head_dim]
             size_t o_packed_size = qwen2_packed_weight_size_fp16(
@@ -442,15 +429,19 @@ Qwen2Scratch qwen2_init_scratch(
     scratch.max_tokens = max_tokens;
 
     size_t head_dim = cfg.head_dim();
+    size_t q_dim = cfg.num_attention_heads * head_dim;
+    size_t kv_dim = cfg.num_kv_heads * head_dim;
+    size_t qkv_dim = q_dim + 2 * kv_dim;
 
     scratch.hidden = scratch_arena.alloc_array<uint16_t>(max_tokens * cfg.hidden_size);
     scratch.residual = scratch_arena.alloc_array<uint16_t>(max_tokens * cfg.hidden_size);
     scratch.normed = scratch_arena.alloc_array<uint16_t>(max_tokens * cfg.hidden_size);
-    scratch.q_proj = scratch_arena.alloc_array<uint16_t>(max_tokens * cfg.num_attention_heads * head_dim);
-    scratch.k_proj = scratch_arena.alloc_array<uint16_t>(max_tokens * cfg.num_kv_heads * head_dim);
-    scratch.v_proj = scratch_arena.alloc_array<uint16_t>(max_tokens * cfg.num_kv_heads * head_dim);
-    scratch.q_transposed = scratch_arena.alloc_array<uint16_t>(max_tokens * cfg.num_attention_heads * head_dim);
-    scratch.attn_out = scratch_arena.alloc_array<uint16_t>(max_tokens * cfg.num_attention_heads * head_dim);
+    scratch.qkv_out = scratch_arena.alloc_array<uint16_t>(max_tokens * qkv_dim);
+    scratch.q_proj = scratch_arena.alloc_array<uint16_t>(max_tokens * q_dim);
+    scratch.k_proj = scratch_arena.alloc_array<uint16_t>(max_tokens * kv_dim);
+    scratch.v_proj = scratch_arena.alloc_array<uint16_t>(max_tokens * kv_dim);
+    scratch.q_transposed = scratch_arena.alloc_array<uint16_t>(max_tokens * q_dim);
+    scratch.attn_out = scratch_arena.alloc_array<uint16_t>(max_tokens * q_dim);
     scratch.gate = scratch_arena.alloc_array<uint16_t>(max_tokens * cfg.intermediate_size);
     scratch.up = scratch_arena.alloc_array<uint16_t>(max_tokens * cfg.intermediate_size * 2);
     scratch.mlp_out = scratch_arena.alloc_array<uint16_t>(max_tokens * cfg.hidden_size);
