@@ -111,13 +111,17 @@ void qwen2_gemm_fp16(
             return;
         }
 
-        const size_t stripe_count = std::min(n_tiles, pool->threads_count() * size_t{4});
-        auto stripe_worker = [&](size_t stripe_id) {
-            const size_t tile_begin = stripe_id * n_tiles / stripe_count;
-            const size_t tile_end = (stripe_id + 1) * n_tiles / stripe_count;
+        // Tune this manually if false sharing for writing outputs is observed.
+        constexpr size_t tiles_per_task = 2;
+
+        const size_t task_count = (n_tiles + tiles_per_task - 1) / tiles_per_task;
+        auto task_worker = [&](size_t task_id) {
+            const size_t tile_begin = task_id * tiles_per_task;
+            const size_t tile_end = std::min(n_tiles, tile_begin + tiles_per_task);
 
             const size_t n_start = tile_begin * n_step;
             const size_t n_end = std::min(N, tile_end * n_step);
+            if (n_end <= n_start) return;
 
             kai_matmul_fp16_packed_rhs_stripe(
                 n_start, n_end - n_start,
@@ -128,7 +132,7 @@ void qwen2_gemm_fp16(
             );
         };
 
-        pool->parallelize_1d(stripe_count, stripe_worker);
+        pool->parallelize_1d(task_count, task_worker);
         return;
     }
 
