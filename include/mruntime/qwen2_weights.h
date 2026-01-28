@@ -33,8 +33,9 @@ struct Qwen2LayerWeights {
     const uint16_t* k_bias;             // [num_kv_heads * head_dim] (may be nullptr)
     const uint16_t* v_bias;             // [num_kv_heads * head_dim] (may be nullptr)
     const uint16_t* post_attn_norm;     // [hidden_size]
-    const uint16_t* gate_proj;          // [intermediate_size, hidden_size]
-    const uint16_t* up_proj;            // [intermediate_size, hidden_size]
+    // Fused (gate + up) projection weights: [2 * intermediate_size, hidden_size].
+    // Row-major, with first intermediate_size rows = gate, second = up.
+    const uint16_t* gate_up_proj;
     const uint16_t* down_proj;          // [hidden_size, intermediate_size]
 
     // Pre-packed weights for KleidiAI (may be nullptr if not packed)
@@ -42,8 +43,9 @@ struct Qwen2LayerWeights {
     const uint16_t* k_proj_packed;
     const uint16_t* v_proj_packed;
     const uint16_t* o_proj_packed;
-    const uint16_t* gate_proj_packed;
-    const uint16_t* up_proj_packed;
+    // Pre-packed concatenation of gate+up along N: [2*intermediate_size, hidden_size].
+    // When present, qwen2_mlp can compute both projections in one GEMM.
+    const uint16_t* gate_up_proj_packed;
     const uint16_t* down_proj_packed;
 };
 
@@ -86,7 +88,7 @@ struct Qwen2Scratch {
     uint16_t* q_transposed;     // [max_tokens * num_heads * head_dim] for BHSD layout
     uint16_t* attn_out;         // [max_tokens, num_heads * head_dim]
     uint16_t* gate;             // [max_tokens, intermediate_size]
-    uint16_t* up;               // [max_tokens, intermediate_size]
+    uint16_t* up;               // [max_tokens, 2 * intermediate_size] (gate+up fused GEMM output; first half is gate)
     uint16_t* mlp_out;          // [max_tokens, hidden_size]
     uint16_t* logits;           // [max_tokens, vocab_size]
 

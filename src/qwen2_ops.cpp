@@ -1,5 +1,6 @@
 #include "mruntime/qwen2_ops.h"
 
+#include <_types/_uint16_t.h>
 #include <algorithm>
 #include <cassert>
 #include <cmath>
@@ -505,6 +506,43 @@ void qwen2_silu_mul_fp16(
     }
 }
 
+void qwen2_silu_mul_interleaved_fp16(
+    const uint16_t* gate_up,
+    uint16_t* output,
+    size_t num_tokens,
+    size_t intermediate_size,
+    PThreadPool* pool
+) {
+    const size_t row_stride = intermediate_size * 2;
+
+    auto worker_token = [&](size_t t) {
+        const uint16_t* gate = gate_up + t * row_stride;
+        const uint16_t* up = gate + intermediate_size;
+        uint16_t* out = output + t * intermediate_size;
+
+#if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+        const __fp16* g = reinterpret_cast<const __fp16*>(gate);
+        const __fp16* u = reinterpret_cast<const __fp16*>(up);
+        __fp16* o = reinterpret_cast<__fp16*>(out);
+        silu_mul_fp16_neon(g, u, o, intermediate_size);
+        return;
+#endif
+
+        for (size_t i = 0; i < intermediate_size; ++i) {
+            float g = fp16_bits_to_float(gate[i]);
+            float u = fp16_bits_to_float(up[i]);
+            float silu_g = g / (1.0f + std::exp(-g));
+            out[i] = float_to_fp16_bits(silu_g * u);
+        }
+    };
+
+    if (pool) {
+        pool->parallelize_1d(num_tokens, worker_token);
+    } else {
+        for (size_t t = 0; t < num_tokens; ++t) worker_token(t);
+    }
+}
+
 void qwen2_add_fp16(
     const uint16_t* a,
     const uint16_t* b,
@@ -662,6 +700,12 @@ void qwen2_transpose_bshd_to_bhsd_fp16(
 ) {
     // Input:  [B, S, H, D]
     // Output: [B, H, S, D]
+
+    if (S == 1) {
+        std::memcpy(output, input, 
+        B*H*D*sizeof(uint16_t));
+        return;
+    }
 
     const size_t task_count = B * H * S;
     auto worker = [&](size_t task_id) {

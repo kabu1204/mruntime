@@ -34,6 +34,9 @@ void qwen2_gemm_fp16(
     PThreadPool* pool
 );
 
+// Returns true when KleidiAI FP16 kernels are available at runtime.
+bool qwen2_has_kai_fp16();
+
 // Get size needed for packed weight buffer
 size_t qwen2_packed_weight_size_fp16(size_t N, size_t K);
 
@@ -120,6 +123,17 @@ void qwen2_silu_mul_fp16(
     const uint16_t* up,
     uint16_t* output,
     size_t n,
+    PThreadPool* pool
+);
+
+// Fused SiLU + Mul for interleaved (gate|up) layout:
+// gate_up: [num_tokens, 2 * intermediate_size], where each row is [gate..., up...]
+// output:  [num_tokens, intermediate_size]
+void qwen2_silu_mul_interleaved_fp16(
+    const uint16_t* gate_up,
+    uint16_t* output,
+    size_t num_tokens,
+    size_t intermediate_size,
     PThreadPool* pool
 );
 

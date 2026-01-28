@@ -34,8 +34,7 @@ Qwen2MemorySizes qwen2_memory_sizes(
     size_t q_proj_size = cfg.num_attention_heads * head_dim * cfg.hidden_size * elem_size;
     size_t kv_proj_size = cfg.num_kv_heads * head_dim * cfg.hidden_size * elem_size;
     size_t o_proj_size = cfg.hidden_size * cfg.num_attention_heads * head_dim * elem_size;
-    size_t gate_proj_size = cfg.intermediate_size * cfg.hidden_size * elem_size;
-    size_t up_proj_size = cfg.intermediate_size * cfg.hidden_size * elem_size;
+    size_t gate_up_proj_size = 2 * cfg.intermediate_size * cfg.hidden_size * elem_size;
     size_t down_proj_size = cfg.hidden_size * cfg.intermediate_size * elem_size;
     size_t norm_size = cfg.hidden_size * elem_size;
 
@@ -44,7 +43,7 @@ Qwen2MemorySizes qwen2_memory_sizes(
     size_t kv_bias_size = cfg.num_kv_heads * head_dim * elem_size;
 
     size_t layer_weights_size = 2 * norm_size + q_proj_size + 2 * kv_proj_size + o_proj_size +
-                                gate_proj_size + up_proj_size + down_proj_size +
+                                gate_up_proj_size + down_proj_size +
                                 q_bias_size + 2 * kv_bias_size;
 
     // Add space for layer pointers array
@@ -75,7 +74,7 @@ Qwen2MemorySizes qwen2_memory_sizes(
                           q_proj_buf * 2 +  // q_proj, q_transposed
                           kv_proj_buf * 2 + // k_proj, v_proj
                           attn_out_buf +
-                          gate_buf * 2 +    // gate, up
+                          gate_buf * 3 +    // gate, up (fused gate+up), silu(gate)*up
                           hidden_buf +      // mlp_out
                           logits_buf;
 
@@ -85,8 +84,7 @@ Qwen2MemorySizes qwen2_memory_sizes(
         qwen2_packed_weight_size_fp16(cfg.num_attention_heads * head_dim, cfg.hidden_size) +
         2 * qwen2_packed_weight_size_fp16(cfg.num_kv_heads * head_dim, cfg.hidden_size) +
         qwen2_packed_weight_size_fp16(cfg.hidden_size, cfg.num_attention_heads * head_dim) +
-        qwen2_packed_weight_size_fp16(cfg.intermediate_size, cfg.hidden_size) +
-        qwen2_packed_weight_size_fp16(cfg.intermediate_size, cfg.hidden_size) +
+        qwen2_packed_weight_size_fp16(cfg.intermediate_size * 2, cfg.hidden_size) +
         qwen2_packed_weight_size_fp16(cfg.hidden_size, cfg.intermediate_size)
     );
     sizes.packed_weights_bytes += qwen2_packed_weight_size_fp16(cfg.vocab_size, cfg.hidden_size);
@@ -140,15 +138,14 @@ Qwen2RopeCache qwen2_init_rope_cache(
 
 namespace {
 
-// Copy tensor data from SafeTensors file into arena, converting BF16 to FP16 if needed
-uint16_t* load_tensor_to_arena(
+bool load_tensor_to_fp16_buffer(
     const SafeTensorsFile& file,
     const std::string& name,
-    Arena& arena,
+    uint16_t* dst,
     size_t expected_numel
 ) {
     if (!file.has_tensor(name)) {
-        return nullptr;
+        return false;
     }
 
     const TensorInfo& info = file.tensor_info(name);
@@ -160,8 +157,6 @@ uint16_t* load_tensor_to_arena(
     }
     assert(numel == expected_numel);
     (void)expected_numel;  // Suppress unused warning in release
-
-    uint16_t* dst = arena.alloc_array<uint16_t>(numel);
 
     // Get raw pointer to mmap'd data (zero-copy access)
     const void* src = file.tensor_data(name);
@@ -183,6 +178,25 @@ uint16_t* load_tensor_to_arena(
     } else {
         throw std::runtime_error("Unsupported dtype for tensor: " + name);
     }
+
+    return true;
+}
+
+// Copy tensor data from SafeTensors file into arena, converting BF16 to FP16 if needed.
+uint16_t* load_tensor_to_arena(
+    const SafeTensorsFile& file,
+    const std::string& name,
+    Arena& arena,
+    size_t expected_numel
+) {
+    if (!file.has_tensor(name)) {
+        return nullptr;
+    }
+
+    uint16_t* dst = arena.alloc_array<uint16_t>(expected_numel);
+    const bool ok = load_tensor_to_fp16_buffer(file, name, dst, expected_numel);
+    assert(ok);
+    (void)ok;
 
     return dst;
 }
@@ -303,14 +317,15 @@ Qwen2Weights qwen2_load_weights(
         );
 
         // MLP projections
-        layer.gate_proj = load_tensor_to_arena(
-            file, prefix + ".mlp.gate_proj.weight", weights_arena,
-            cfg.intermediate_size * cfg.hidden_size
-        );
-        layer.up_proj = load_tensor_to_arena(
-            file, prefix + ".mlp.up_proj.weight", weights_arena,
-            cfg.intermediate_size * cfg.hidden_size
-        );
+        const size_t gate_up_numel = cfg.intermediate_size * cfg.hidden_size;
+        uint16_t* gate_up = weights_arena.alloc_array<uint16_t>(gate_up_numel * 2);
+        if (!load_tensor_to_fp16_buffer(file, prefix + ".mlp.gate_proj.weight", gate_up, gate_up_numel)) {
+            throw std::runtime_error("Missing tensor: " + prefix + ".mlp.gate_proj.weight");
+        }
+        if (!load_tensor_to_fp16_buffer(file, prefix + ".mlp.up_proj.weight", gate_up + gate_up_numel, gate_up_numel)) {
+            throw std::runtime_error("Missing tensor: " + prefix + ".mlp.up_proj.weight");
+        }
+        layer.gate_up_proj = gate_up;
         layer.down_proj = load_tensor_to_arena(
             file, prefix + ".mlp.down_proj.weight", weights_arena,
             cfg.hidden_size * cfg.intermediate_size
@@ -321,8 +336,7 @@ Qwen2Weights qwen2_load_weights(
         layer.k_proj_packed = nullptr;
         layer.v_proj_packed = nullptr;
         layer.o_proj_packed = nullptr;
-        layer.gate_proj_packed = nullptr;
-        layer.up_proj_packed = nullptr;
+        layer.gate_up_proj_packed = nullptr;
         layer.down_proj_packed = nullptr;
 
         // Pack weights for KleidiAI if requested
@@ -360,21 +374,18 @@ Qwen2Weights qwen2_load_weights(
                 cfg.hidden_size, cfg.num_attention_heads * head_dim);
             layer.o_proj_packed = o_packed;
 
-            // Gate projection: [intermediate_size, hidden_size]
-            size_t gate_packed_size = qwen2_packed_weight_size_fp16(
-                cfg.intermediate_size, cfg.hidden_size);
-            uint16_t* gate_packed = weights_arena.alloc_array<uint16_t>(gate_packed_size / sizeof(uint16_t));
-            qwen2_pack_weight_fp16(layer.gate_proj, gate_packed,
-                cfg.intermediate_size, cfg.hidden_size);
-            layer.gate_proj_packed = gate_packed;
-
-            // Up projection: [intermediate_size, hidden_size]
-            size_t up_packed_size = qwen2_packed_weight_size_fp16(
-                cfg.intermediate_size, cfg.hidden_size);
-            uint16_t* up_packed = weights_arena.alloc_array<uint16_t>(up_packed_size / sizeof(uint16_t));
-            qwen2_pack_weight_fp16(layer.up_proj, up_packed,
-                cfg.intermediate_size, cfg.hidden_size);
-            layer.up_proj_packed = up_packed;
+            // Fused (gate + up) projection packed weight:
+            // concat rows as [2 * intermediate_size, hidden_size] so we can compute both in one GEMM.
+            size_t gate_up_packed_size = qwen2_packed_weight_size_fp16(
+                cfg.intermediate_size * 2, cfg.hidden_size);
+            uint16_t* gate_up_packed = weights_arena.alloc_array<uint16_t>(gate_up_packed_size / sizeof(uint16_t));
+            qwen2_pack_weight_fp16(
+                layer.gate_up_proj,
+                gate_up_packed,
+                cfg.intermediate_size * 2,
+                cfg.hidden_size
+            );
+            layer.gate_up_proj_packed = gate_up_packed;
 
             // Down projection: [hidden_size, intermediate_size]
             size_t down_packed_size = qwen2_packed_weight_size_fp16(
@@ -441,7 +452,7 @@ Qwen2Scratch qwen2_init_scratch(
     scratch.q_transposed = scratch_arena.alloc_array<uint16_t>(max_tokens * cfg.num_attention_heads * head_dim);
     scratch.attn_out = scratch_arena.alloc_array<uint16_t>(max_tokens * cfg.num_attention_heads * head_dim);
     scratch.gate = scratch_arena.alloc_array<uint16_t>(max_tokens * cfg.intermediate_size);
-    scratch.up = scratch_arena.alloc_array<uint16_t>(max_tokens * cfg.intermediate_size);
+    scratch.up = scratch_arena.alloc_array<uint16_t>(max_tokens * cfg.intermediate_size * 2);
     scratch.mlp_out = scratch_arena.alloc_array<uint16_t>(max_tokens * cfg.hidden_size);
     scratch.logits = scratch_arena.alloc_array<uint16_t>(max_tokens * cfg.vocab_size);
 

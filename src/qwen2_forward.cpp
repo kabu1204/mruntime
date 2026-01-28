@@ -275,28 +275,15 @@ void qwen2_mlp(
     size_t hidden_size = cfg.hidden_size;
     size_t intermediate_size = cfg.intermediate_size;
 
-    // Gate projection: [num_tokens, hidden_size] @ [intermediate, hidden]^T -> [num_tokens, intermediate]
+    // Fused gate + up projections: output layout is [gate..., up...] per token.
     {
-        TRACE_SCOPE_CAT("gate_proj", "gemm");
+        TRACE_SCOPE_CAT("gate_up_proj", "gemm");
         qwen2_gemm_fp16(
             normed_input,
-            layer.gate_proj,
-            scratch.gate,
-            num_tokens, intermediate_size, hidden_size,
-            layer.gate_proj_packed,
-            pool
-        );
-    }
-
-    // Up projection: [num_tokens, hidden_size] @ [intermediate, hidden]^T -> [num_tokens, intermediate]
-    {
-        TRACE_SCOPE_CAT("up_proj", "gemm");
-        qwen2_gemm_fp16(
-            normed_input,
-            layer.up_proj,
+            layer.gate_up_proj,
             scratch.up,
-            num_tokens, intermediate_size, hidden_size,
-            layer.up_proj_packed,
+            num_tokens, intermediate_size * 2, hidden_size,
+            layer.gate_up_proj_packed,
             pool
         );
     }
@@ -304,11 +291,11 @@ void qwen2_mlp(
     // Fused SiLU + elementwise multiply: out = silu(gate) * up
     {
         TRACE_SCOPE_CAT("silu_mul", "elementwise");
-        qwen2_silu_mul_fp16(
-            scratch.gate,
+        qwen2_silu_mul_interleaved_fp16(
             scratch.up,
-            scratch.gate,  // Reuse gate buffer for intermediate result
-            num_tokens * intermediate_size,
+            scratch.gate,
+            num_tokens,
+            intermediate_size,
             pool
         );
     }

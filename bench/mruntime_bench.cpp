@@ -554,24 +554,41 @@ int main() {
     // =========================================================================
     std::cout << "\n=== Simulated E2E Pattern (no weight reuse) ===\n";
 
-    auto benchmark_multi_gemv_pattern = [&](size_t N, size_t K, size_t num_matrices, bool flush_between, PThreadPool* p) -> double {
+    auto benchmark_fused_mlp_pattern = [&](size_t hidden_size, size_t intermediate_size, size_t num_layers, bool flush_between, PThreadPool* p) -> double {
         constexpr size_t M = 1;
-        const size_t A_size = M * K;
-        const size_t C_size = M * N;
-        const size_t packed_B_bytes = qwen2_packed_weight_size_fp16(N, K);
 
-        uint16_t* A = static_cast<uint16_t*>(aligned_alloc_or_die(A_size * sizeof(uint16_t)));
-        uint16_t* C = static_cast<uint16_t*>(aligned_alloc_or_die(C_size * sizeof(uint16_t)));
+        // gate_up: [2*intermediate, hidden]
+        const size_t gate_up_N = intermediate_size * 2;
+        const size_t gate_up_K = hidden_size;
+        const size_t gate_up_A_size = M * gate_up_K;
+        const size_t gate_up_C_size = M * gate_up_N;
+        const size_t gate_up_packed_B_bytes = qwen2_packed_weight_size_fp16(gate_up_N, gate_up_K);
 
-        // Allocate multiple different weight matrices
-        std::vector<uint16_t*> packed_Bs(num_matrices);
-        for (size_t i = 0; i < num_matrices; ++i) {
-            packed_Bs[i] = static_cast<uint16_t*>(aligned_alloc_or_die(packed_B_bytes));
-            std::memset(packed_Bs[i], static_cast<int>(0x42 + i), packed_B_bytes);
+        // down: [hidden, intermediate]
+        const size_t down_N = hidden_size;
+        const size_t down_K = intermediate_size;
+        const size_t down_A_size = M * down_K;
+        const size_t down_C_size = M * down_N;
+        const size_t down_packed_B_bytes = qwen2_packed_weight_size_fp16(down_N, down_K);
+
+        uint16_t* gate_up_A = static_cast<uint16_t*>(aligned_alloc_or_die(gate_up_A_size * sizeof(uint16_t)));
+        uint16_t* gate_up_C = static_cast<uint16_t*>(aligned_alloc_or_die(gate_up_C_size * sizeof(uint16_t)));
+        uint16_t* down_A = static_cast<uint16_t*>(aligned_alloc_or_die(down_A_size * sizeof(uint16_t)));
+        uint16_t* down_C = static_cast<uint16_t*>(aligned_alloc_or_die(down_C_size * sizeof(uint16_t)));
+
+        std::vector<uint16_t*> gate_up_packed_Bs(num_layers);
+        std::vector<uint16_t*> down_packed_Bs(num_layers);
+        for (size_t i = 0; i < num_layers; ++i) {
+            gate_up_packed_Bs[i] = static_cast<uint16_t*>(aligned_alloc_or_die(gate_up_packed_B_bytes));
+            down_packed_Bs[i] = static_cast<uint16_t*>(aligned_alloc_or_die(down_packed_B_bytes));
+            std::memset(gate_up_packed_Bs[i], static_cast<int>(0x42 + i), gate_up_packed_B_bytes);
+            std::memset(down_packed_Bs[i], static_cast<int>(0xC0 + i), down_packed_B_bytes);
         }
 
-        std::memset(A, 0x42, A_size * sizeof(uint16_t));
-        std::memset(C, 0, C_size * sizeof(uint16_t));
+        std::memset(gate_up_A, 0x42, gate_up_A_size * sizeof(uint16_t));
+        std::memset(gate_up_C, 0, gate_up_C_size * sizeof(uint16_t));
+        std::memset(down_A, 0x42, down_A_size * sizeof(uint16_t));
+        std::memset(down_C, 0, down_C_size * sizeof(uint16_t));
 
         // Initial cache flush
         cache_flusher.flush();
@@ -585,8 +602,9 @@ int main() {
             }
 
             auto start = std::chrono::steady_clock::now();
-            for (size_t i = 0; i < num_matrices; ++i) {
-                qwen2_gemm_fp16(A, nullptr, C, M, N, K, packed_Bs[i], p);
+            for (size_t layer = 0; layer < num_layers; ++layer) {
+                qwen2_gemm_fp16(gate_up_A, nullptr, gate_up_C, M, gate_up_N, gate_up_K, gate_up_packed_Bs[layer], p);
+                qwen2_gemm_fp16(down_A, nullptr, down_C, M, down_N, down_K, down_packed_Bs[layer], p);
             }
             auto end = std::chrono::steady_clock::now();
 
@@ -594,37 +612,54 @@ int main() {
             total_ms += elapsed.count();
         }
 
-        double time_per_gemv = total_ms / (iters * num_matrices);
+        const size_t total_gemvs = num_layers * 2;
+        const double time_per_gemv = total_ms / (iters * total_gemvs);
 
-        std::free(A);
-        std::free(C);
-        for (auto* b : packed_Bs) std::free(b);
+        std::free(gate_up_A);
+        std::free(gate_up_C);
+        std::free(down_A);
+        std::free(down_C);
+        for (auto* b : gate_up_packed_Bs) std::free(b);
+        for (auto* b : down_packed_Bs) std::free(b);
 
         return time_per_gemv;
     };
 
-    // Simulate 24 layers × 3 MLP ops = 72 different weight matrices
-    const size_t weight_bytes = 4864ULL * 896ULL * sizeof(uint16_t);
+    // Simulate fused MLP: 24 layers × 2 ops (gate_up + down) = 48 different weight matrices.
+    const size_t hidden_size = 896;
+    const size_t intermediate_size = 4864;
+    const size_t gate_up_weight_bytes = (intermediate_size * 2) * hidden_size * sizeof(uint16_t);
+    const size_t down_weight_bytes = hidden_size * intermediate_size * sizeof(uint16_t);
+    const size_t avg_weight_bytes_per_gemv = (gate_up_weight_bytes + down_weight_bytes) / 2;
 
     {
-        double time_ms = benchmark_multi_gemv_pattern(4864, 896, 72, true, &pool);
-        double bw = bandwidth_gb_s(weight_bytes, time_ms);
-        std::cout << "  72 matrices, flush between sweeps (cold start):\n";
+        double time_ms = benchmark_fused_mlp_pattern(hidden_size, intermediate_size, 24, true, &pool);
+        double bw = bandwidth_gb_s(avg_weight_bytes_per_gemv, time_ms);
+        std::cout << "  48 matrices (fused MLP), flush between sweeps (cold start):\n";
         std::cout << "    Per-GEMV: " << time_ms << " ms, BW: " << bw << " GB/s\n";
     }
 
     {
-        double time_ms = benchmark_multi_gemv_pattern(4864, 896, 72, false, &pool);
-        double bw = bandwidth_gb_s(weight_bytes, time_ms);
-        std::cout << "  72 matrices, no flush between sweeps (steady-state):\n";
+        double time_ms = benchmark_fused_mlp_pattern(hidden_size, intermediate_size, 24, false, &pool);
+        double bw = bandwidth_gb_s(avg_weight_bytes_per_gemv, time_ms);
+        std::cout << "  48 matrices (fused MLP), no flush between sweeps (steady-state):\n";
         std::cout << "    Per-GEMV: " << time_ms << " ms, BW: " << bw << " GB/s\n";
     }
 
     {
-        double time_ms_single = benchmark_gemv_cold(4864, 896, &pool);
-        double bw_single = bandwidth_gb_s(weight_bytes, time_ms_single);
         std::cout << "  Single matrix (cold cache baseline):\n";
-        std::cout << "    Per-GEMV: " << time_ms_single << " ms, BW: " << bw_single << " GB/s\n";
+        {
+            double time_ms = benchmark_gemv_cold(intermediate_size * 2, hidden_size, &pool);
+            double bw = bandwidth_gb_s(gate_up_weight_bytes, time_ms);
+            std::cout << "    gate_up (" << (intermediate_size * 2) << "x" << hidden_size << "): "
+                      << time_ms << " ms, BW: " << bw << " GB/s\n";
+        }
+        {
+            double time_ms = benchmark_gemv_cold(hidden_size, intermediate_size, &pool);
+            double bw = bandwidth_gb_s(down_weight_bytes, time_ms);
+            std::cout << "    down    (" << hidden_size << "x" << intermediate_size << "): "
+                      << time_ms << " ms, BW: " << bw << " GB/s\n";
+        }
     }
 
     return 0;
