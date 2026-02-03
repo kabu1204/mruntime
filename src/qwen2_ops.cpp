@@ -1,6 +1,7 @@
 #include "mruntime/qwen2_ops.h"
 
-#include <_types/_uint16_t.h>
+#include <array>
+#include <cstdint>
 #include <algorithm>
 #include <cassert>
 #include <cmath>
@@ -202,6 +203,23 @@ void qwen2_rmsnorm_fp16(
     float eps,
     PThreadPool* pool
 ) {
+#if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+    auto worker_token = [&](size_t t) {
+        ::rmsnorm_fp16_neon(
+            input + t * hidden_size, weight, output + t * hidden_size, hidden_size, eps);
+    };
+
+    // Skip thread pool for small workloads (decode: num_tokens=1)
+    constexpr size_t kMinTokensForParallel = 4;
+    if (pool && num_tokens >= kMinTokensForParallel) {
+        pool->parallelize_1d(num_tokens, worker_token);
+    } else {
+        for (size_t t = 0; t < num_tokens; ++t) worker_token(t);
+    }
+    return;
+#endif
+
+    // Scalar fallback
     auto worker = [&](size_t t) {
         float sum_sq = 0.0f;
         for (size_t i = 0; i < hidden_size; ++i) {
@@ -307,6 +325,83 @@ void qwen2_rope_fp16(
 // Flash Attention
 // ============================================================================
 
+namespace {
+
+constexpr size_t kFlashAttentionKvBlock = 128;
+constexpr size_t kFlashAttentionMaxHeadDim = 512;
+
+struct FlashAttentionGqaScratch {
+    std::array<float, kFlashAttentionMaxHeadDim> acc;
+    std::array<float, kFlashAttentionKvBlock> scores;
+    std::array<float, kFlashAttentionKvBlock> weights;
+#if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+    std::array<uint16_t, kFlashAttentionKvBlock> exp_in_bits;
+    std::array<uint16_t, kFlashAttentionKvBlock> exp_out_bits;
+#endif
+};
+
+inline float dot_fp16_bits_fp16_bits(const uint16_t* a, const uint16_t* b, size_t n) {
+#if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+    float32x4_t acc0 = vdupq_n_f32(0.0f);
+    float32x4_t acc1 = vdupq_n_f32(0.0f);
+
+    size_t d = 0;
+    for (; d + 8 <= n; d += 8) {
+        const uint16x8_t au = vld1q_u16(a + d);
+        const uint16x8_t bu = vld1q_u16(b + d);
+        const float16x8_t ah = vreinterpretq_f16_u16(au);
+        const float16x8_t bh = vreinterpretq_f16_u16(bu);
+        const float32x4_t a0 = vcvt_f32_f16(vget_low_f16(ah));
+        const float32x4_t a1 = vcvt_f32_f16(vget_high_f16(ah));
+        const float32x4_t b0 = vcvt_f32_f16(vget_low_f16(bh));
+        const float32x4_t b1 = vcvt_f32_f16(vget_high_f16(bh));
+        acc0 = vfmaq_f32(acc0, a0, b0);
+        acc1 = vfmaq_f32(acc1, a1, b1);
+    }
+
+    const float32x4_t sumv = vaddq_f32(acc0, acc1);
+#if defined(__aarch64__)
+    float sum = vaddvq_f32(sumv);
+#else
+    const float32x2_t sum2 = vadd_f32(vget_low_f32(sumv), vget_high_f32(sumv));
+    const float32x2_t sum1 = vpadd_f32(sum2, sum2);
+    float sum = vget_lane_f32(sum1, 0);
+#endif
+
+    for (; d < n; ++d) {
+        sum += fp16_bits_to_float(a[d]) * fp16_bits_to_float(b[d]);
+    }
+    return sum;
+#else
+    float sum = 0.0f;
+    for (size_t d = 0; d < n; ++d) {
+        sum += fp16_bits_to_float(a[d]) * fp16_bits_to_float(b[d]);
+    }
+    return sum;
+#endif
+}
+
+inline void mul_inplace_fp32(float* x, size_t n, float s) {
+#if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+    const float32x4_t vs = vdupq_n_f32(s);
+    size_t i = 0;
+    for (; i + 4 <= n; i += 4) {
+        float32x4_t vx = vld1q_f32(x + i);
+        vx = vmulq_f32(vx, vs);
+        vst1q_f32(x + i, vx);
+    }
+    for (; i < n; ++i) {
+        x[i] *= s;
+    }
+#else
+    for (size_t i = 0; i < n; ++i) {
+        x[i] *= s;
+    }
+#endif
+}
+
+}  // namespace
+
 void qwen2_flash_attention_fp16(
     const uint16_t* Q,
     const uint16_t* K,
@@ -321,33 +416,82 @@ void qwen2_flash_attention_fp16(
     bool causal,
     PThreadPool* pool
 ) {
-    // Strides for [batch, num_heads, seq_len, head_dim] layout
-    const size_t q_stride0 = num_heads * q_len * head_dim;
+    // Delegate to the GQA kernel with kv_stride == kv_len and num_q_heads == num_kv_heads.
+    // This shares the same blockwise online-softmax implementation (no kv_len-sized scores buffer).
+    qwen2_flash_attention_gqa_fp16(
+        Q,
+        K,
+        V,
+        O,
+        batch,
+        num_heads,  // num_q_heads
+        num_heads,  // num_kv_heads
+        q_len,
+        kv_len,
+        kv_len,     // kv_stride
+        head_dim,
+        scale,
+        causal,
+        pool
+    );
+}
+
+void qwen2_flash_attention_gqa_fp16(
+    const uint16_t* Q,
+    const uint16_t* K,
+    const uint16_t* V,
+    uint16_t* O,
+    size_t batch,
+    size_t num_q_heads,
+    size_t num_kv_heads,
+    size_t q_len,
+    size_t kv_len,
+    size_t kv_stride,
+    size_t head_dim,
+    float scale,
+    bool causal,
+    PThreadPool* pool
+) {
+    if (batch == 0 || num_q_heads == 0 || num_kv_heads == 0 || q_len == 0 || kv_len == 0 || head_dim == 0) {
+        return;
+    }
+    assert(kv_stride >= kv_len);
+    assert(num_q_heads % num_kv_heads == 0);
+    assert(head_dim <= kFlashAttentionMaxHeadDim);
+
+    const size_t heads_per_kv = num_q_heads / num_kv_heads;
+
+    const size_t q_stride0 = num_q_heads * q_len * head_dim;
     const size_t q_stride1 = q_len * head_dim;
     const size_t q_stride2 = head_dim;
 
-    const size_t k_stride0 = num_heads * kv_len * head_dim;
-    const size_t k_stride1 = kv_len * head_dim;
+    const size_t k_stride0 = num_kv_heads * kv_stride * head_dim;
+    const size_t k_stride1 = kv_stride * head_dim;
     const size_t k_stride2 = head_dim;
 
-    const size_t v_stride0 = num_heads * kv_len * head_dim;
-    const size_t v_stride1 = kv_len * head_dim;
+    const size_t v_stride0 = num_kv_heads * kv_stride * head_dim;
+    const size_t v_stride1 = kv_stride * head_dim;
     const size_t v_stride2 = head_dim;
 
-    const size_t o_stride0 = num_heads * q_len * head_dim;
+    const size_t o_stride0 = num_q_heads * q_len * head_dim;
     const size_t o_stride1 = q_len * head_dim;
     const size_t o_stride2 = head_dim;
 
-    // For causal: Q corresponds to the last q_len positions in K/V
+    // Causal mask assumes Q covers the last q_len positions of the KV stream:
+    // - Prefill: kv_len == q_len -> base_position = 0 and token qi attends [0..qi].
+    // - Decode:  q_len == 1 -> base_position = kv_len - 1 and the token attends [0..kv_len-1].
     const size_t base_position = (kv_len >= q_len) ? (kv_len - q_len) : 0;
 
-    const size_t task_count = batch * num_heads * q_len;
+    const size_t task_count = batch * num_q_heads * q_len;
+
     auto worker = [&](size_t task_id) {
         size_t tmp = task_id;
         const size_t qi = tmp % q_len;
         tmp /= q_len;
-        const size_t h = tmp % num_heads;
-        const size_t b = tmp / num_heads;
+        const size_t q_h = tmp % num_q_heads;
+        const size_t b = tmp / num_q_heads;
+
+        const size_t kv_h = q_h / heads_per_kv;
 
         size_t max_k = kv_len - 1;
         if (causal && kv_len >= q_len) {
@@ -355,39 +499,99 @@ void qwen2_flash_attention_fp16(
             if (max_k >= kv_len) max_k = kv_len - 1;
         }
 
-        static thread_local std::vector<float> scores;
-        static thread_local std::vector<float> acc;
-        if (scores.size() < kv_len) scores.resize(kv_len);
-        if (acc.size() < head_dim) acc.resize(head_dim);
-        std::fill(acc.begin(), acc.begin() + head_dim, 0.0f);
+        const uint16_t* q_ptr = Q + b * q_stride0 + q_h * q_stride1 + qi * q_stride2;
+        const uint16_t* k_ptr = K + b * k_stride0 + kv_h * k_stride1;
+        const uint16_t* v_ptr = V + b * v_stride0 + kv_h * v_stride1;
 
-        float max_score = -std::numeric_limits<float>::infinity();
-        for (size_t ki = 0; ki <= max_k; ++ki) {
-            float dot = 0.0f;
-            for (size_t d = 0; d < head_dim; ++d) {
-                size_t q_idx = b * q_stride0 + h * q_stride1 + qi * q_stride2 + d;
-                size_t k_idx = b * k_stride0 + h * k_stride1 + ki * k_stride2 + d;
-                dot += fp16_bits_to_float(Q[q_idx]) * fp16_bits_to_float(K[k_idx]);
+        static thread_local FlashAttentionGqaScratch scratch;
+        float* acc = scratch.acc.data();
+        float* scores = scratch.scores.data();
+        float* weights = scratch.weights.data();
+#if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+        uint16_t* exp_in_bits = scratch.exp_in_bits.data();
+        uint16_t* exp_out_bits = scratch.exp_out_bits.data();
+#endif
+
+        std::fill_n(acc, head_dim, 0.0f);
+
+        float m = -std::numeric_limits<float>::infinity();
+        float l = 0.0f;
+
+        for (size_t k0 = 0; k0 <= max_k; k0 += kFlashAttentionKvBlock) {
+            const size_t k1 = std::min(max_k + 1, k0 + kFlashAttentionKvBlock);
+            const size_t block_len = k1 - k0;
+
+            float block_max = -std::numeric_limits<float>::infinity();
+            for (size_t j = 0; j < block_len; ++j) {
+                const uint16_t* k_vec = k_ptr + (k0 + j) * k_stride2;
+                const float s = dot_fp16_bits_fp16_bits(q_ptr, k_vec, head_dim) * scale;
+                scores[j] = s;
+                block_max = std::max(block_max, s);
             }
-            float s = dot * scale;
-            scores[ki] = s;
-            max_score = std::max(max_score, s);
+
+            const float new_m = std::max(m, block_max);
+            const float exp_diff = std::exp(m - new_m);
+            l *= exp_diff;
+            mul_inplace_fp32(acc, head_dim, exp_diff);
+            m = new_m;
+
+#if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+            for (size_t j = 0; j < block_len; ++j) {
+                exp_in_bits[j] = float_to_fp16_bits(scores[j] - m);
+            }
+            fast_exp_fp16_neon(
+                reinterpret_cast<const __fp16*>(exp_in_bits),
+                reinterpret_cast<__fp16*>(exp_out_bits),
+                block_len
+            );
+            fp16_bits_to_fp32(exp_out_bits, weights, block_len);
+#else
+            for (size_t j = 0; j < block_len; ++j) {
+                weights[j] = std::exp(scores[j] - m);
+            }
+#endif
+
+            float rowsum = 0.0f;
+            for (size_t j = 0; j < block_len; ++j) {
+                rowsum += weights[j];
+            }
+            l += rowsum;
+
+            for (size_t j = 0; j < block_len; ++j) {
+                const float w = weights[j];
+                const uint16_t* v_vec = v_ptr + (k0 + j) * v_stride2;
+
+#if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+                const float32x4_t vw = vdupq_n_f32(w);
+                size_t d = 0;
+                for (; d + 8 <= head_dim; d += 8) {
+                    const uint16x8_t vu = vld1q_u16(v_vec + d);
+                    const float16x8_t vh = vreinterpretq_f16_u16(vu);
+                    const float32x4_t v0 = vcvt_f32_f16(vget_low_f16(vh));
+                    const float32x4_t v1 = vcvt_f32_f16(vget_high_f16(vh));
+
+                    float32x4_t a0 = vld1q_f32(acc + d);
+                    float32x4_t a1 = vld1q_f32(acc + d + 4);
+                    a0 = vfmaq_f32(a0, v0, vw);
+                    a1 = vfmaq_f32(a1, v1, vw);
+                    vst1q_f32(acc + d, a0);
+                    vst1q_f32(acc + d + 4, a1);
+                }
+                for (; d < head_dim; ++d) {
+                    acc[d] += w * fp16_bits_to_float(v_vec[d]);
+                }
+#else
+                for (size_t d = 0; d < head_dim; ++d) {
+                    acc[d] += w * fp16_bits_to_float(v_vec[d]);
+                }
+#endif
+            }
         }
 
-        float sum_exp = 0.0f;
-        for (size_t ki = 0; ki <= max_k; ++ki) {
-            float e = std::exp(scores[ki] - max_score);
-            sum_exp += e;
-            for (size_t d = 0; d < head_dim; ++d) {
-                size_t v_idx = b * v_stride0 + h * v_stride1 + ki * v_stride2 + d;
-                acc[d] += e * fp16_bits_to_float(V[v_idx]);
-            }
-        }
-
-        float inv_sum = 1.0f / sum_exp;
+        const float inv_l = 1.0f / l;
         for (size_t d = 0; d < head_dim; ++d) {
-            size_t o_idx = b * o_stride0 + h * o_stride1 + qi * o_stride2 + d;
-            O[o_idx] = float_to_fp16_bits(acc[d] * inv_sum);
+            const size_t o_idx = b * o_stride0 + q_h * o_stride1 + qi * o_stride2 + d;
+            O[o_idx] = float_to_fp16_bits(acc[d] * inv_l);
         }
     };
 

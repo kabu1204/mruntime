@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 
@@ -233,6 +234,125 @@ static inline void fp32_to_fp16_bits_neon(const float* src, uint16_t* dst, size_
         for (size_t j = 0; j < r; ++j) {
             dst[i + j] = tmp_out[j];
         }
+    }
+}
+
+// RMSNorm: out = (x / rms(x)) * weight, where rms(x) = sqrt(mean(x^2) + eps)
+// Processes one token row of hidden_size elements.
+static inline void rmsnorm_fp16_neon(
+    const uint16_t* input,
+    const uint16_t* weight,
+    uint16_t* output,
+    size_t hidden_size,
+    float eps
+) {
+    // Phase 1: Vectorized sum-of-squares with 4 accumulators for ILP
+    float32x4_t acc0 = vdupq_n_f32(0.0f);
+    float32x4_t acc1 = vdupq_n_f32(0.0f);
+    float32x4_t acc2 = vdupq_n_f32(0.0f);
+    float32x4_t acc3 = vdupq_n_f32(0.0f);
+
+    size_t i = 0;
+    // Process 32 elements per iteration (4x8) for better ILP
+    for (; i + 32 <= hidden_size; i += 32) {
+        // Load 4 groups of 8 fp16 values
+        const float16x8_t h0 = vreinterpretq_f16_u16(vld1q_u16(input + i));
+        const float16x8_t h1 = vreinterpretq_f16_u16(vld1q_u16(input + i + 8));
+        const float16x8_t h2 = vreinterpretq_f16_u16(vld1q_u16(input + i + 16));
+        const float16x8_t h3 = vreinterpretq_f16_u16(vld1q_u16(input + i + 24));
+
+        // Convert and accumulate x*x
+        float32x4_t x0_lo = vcvt_f32_f16(vget_low_f16(h0));
+        float32x4_t x0_hi = vcvt_f32_f16(vget_high_f16(h0));
+        acc0 = vfmaq_f32(acc0, x0_lo, x0_lo);
+        acc0 = vfmaq_f32(acc0, x0_hi, x0_hi);
+
+        float32x4_t x1_lo = vcvt_f32_f16(vget_low_f16(h1));
+        float32x4_t x1_hi = vcvt_f32_f16(vget_high_f16(h1));
+        acc1 = vfmaq_f32(acc1, x1_lo, x1_lo);
+        acc1 = vfmaq_f32(acc1, x1_hi, x1_hi);
+
+        float32x4_t x2_lo = vcvt_f32_f16(vget_low_f16(h2));
+        float32x4_t x2_hi = vcvt_f32_f16(vget_high_f16(h2));
+        acc2 = vfmaq_f32(acc2, x2_lo, x2_lo);
+        acc2 = vfmaq_f32(acc2, x2_hi, x2_hi);
+
+        float32x4_t x3_lo = vcvt_f32_f16(vget_low_f16(h3));
+        float32x4_t x3_hi = vcvt_f32_f16(vget_high_f16(h3));
+        acc3 = vfmaq_f32(acc3, x3_lo, x3_lo);
+        acc3 = vfmaq_f32(acc3, x3_hi, x3_hi);
+    }
+
+    // Process remaining 8-element groups
+    for (; i + 8 <= hidden_size; i += 8) {
+        const float16x8_t h = vreinterpretq_f16_u16(vld1q_u16(input + i));
+        float32x4_t x_lo = vcvt_f32_f16(vget_low_f16(h));
+        float32x4_t x_hi = vcvt_f32_f16(vget_high_f16(h));
+        acc0 = vfmaq_f32(acc0, x_lo, x_lo);
+        acc0 = vfmaq_f32(acc0, x_hi, x_hi);
+    }
+
+    // Horizontal reduction
+    float32x4_t sum01 = vaddq_f32(acc0, acc1);
+    float32x4_t sum23 = vaddq_f32(acc2, acc3);
+    float32x4_t sum0123 = vaddq_f32(sum01, sum23);
+    float sum_sq = vaddvq_f32(sum0123);
+
+    // Handle tail (scalar) - use temp buffer approach for consistency
+    if (i < hidden_size) {
+        uint16_t tmp_in[8] = {};
+        float tmp_f[8];
+        const size_t r = hidden_size - i;
+        for (size_t j = 0; j < r; ++j) tmp_in[j] = input[i + j];
+        const float16x8_t h = vreinterpretq_f16_u16(vld1q_u16(tmp_in));
+        vst1q_f32(tmp_f, vcvt_f32_f16(vget_low_f16(h)));
+        vst1q_f32(tmp_f + 4, vcvt_f32_f16(vget_high_f16(h)));
+        for (size_t j = 0; j < r; ++j) sum_sq += tmp_f[j] * tmp_f[j];
+    }
+
+    // Compute inv_rms
+    const float rms = std::sqrt(sum_sq / static_cast<float>(hidden_size) + eps);
+    const float inv_rms = 1.0f / rms;
+    const float32x4_t v_inv_rms = vdupq_n_f32(inv_rms);
+
+    // Phase 2: Normalize and scale by weight
+    i = 0;
+    for (; i + 8 <= hidden_size; i += 8) {
+        const float16x8_t h_in = vreinterpretq_f16_u16(vld1q_u16(input + i));
+        const float16x8_t h_w = vreinterpretq_f16_u16(vld1q_u16(weight + i));
+
+        float32x4_t x_lo = vcvt_f32_f16(vget_low_f16(h_in));
+        float32x4_t x_hi = vcvt_f32_f16(vget_high_f16(h_in));
+        float32x4_t w_lo = vcvt_f32_f16(vget_low_f16(h_w));
+        float32x4_t w_hi = vcvt_f32_f16(vget_high_f16(h_w));
+
+        float32x4_t out_lo = vmulq_f32(vmulq_f32(x_lo, v_inv_rms), w_lo);
+        float32x4_t out_hi = vmulq_f32(vmulq_f32(x_hi, v_inv_rms), w_hi);
+
+        const float16x8_t h_out = vcombine_f16(vcvt_f16_f32(out_lo), vcvt_f16_f32(out_hi));
+        vst1q_u16(output + i, vreinterpretq_u16_f16(h_out));
+    }
+
+    // Handle tail
+    if (i < hidden_size) {
+        uint16_t tmp_in[8] = {}, tmp_w[8] = {}, tmp_out[8];
+        float f_in[8], f_w[8], f_out[8];
+        const size_t r = hidden_size - i;
+        for (size_t j = 0; j < r; ++j) { tmp_in[j] = input[i + j]; tmp_w[j] = weight[i + j]; }
+
+        const float16x8_t h_in = vreinterpretq_f16_u16(vld1q_u16(tmp_in));
+        const float16x8_t h_w = vreinterpretq_f16_u16(vld1q_u16(tmp_w));
+        vst1q_f32(f_in, vcvt_f32_f16(vget_low_f16(h_in)));
+        vst1q_f32(f_in + 4, vcvt_f32_f16(vget_high_f16(h_in)));
+        vst1q_f32(f_w, vcvt_f32_f16(vget_low_f16(h_w)));
+        vst1q_f32(f_w + 4, vcvt_f32_f16(vget_high_f16(h_w)));
+
+        for (size_t j = 0; j < 8; ++j) f_out[j] = f_in[j] * inv_rms * f_w[j];
+
+        const float16x8_t h_out = vcombine_f16(
+            vcvt_f16_f32(vld1q_f32(f_out)), vcvt_f16_f32(vld1q_f32(f_out + 4)));
+        vst1q_u16(tmp_out, vreinterpretq_u16_f16(h_out));
+        for (size_t j = 0; j < r; ++j) output[i + j] = tmp_out[j];
     }
 }
 

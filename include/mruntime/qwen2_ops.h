@@ -97,6 +97,31 @@ void qwen2_flash_attention_fp16(
     PThreadPool* pool
 );
 
+// Flash attention for GQA:
+// Q has num_q_heads while K/V have num_kv_heads (num_q_heads % num_kv_heads == 0).
+// K/V are typically backed by the KV cache, where kv_stride == max_seq_len.
+// Layout:
+//   Q: [batch, num_q_heads, q_len, head_dim]
+//   K: [batch, num_kv_heads, kv_stride, head_dim] (only first kv_len entries are valid)
+//   V: [batch, num_kv_heads, kv_stride, head_dim] (only first kv_len entries are valid)
+//   O: [batch, num_q_heads, q_len, head_dim]
+void qwen2_flash_attention_gqa_fp16(
+    const uint16_t* Q,      // [batch, num_q_heads, q_len, head_dim]
+    const uint16_t* K,      // [batch, num_kv_heads, kv_stride, head_dim]
+    const uint16_t* V,      // [batch, num_kv_heads, kv_stride, head_dim]
+    uint16_t* O,            // [batch, num_q_heads, q_len, head_dim]
+    size_t batch,
+    size_t num_q_heads,
+    size_t num_kv_heads,
+    size_t q_len,
+    size_t kv_len,
+    size_t kv_stride,
+    size_t head_dim,
+    float scale,
+    bool causal,
+    PThreadPool* pool
+);
+
 // ============ Activation Functions ============
 
 // SiLU: out = x * sigmoid(x)

@@ -427,46 +427,23 @@ void qwen2_attention(
     // Flash attention with grouped query attention
     {
         TRACE_SCOPE_CAT("flash_attention", "attention");
-        // Q: [1, num_heads, num_tokens, head_dim]
-        // K: [1, num_kv_heads, total_seq_len, head_dim] (from cache)
-        // V: [1, num_kv_heads, total_seq_len, head_dim] (from cache)
-        // Output: [1, num_heads, num_tokens, head_dim]
-
         const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
-        const size_t heads_per_kv = num_heads / num_kv_heads;
-
-        // Process each KV head group
-        for (size_t kv_h = 0; kv_h < num_kv_heads; ++kv_h) {
-            // Get K, V slices from cache
-            const uint16_t* k_slice = k_cache + kv_h * max_seq_len * head_dim;
-            const uint16_t* v_slice = v_cache + kv_h * max_seq_len * head_dim;
-
-            for (size_t h_offset = 0; h_offset < heads_per_kv; ++h_offset) {
-                size_t q_h = kv_h * heads_per_kv + h_offset;
-
-                // Q slice: [1, 1, num_tokens, head_dim]
-                const uint16_t* q_slice = scratch.q_transposed + q_h * num_tokens * head_dim;
-
-                // Output slice: [1, 1, num_tokens, head_dim]
-                uint16_t* out_slice = scratch.attn_out + q_h * num_tokens * head_dim;
-
-                // Flash attention for this head
-                qwen2_flash_attention_fp16(
-                    q_slice,
-                    k_slice,
-                    v_slice,
-                    out_slice,
-                    1,  // batch
-                    1,  // num_heads (processing one at a time)
-                    num_tokens,  // q_len
-                    total_seq_len,  // kv_len
-                    head_dim,
-                    scale,
-                    true,  // causal
-                    pool
-                );
-            }
-        }
+        qwen2_flash_attention_gqa_fp16(
+            scratch.q_transposed,  // Q: [1, num_heads, num_tokens, head_dim]
+            k_cache,               // K: [1, num_kv_heads, max_seq_len, head_dim]
+            v_cache,               // V: [1, num_kv_heads, max_seq_len, head_dim]
+            scratch.attn_out,      // O: [1, num_heads, num_tokens, head_dim]
+            1,                     // batch
+            num_heads,             // num_q_heads
+            num_kv_heads,
+            num_tokens,            // q_len
+            total_seq_len,         // kv_len
+            max_seq_len,           // kv_stride
+            head_dim,
+            scale,
+            true,                  // causal
+            pool
+        );
     }
 
     // Transpose attention output from [1, num_heads, num_tokens, head_dim] to [1, num_tokens, num_heads, head_dim]
