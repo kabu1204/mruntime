@@ -35,6 +35,15 @@ target_link_libraries(qwen2_ops_test PRIVATE mruntime GTest::gtest_main)
 target_include_directories(qwen2_ops_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
 add_test(NAME qwen2_ops_test COMMAND qwen2_ops_test)
 
+if(MRUNTIME_ENABLE_VULKAN)
+    add_executable(vulkan_smoke_test vulkan_smoke_test.cpp)
+    target_link_libraries(vulkan_smoke_test PRIVATE Vulkan::Vulkan)
+    target_include_directories(vulkan_smoke_test PRIVATE ${MRUNTIME_VULKAN_GENERATED_DIR})
+    add_dependencies(vulkan_smoke_test mruntime_vulkan_shaders)
+    add_test(NAME vulkan_smoke_test COMMAND vulkan_smoke_test)
+    set_tests_properties(vulkan_smoke_test PROPERTIES SKIP_RETURN_CODE 77)
+endif()
+
 # Some tests assume working-directory == ${CMAKE_BINARY_DIR} (out-of-source build root).
 set_tests_properties(loader_test qwen2_tokenizer_test PROPERTIES
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}

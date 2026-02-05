@@ -104,8 +104,4 @@ destroy_qwen2_arenas(arenas);
 
 ## Documentation
 
-See [docs/REFACTORING.md](docs/REFACTORING.md) for detailed refactoring notes.
-
-## License
-
-Research prototype. See LICENSE file for details.
+- `docs/vulkan_backend.md`: Experimental Vulkan backend (build + smoke test).

@@ -10,6 +10,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 option(MRUNTIME_BUILD_TESTS "Build unit tests" ON)
 option(MRUNTIME_BUILD_BENCH "Build benchmarks" ON)
 option(MRUNTIME_BUILD_CLI "Build CLI tools" ON)
+option(MRUNTIME_ENABLE_VULKAN "Enable Vulkan backend (experimental)" OFF)
 
 include(FetchContent)
 
@@ -74,6 +75,63 @@ set(_MRUNTIME_PREV_SKIP_INSTALL_RULES "${CMAKE_SKIP_INSTALL_RULES}")
 set(CMAKE_SKIP_INSTALL_RULES TRUE)
 FetchContent_MakeAvailable(spdlog absl re2 nlohmann_json pthreadpool kleidiai)
 set(CMAKE_SKIP_INSTALL_RULES "${_MRUNTIME_PREV_SKIP_INSTALL_RULES}")
+
+# Vulkan (optional)
+set(MRUNTIME_VULKAN_GENERATED_DIR "")
+set(MRUNTIME_VULKAN_SHADER_HEADERS "")
+if(MRUNTIME_ENABLE_VULKAN)
+    find_package(Vulkan REQUIRED)
+
+    # Used to compile GLSL compute shaders into SPIR-V during the build.
+    # Vulkan SDK provides this tool.
+    find_program(MRUNTIME_GLSLANG_VALIDATOR_EXECUTABLE NAMES glslangValidator)
+    if(NOT MRUNTIME_GLSLANG_VALIDATOR_EXECUTABLE)
+        message(
+            FATAL_ERROR
+            "glslangValidator not found. Install Vulkan SDK or set MRUNTIME_GLSLANG_VALIDATOR_EXECUTABLE."
+        )
+    endif()
+
+    set(MRUNTIME_VULKAN_GENERATED_DIR "${CMAKE_BINARY_DIR}/generated/vulkan")
+    file(MAKE_DIRECTORY "${MRUNTIME_VULKAN_GENERATED_DIR}")
+
+    set(_MRUNTIME_VK_SHADER_SRC "${CMAKE_SOURCE_DIR}/src/vulkan/shaders/vector_add.comp")
+    set(_MRUNTIME_VK_SHADER_SPV "${MRUNTIME_VULKAN_GENERATED_DIR}/vector_add.spv")
+    set(_MRUNTIME_VK_SHADER_HDR "${MRUNTIME_VULKAN_GENERATED_DIR}/vector_add_spv.h")
+
+    add_custom_command(
+        OUTPUT "${_MRUNTIME_VK_SHADER_SPV}"
+        COMMAND "${MRUNTIME_GLSLANG_VALIDATOR_EXECUTABLE}"
+            --target-env vulkan1.1
+            -V "${_MRUNTIME_VK_SHADER_SRC}"
+            -o "${_MRUNTIME_VK_SHADER_SPV}"
+        DEPENDS "${_MRUNTIME_VK_SHADER_SRC}"
+        COMMENT "Compiling GLSL -> SPIR-V: vector_add.comp"
+        VERBATIM
+    )
+
+    add_custom_command(
+        OUTPUT "${_MRUNTIME_VK_SHADER_HDR}"
+        COMMAND "${CMAKE_COMMAND}"
+            -DINPUT="${_MRUNTIME_VK_SHADER_SPV}"
+            -DOUTPUT="${_MRUNTIME_VK_SHADER_HDR}"
+            -DVAR_NAME="kVectorAddSpv"
+            -DNAMESPACE="mruntime::vulkan::shaders"
+            -P "${CMAKE_SOURCE_DIR}/cmake/spirv_to_header.cmake"
+        DEPENDS
+            "${_MRUNTIME_VK_SHADER_SPV}"
+            "${CMAKE_SOURCE_DIR}/cmake/spirv_to_header.cmake"
+        COMMENT "Embedding SPIR-V into header: vector_add_spv.h"
+        VERBATIM
+    )
+
+    set(MRUNTIME_VULKAN_SHADER_HEADERS "${_MRUNTIME_VK_SHADER_HDR}")
+    add_custom_target(mruntime_vulkan_shaders DEPENDS "${MRUNTIME_VULKAN_SHADER_HEADERS}")
+
+    unset(_MRUNTIME_VK_SHADER_SRC)
+    unset(_MRUNTIME_VK_SHADER_SPV)
+    unset(_MRUNTIME_VK_SHADER_HDR)
+endif()
 
 # Core library sources (bare-metal API)
 set(MRUNTIME_CORE_SOURCES
