@@ -37,8 +37,11 @@ add_test(NAME qwen2_ops_test COMMAND qwen2_ops_test)
 
 if(MRUNTIME_ENABLE_VULKAN)
     add_executable(vulkan_smoke_test vulkan_smoke_test.cpp)
-    target_link_libraries(vulkan_smoke_test PRIVATE Vulkan::Vulkan)
-    target_include_directories(vulkan_smoke_test PRIVATE ${MRUNTIME_VULKAN_GENERATED_DIR})
+    target_link_libraries(vulkan_smoke_test PRIVATE mruntime Vulkan::Vulkan)
+    target_include_directories(vulkan_smoke_test PRIVATE
+        ${MRUNTIME_VULKAN_GENERATED_DIR}
+        ${CMAKE_SOURCE_DIR}/src/vulkan
+    )
     add_dependencies(vulkan_smoke_test mruntime_vulkan_shaders)
     add_test(NAME vulkan_smoke_test COMMAND vulkan_smoke_test)
     set_tests_properties(vulkan_smoke_test PROPERTIES SKIP_RETURN_CODE 77)

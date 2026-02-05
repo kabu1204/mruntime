@@ -144,6 +144,13 @@ set(MRUNTIME_CORE_SOURCES
     src/qwen2_generate.cpp
 )
 
+if(MRUNTIME_ENABLE_VULKAN)
+    list(APPEND MRUNTIME_CORE_SOURCES
+        src/vulkan/vk_buffer_arena.cpp
+        src/vulkan/vk_context.cpp
+    )
+endif()
+
 set(MRUNTIME_LOADER_SOURCES
     src/loader/safetensors.cpp
 )
@@ -179,6 +186,13 @@ target_link_libraries(mruntime
     PRIVATE
         nlohmann_json::nlohmann_json
 )
+
+if(MRUNTIME_ENABLE_VULKAN)
+    target_link_libraries(mruntime PRIVATE Vulkan::Vulkan)
+    target_include_directories(mruntime PRIVATE
+        ${CMAKE_SOURCE_DIR}/src/vulkan
+    )
+endif()
 
 if((CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64" OR CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64") AND NOT MSVC)
     set_source_files_properties(src/core/kai_gemm.cpp PROPERTIES COMPILE_OPTIONS "-march=armv8.2-a+fp16")
