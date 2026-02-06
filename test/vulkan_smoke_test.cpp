@@ -8,29 +8,10 @@
 #include <string>
 
 #include "vk_buffer_arena.h"
+#include "vk_compute_pipeline.h"
 #include "vk_context.h"
 #include "vk_helpers.h"
 #include "vector_add_spv.h"
-
-namespace {
-
-template <typename Handle, void (*DestroyFn)(VkDevice, Handle, const VkAllocationCallbacks*)>
-struct UniqueDeviceHandle {
-    VkDevice device = VK_NULL_HANDLE;
-    Handle handle = VK_NULL_HANDLE;
-
-    UniqueDeviceHandle() = default;
-    UniqueDeviceHandle(const UniqueDeviceHandle&) = delete;
-    UniqueDeviceHandle& operator=(const UniqueDeviceHandle&) = delete;
-
-    ~UniqueDeviceHandle() {
-        if (handle) {
-            DestroyFn(device, handle, nullptr);
-        }
-    }
-};
-
-}  // namespace
 
 int main() {
     try {
@@ -42,7 +23,6 @@ int main() {
         std::cout << "Using Vulkan device: " << props.deviceName << "\n";
 
         const VkDevice device = ctx.device();
-        const VkQueue queue = ctx.queue();
 
         constexpr uint32_t n = 1024;
         const VkDeviceSize bytes = static_cast<VkDeviceSize>(n) * sizeof(float);
@@ -71,191 +51,34 @@ int main() {
         }
         std::memset(c_f, 0, static_cast<size_t>(bytes));
 
-        VkDescriptorSetLayoutBinding bindings[3] = {};
-        for (uint32_t i = 0; i < 3; ++i) {
-            bindings[i].binding = i;
-            bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-            bindings[i].descriptorCount = 1;
-            bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-        }
+        mruntime::vulkan::ComputePipelineCreateInfo pipeline_ci;
+        pipeline_ci.spirv = mruntime::vulkan::shaders::kVectorAddSpv;
+        pipeline_ci.spirv_size = mruntime::vulkan::shaders::kVectorAddSpvSize;
+        pipeline_ci.storage_buffer_count = 3;
+        pipeline_ci.push_constant_size = sizeof(uint32_t);
+        mruntime::vulkan::VkComputePipeline pipeline = mruntime::vulkan::VkComputePipeline::Create(device, pipeline_ci);
 
-        VkDescriptorSetLayoutCreateInfo dsl_ci = {};
-        dsl_ci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-        dsl_ci.bindingCount = 3;
-        dsl_ci.pBindings = bindings;
-
-        UniqueDeviceHandle<VkDescriptorSetLayout, vkDestroyDescriptorSetLayout> dsl;
-        dsl.device = device;
-        mruntime::vulkan::vk_check(vkCreateDescriptorSetLayout(device, &dsl_ci, nullptr, &dsl.handle),
-            "vkCreateDescriptorSetLayout");
-
-        VkPushConstantRange pc_range = {};
-        pc_range.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-        pc_range.offset = 0;
-        pc_range.size = sizeof(uint32_t);
-
-        VkPipelineLayoutCreateInfo pl_ci = {};
-        pl_ci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-        pl_ci.setLayoutCount = 1;
-        pl_ci.pSetLayouts = &dsl.handle;
-        pl_ci.pushConstantRangeCount = 1;
-        pl_ci.pPushConstantRanges = &pc_range;
-
-        UniqueDeviceHandle<VkPipelineLayout, vkDestroyPipelineLayout> pipeline_layout;
-        pipeline_layout.device = device;
-        mruntime::vulkan::vk_check(vkCreatePipelineLayout(device, &pl_ci, nullptr, &pipeline_layout.handle),
-            "vkCreatePipelineLayout");
-
-        static_assert((mruntime::vulkan::shaders::kVectorAddSpvSize % 4) == 0, "SPIR-V must be word-aligned");
-        VkShaderModuleCreateInfo sm_ci = {};
-        sm_ci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-        sm_ci.codeSize = mruntime::vulkan::shaders::kVectorAddSpvSize;
-        sm_ci.pCode = reinterpret_cast<const uint32_t*>(mruntime::vulkan::shaders::kVectorAddSpv);
-
-        UniqueDeviceHandle<VkShaderModule, vkDestroyShaderModule> shader;
-        shader.device = device;
-        mruntime::vulkan::vk_check(vkCreateShaderModule(device, &sm_ci, nullptr, &shader.handle),
-            "vkCreateShaderModule");
-
-        VkPipelineShaderStageCreateInfo stage = {};
-        stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-        stage.module = shader.handle;
-        stage.pName = "main";
-
-        VkComputePipelineCreateInfo cp_ci = {};
-        cp_ci.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
-        cp_ci.stage = stage;
-        cp_ci.layout = pipeline_layout.handle;
-
-        UniqueDeviceHandle<VkPipeline, vkDestroyPipeline> pipeline;
-        pipeline.device = device;
-        mruntime::vulkan::vk_check(vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &cp_ci, nullptr, &pipeline.handle),
-            "vkCreateComputePipelines");
-
-        VkDescriptorPoolSize pool_sizes[1] = {};
-        pool_sizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        pool_sizes[0].descriptorCount = 3;
-
-        VkDescriptorPoolCreateInfo dp_ci = {};
-        dp_ci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-        dp_ci.maxSets = 1;
-        dp_ci.poolSizeCount = 1;
-        dp_ci.pPoolSizes = pool_sizes;
-
-        UniqueDeviceHandle<VkDescriptorPool, vkDestroyDescriptorPool> descriptor_pool;
-        descriptor_pool.device = device;
-        mruntime::vulkan::vk_check(vkCreateDescriptorPool(device, &dp_ci, nullptr, &descriptor_pool.handle),
-            "vkCreateDescriptorPool");
-
-        VkDescriptorSetAllocateInfo ds_ai = {};
-        ds_ai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-        ds_ai.descriptorPool = descriptor_pool.handle;
-        ds_ai.descriptorSetCount = 1;
-        ds_ai.pSetLayouts = &dsl.handle;
-
-        VkDescriptorSet ds = VK_NULL_HANDLE;
-        mruntime::vulkan::vk_check(vkAllocateDescriptorSets(device, &ds_ai, &ds), "vkAllocateDescriptorSets");
-
-        VkDescriptorBufferInfo a_info = arena.descriptor(a_off, bytes);
-        VkDescriptorBufferInfo b_info = arena.descriptor(b_off, bytes);
-        VkDescriptorBufferInfo c_info = arena.descriptor(c_off, bytes);
-
-        VkWriteDescriptorSet writes[3] = {};
-        writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[0].dstSet = ds;
-        writes[0].dstBinding = 0;
-        writes[0].descriptorCount = 1;
-        writes[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        writes[0].pBufferInfo = &a_info;
-
-        writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[1].dstSet = ds;
-        writes[1].dstBinding = 1;
-        writes[1].descriptorCount = 1;
-        writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        writes[1].pBufferInfo = &b_info;
-
-        writes[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[2].dstSet = ds;
-        writes[2].dstBinding = 2;
-        writes[2].descriptorCount = 1;
-        writes[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        writes[2].pBufferInfo = &c_info;
-
-        vkUpdateDescriptorSets(device, 3, writes, 0, nullptr);
-
-        VkCommandBufferAllocateInfo cb_ai = {};
-        cb_ai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-        cb_ai.commandPool = ctx.command_pool();
-        cb_ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-        cb_ai.commandBufferCount = 1;
-
-        VkCommandBuffer cb = VK_NULL_HANDLE;
-        mruntime::vulkan::vk_check(vkAllocateCommandBuffers(device, &cb_ai, &cb), "vkAllocateCommandBuffers");
-
-        VkCommandBufferBeginInfo begin = {};
-        begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-        mruntime::vulkan::vk_check(vkBeginCommandBuffer(cb, &begin), "vkBeginCommandBuffer");
-
-        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.handle);
-        vkCmdBindDescriptorSets(
-            cb,
-            VK_PIPELINE_BIND_POINT_COMPUTE,
-            pipeline_layout.handle,
-            0,
-            1,
-            &ds,
-            0,
-            nullptr
-        );
-        vkCmdPushConstants(
-            cb,
-            pipeline_layout.handle,
-            VK_SHADER_STAGE_COMPUTE_BIT,
-            0,
-            sizeof(uint32_t),
-            &n
-        );
+        VkDescriptorBufferInfo buffers[3] = {
+            arena.descriptor(a_off, bytes),
+            arena.descriptor(b_off, bytes),
+            arena.descriptor(c_off, bytes),
+        };
 
         constexpr uint32_t local_size_x = 256;
         const uint32_t groups = (n + local_size_x - 1) / local_size_x;
-        vkCmdDispatch(cb, groups, 1, 1);
-
-        VkBufferMemoryBarrier barrier = {};
-        barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-        barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-        barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
-        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        barrier.buffer = arena.buffer();
-        barrier.offset = c_off;
-        barrier.size = bytes;
-
-        vkCmdPipelineBarrier(
-            cb,
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-            VK_PIPELINE_STAGE_HOST_BIT,
-            0,
-            0, nullptr,
-            1, &barrier,
-            0, nullptr
+        pipeline.dispatch_and_wait(
+            ctx,
+            buffers,
+            3,
+            groups,
+            1,
+            1,
+            &n,
+            sizeof(uint32_t),
+            arena.buffer(),
+            c_off,
+            bytes
         );
-
-        mruntime::vulkan::vk_check(vkEndCommandBuffer(cb), "vkEndCommandBuffer");
-
-        VkFenceCreateInfo fence_ci = {};
-        fence_ci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-        UniqueDeviceHandle<VkFence, vkDestroyFence> fence;
-        fence.device = device;
-        mruntime::vulkan::vk_check(vkCreateFence(device, &fence_ci, nullptr, &fence.handle), "vkCreateFence");
-
-        VkSubmitInfo submit = {};
-        submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-        submit.commandBufferCount = 1;
-        submit.pCommandBuffers = &cb;
-        mruntime::vulkan::vk_check(vkQueueSubmit(queue, 1, &submit, fence.handle), "vkQueueSubmit");
-        mruntime::vulkan::vk_check(vkWaitForFences(device, 1, &fence.handle, VK_TRUE, UINT64_MAX), "vkWaitForFences");
 
         for (uint32_t i = 0; i < n; ++i) {
             const float expected = a_f[i] + b_f[i];

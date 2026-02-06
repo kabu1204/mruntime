@@ -147,6 +147,8 @@ set(MRUNTIME_CORE_SOURCES
 if(MRUNTIME_ENABLE_VULKAN)
     list(APPEND MRUNTIME_CORE_SOURCES
         src/vulkan/vk_buffer_arena.cpp
+        src/vulkan/vk_command.cpp
+        src/vulkan/vk_compute_pipeline.cpp
         src/vulkan/vk_context.cpp
     )
 endif()
