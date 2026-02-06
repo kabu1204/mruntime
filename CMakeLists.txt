@@ -95,42 +95,60 @@ if(MRUNTIME_ENABLE_VULKAN)
     set(MRUNTIME_VULKAN_GENERATED_DIR "${CMAKE_BINARY_DIR}/generated/vulkan")
     file(MAKE_DIRECTORY "${MRUNTIME_VULKAN_GENERATED_DIR}")
 
-    set(_MRUNTIME_VK_SHADER_SRC "${CMAKE_SOURCE_DIR}/src/vulkan/shaders/vector_add.comp")
-    set(_MRUNTIME_VK_SHADER_SPV "${MRUNTIME_VULKAN_GENERATED_DIR}/vector_add.spv")
-    set(_MRUNTIME_VK_SHADER_HDR "${MRUNTIME_VULKAN_GENERATED_DIR}/vector_add_spv.h")
+    function(mruntime_add_vulkan_shader shader_stem shader_source var_name)
+        set(shader_spv "${MRUNTIME_VULKAN_GENERATED_DIR}/${shader_stem}.spv")
+        set(shader_hdr "${MRUNTIME_VULKAN_GENERATED_DIR}/${shader_stem}_spv.h")
 
-    add_custom_command(
-        OUTPUT "${_MRUNTIME_VK_SHADER_SPV}"
-        COMMAND "${MRUNTIME_GLSLANG_VALIDATOR_EXECUTABLE}"
-            --target-env vulkan1.1
-            -V "${_MRUNTIME_VK_SHADER_SRC}"
-            -o "${_MRUNTIME_VK_SHADER_SPV}"
-        DEPENDS "${_MRUNTIME_VK_SHADER_SRC}"
-        COMMENT "Compiling GLSL -> SPIR-V: vector_add.comp"
-        VERBATIM
+        add_custom_command(
+            OUTPUT "${shader_spv}"
+            COMMAND "${MRUNTIME_GLSLANG_VALIDATOR_EXECUTABLE}"
+                --target-env vulkan1.1
+                -V "${shader_source}"
+                -o "${shader_spv}"
+            DEPENDS "${shader_source}"
+            COMMENT "Compiling GLSL -> SPIR-V: ${shader_stem}.comp"
+            VERBATIM
+        )
+
+        add_custom_command(
+            OUTPUT "${shader_hdr}"
+            COMMAND "${CMAKE_COMMAND}"
+                -DINPUT="${shader_spv}"
+                -DOUTPUT="${shader_hdr}"
+                -DVAR_NAME="${var_name}"
+                -DNAMESPACE="mruntime::vulkan::shaders"
+                -P "${CMAKE_SOURCE_DIR}/cmake/spirv_to_header.cmake"
+            DEPENDS
+                "${shader_spv}"
+                "${CMAKE_SOURCE_DIR}/cmake/spirv_to_header.cmake"
+            COMMENT "Embedding SPIR-V into header: ${shader_stem}_spv.h"
+            VERBATIM
+        )
+
+        set(MRUNTIME_VULKAN_SHADER_HEADERS
+            ${MRUNTIME_VULKAN_SHADER_HEADERS}
+            "${shader_hdr}"
+            PARENT_SCOPE
+        )
+    endfunction()
+
+    mruntime_add_vulkan_shader(
+        vector_add
+        "${CMAKE_SOURCE_DIR}/src/vulkan/shaders/vector_add.comp"
+        kVectorAddSpv
+    )
+    mruntime_add_vulkan_shader(
+        fp16_add
+        "${CMAKE_SOURCE_DIR}/src/vulkan/shaders/fp16_add.comp"
+        kFp16AddSpv
+    )
+    mruntime_add_vulkan_shader(
+        fp16_mul
+        "${CMAKE_SOURCE_DIR}/src/vulkan/shaders/fp16_mul.comp"
+        kFp16MulSpv
     )
 
-    add_custom_command(
-        OUTPUT "${_MRUNTIME_VK_SHADER_HDR}"
-        COMMAND "${CMAKE_COMMAND}"
-            -DINPUT="${_MRUNTIME_VK_SHADER_SPV}"
-            -DOUTPUT="${_MRUNTIME_VK_SHADER_HDR}"
-            -DVAR_NAME="kVectorAddSpv"
-            -DNAMESPACE="mruntime::vulkan::shaders"
-            -P "${CMAKE_SOURCE_DIR}/cmake/spirv_to_header.cmake"
-        DEPENDS
-            "${_MRUNTIME_VK_SHADER_SPV}"
-            "${CMAKE_SOURCE_DIR}/cmake/spirv_to_header.cmake"
-        COMMENT "Embedding SPIR-V into header: vector_add_spv.h"
-        VERBATIM
-    )
-
-    set(MRUNTIME_VULKAN_SHADER_HEADERS "${_MRUNTIME_VK_SHADER_HDR}")
     add_custom_target(mruntime_vulkan_shaders DEPENDS "${MRUNTIME_VULKAN_SHADER_HEADERS}")
-
-    unset(_MRUNTIME_VK_SHADER_SRC)
-    unset(_MRUNTIME_VK_SHADER_SPV)
-    unset(_MRUNTIME_VK_SHADER_HDR)
 endif()
 
 # Core library sources (bare-metal API)
@@ -149,6 +167,8 @@ if(MRUNTIME_ENABLE_VULKAN)
         src/vulkan/vk_buffer_arena.cpp
         src/vulkan/vk_command.cpp
         src/vulkan/vk_compute_pipeline.cpp
+        src/vulkan/vk_fp16_ops.cpp
+        src/vulkan/vk_kernel_runtime.cpp
         src/vulkan/vk_context.cpp
     )
 endif()
@@ -192,8 +212,10 @@ target_link_libraries(mruntime
 if(MRUNTIME_ENABLE_VULKAN)
     target_link_libraries(mruntime PRIVATE Vulkan::Vulkan)
     target_include_directories(mruntime PRIVATE
+        ${MRUNTIME_VULKAN_GENERATED_DIR}
         ${CMAKE_SOURCE_DIR}/src/vulkan
     )
+    add_dependencies(mruntime mruntime_vulkan_shaders)
 endif()
 
 if((CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64" OR CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64") AND NOT MSVC)

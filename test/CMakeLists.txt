@@ -45,6 +45,17 @@ if(MRUNTIME_ENABLE_VULKAN)
     add_dependencies(vulkan_smoke_test mruntime_vulkan_shaders)
     add_test(NAME vulkan_smoke_test COMMAND vulkan_smoke_test)
     set_tests_properties(vulkan_smoke_test PROPERTIES SKIP_RETURN_CODE 77)
+
+    add_executable(vulkan_fp16_ops_test vulkan_fp16_ops_test.cpp)
+    target_link_libraries(vulkan_fp16_ops_test PRIVATE mruntime Vulkan::Vulkan)
+    target_include_directories(vulkan_fp16_ops_test PRIVATE
+        ${MRUNTIME_VULKAN_GENERATED_DIR}
+        ${CMAKE_SOURCE_DIR}/include
+        ${CMAKE_SOURCE_DIR}/src/vulkan
+    )
+    add_dependencies(vulkan_fp16_ops_test mruntime_vulkan_shaders)
+    add_test(NAME vulkan_fp16_ops_test COMMAND vulkan_fp16_ops_test)
+    set_tests_properties(vulkan_fp16_ops_test PROPERTIES SKIP_RETURN_CODE 77)
 endif()
 
 # Some tests assume working-directory == ${CMAKE_BINARY_DIR} (out-of-source build root).
