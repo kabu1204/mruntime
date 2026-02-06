@@ -14,6 +14,23 @@
 #define FAST_EXP_FP16_P3_F16 0.166667f16      // ~ 1/6
 #define FAST_EXP_FP16_ONE_F16 1.0f16
 
+// Input clamp range for FP32 exp() to avoid overflow/underflow in exp construction.
+#define FAST_EXP_FP32_CLAMP_MAX_F32 88.3762626647949f
+#define FAST_EXP_FP32_CLAMP_MIN_F32 (-88.3762626647949f)
+
+// Range-reduction constants for exp(x) = 2^n * exp(r), with r around 0.
+#define FAST_EXP_FP32_LOG2E_F32 1.44269504088896341f
+#define FAST_EXP_FP32_LN2_HI_F32 0.693359375f
+#define FAST_EXP_FP32_LN2_LO_F32 (-2.12194440e-4f)
+
+// Cephes polynomial coefficients for exp(r) over reduced range.
+#define FAST_EXP_FP32_P0_F32 1.9875691500e-4f
+#define FAST_EXP_FP32_P1_F32 1.3981999507e-3f
+#define FAST_EXP_FP32_P2_F32 8.3334519073e-3f
+#define FAST_EXP_FP32_P3_F32 4.1665795894e-2f
+#define FAST_EXP_FP32_P4_F32 1.6666665459e-1f
+#define FAST_EXP_FP32_P5_F32 5.0000001201e-1f
+
 // Input clamp range for FP16 exp().
 #define FAST_EXP_FP16_CLAMP_MAX_F16 11.0f16
 #define FAST_EXP_FP16_CLAMP_MIN_F16 (-18.0f16)
@@ -24,6 +41,56 @@
 #define FAST_EXP_FP16_EXP_MIN 0
 #define FAST_EXP_FP16_EXP_MAX 30
 #define FAST_EXP_FP16_EXP_SHIFT 10
+
+// --------------------------------------------------------
+// Fast Exp for FP32 (float32x4_t)
+// Algorithm: range reduction + polynomial approximation.
+// --------------------------------------------------------
+static inline float32x4_t fast_exp_fp32_neon(float32x4_t x) {
+    const float32x4_t max_val = vdupq_n_f32(FAST_EXP_FP32_CLAMP_MAX_F32);
+    const float32x4_t min_val = vdupq_n_f32(FAST_EXP_FP32_CLAMP_MIN_F32);
+    x = vminq_f32(x, max_val);
+    x = vmaxq_f32(x, min_val);
+
+    const float32x4_t log2e = vdupq_n_f32(FAST_EXP_FP32_LOG2E_F32);
+    const float32x4_t half = vdupq_n_f32(0.5f);
+    float32x4_t fx = vfmaq_f32(half, x, log2e);  // x * log2(e) + 0.5
+
+    // floor(fx) without requiring dedicated floor intrinsics.
+    int32x4_t n = vcvtq_s32_f32(fx);
+    float32x4_t n_float = vcvtq_f32_s32(n);
+    const uint32x4_t gt_mask = vcgtq_f32(n_float, fx);
+    n = vsubq_s32(n, vreinterpretq_s32_u32(vandq_u32(gt_mask, vdupq_n_u32(1))));
+    n_float = vcvtq_f32_s32(n);
+
+    const float32x4_t ln2_hi = vdupq_n_f32(FAST_EXP_FP32_LN2_HI_F32);
+    const float32x4_t ln2_lo = vdupq_n_f32(FAST_EXP_FP32_LN2_LO_F32);
+    float32x4_t r = vfmsq_f32(x, n_float, ln2_hi);
+    r = vfmsq_f32(r, n_float, ln2_lo);
+
+    const float32x4_t p0 = vdupq_n_f32(FAST_EXP_FP32_P0_F32);
+    const float32x4_t p1 = vdupq_n_f32(FAST_EXP_FP32_P1_F32);
+    const float32x4_t p2 = vdupq_n_f32(FAST_EXP_FP32_P2_F32);
+    const float32x4_t p3 = vdupq_n_f32(FAST_EXP_FP32_P3_F32);
+    const float32x4_t p4 = vdupq_n_f32(FAST_EXP_FP32_P4_F32);
+    const float32x4_t p5 = vdupq_n_f32(FAST_EXP_FP32_P5_F32);
+    const float32x4_t one = vdupq_n_f32(1.0f);
+
+    const float32x4_t r2 = vmulq_f32(r, r);
+    float32x4_t poly = vfmaq_f32(p1, p0, r);
+    poly = vfmaq_f32(p2, poly, r);
+    poly = vfmaq_f32(p3, poly, r);
+    poly = vfmaq_f32(p4, poly, r);
+    poly = vfmaq_f32(p5, poly, r);
+    poly = vfmaq_f32(vaddq_f32(one, r), poly, r2);
+
+    // Build 2^n from exponent bits (FP32 exponent bias = 127, mantissa bits = 23).
+    int32x4_t exp_bits = vaddq_s32(n, vdupq_n_s32(127));
+    exp_bits = vshlq_n_s32(exp_bits, 23);
+    const float32x4_t two_pow_n = vreinterpretq_f32_s32(exp_bits);
+
+    return vmulq_f32(poly, two_pow_n);
+}
 
 // --------------------------------------------------------
 // Fast Exp for FP16 (float16x8_t)

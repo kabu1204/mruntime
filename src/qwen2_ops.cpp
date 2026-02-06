@@ -334,10 +334,6 @@ struct FlashAttentionGqaScratch {
     std::array<float, kFlashAttentionMaxHeadDim> acc;
     std::array<float, kFlashAttentionKvBlock> scores;
     std::array<float, kFlashAttentionKvBlock> weights;
-#if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
-    std::array<uint16_t, kFlashAttentionKvBlock> exp_in_bits;
-    std::array<uint16_t, kFlashAttentionKvBlock> exp_out_bits;
-#endif
 };
 
 inline float dot_fp16_bits_fp16_bits(const uint16_t* a, const uint16_t* b, size_t n) {
@@ -397,6 +393,45 @@ inline void mul_inplace_fp32(float* x, size_t n, float s) {
     for (size_t i = 0; i < n; ++i) {
         x[i] *= s;
     }
+#endif
+}
+
+inline float exp_shift_and_sum_fp32(const float* src, float* dst, size_t n, float shift) {
+#if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+    const float32x4_t vshift = vdupq_n_f32(shift);
+    float32x4_t vsum = vdupq_n_f32(0.0f);
+
+    size_t i = 0;
+    for (; i + 4 <= n; i += 4) {
+        const float32x4_t x = vsubq_f32(vld1q_f32(src + i), vshift);
+        const float32x4_t e = ::fast_exp_fp32_neon(x);
+        vst1q_f32(dst + i, e);
+        vsum = vaddq_f32(vsum, e);
+    }
+
+#if defined(__aarch64__)
+    float sum = vaddvq_f32(vsum);
+#else
+    const float32x2_t sum2 = vadd_f32(vget_low_f32(vsum), vget_high_f32(vsum));
+    const float32x2_t sum1 = vpadd_f32(sum2, sum2);
+    float sum = vget_lane_f32(sum1, 0);
+#endif
+
+    for (; i < n; ++i) {
+        const float e = std::exp(src[i] - shift);
+        dst[i] = e;
+        sum += e;
+    }
+
+    return sum;
+#else
+    float sum = 0.0f;
+    for (size_t i = 0; i < n; ++i) {
+        const float e = std::exp(src[i] - shift);
+        dst[i] = e;
+        sum += e;
+    }
+    return sum;
 #endif
 }
 
@@ -507,10 +542,6 @@ void qwen2_flash_attention_gqa_fp16(
         float* acc = scratch.acc.data();
         float* scores = scratch.scores.data();
         float* weights = scratch.weights.data();
-#if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
-        uint16_t* exp_in_bits = scratch.exp_in_bits.data();
-        uint16_t* exp_out_bits = scratch.exp_out_bits.data();
-#endif
 
         std::fill_n(acc, head_dim, 0.0f);
 
@@ -535,26 +566,7 @@ void qwen2_flash_attention_gqa_fp16(
             mul_inplace_fp32(acc, head_dim, exp_diff);
             m = new_m;
 
-#if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
-            for (size_t j = 0; j < block_len; ++j) {
-                exp_in_bits[j] = float_to_fp16_bits(scores[j] - m);
-            }
-            fast_exp_fp16_neon(
-                reinterpret_cast<const __fp16*>(exp_in_bits),
-                reinterpret_cast<__fp16*>(exp_out_bits),
-                block_len
-            );
-            fp16_bits_to_fp32(exp_out_bits, weights, block_len);
-#else
-            for (size_t j = 0; j < block_len; ++j) {
-                weights[j] = std::exp(scores[j] - m);
-            }
-#endif
-
-            float rowsum = 0.0f;
-            for (size_t j = 0; j < block_len; ++j) {
-                rowsum += weights[j];
-            }
+            const float rowsum = exp_shift_and_sum_fp32(scores, weights, block_len, m);
             l += rowsum;
 
             for (size_t j = 0; j < block_len; ++j) {
