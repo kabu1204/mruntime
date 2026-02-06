@@ -1,0 +1,44 @@
+#version 460
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+// BSHD -> BHSD transpose
+layout(set = 0, binding = 0, std430) readonly buffer InputBuffer {
+    float16_t data[];
+} input_buf;
+
+layout(set = 0, binding = 1, std430) writeonly buffer OutBuffer {
+    float16_t data[];
+} out_buf;
+
+layout(push_constant) uniform PushConstants {
+    uint B;
+    uint S;
+    uint H;
+    uint D;
+} pc;
+
+void main() {
+    // Each invocation handles one (b, h, s) triple, copying D elements.
+    const uint total_tasks = pc.B * pc.H * pc.S;
+    const uint task_id = gl_GlobalInvocationID.x;
+    if (task_id >= total_tasks) {
+        return;
+    }
+
+    const uint s = task_id % pc.S;
+    const uint h = (task_id / pc.S) % pc.H;
+    const uint b = task_id / (pc.S * pc.H);
+
+    // Input layout:  [B][S][H][D] -> offset = ((b*S + s)*H + h)*D
+    // Output layout: [B][H][S][D] -> offset = ((b*H + h)*S + s)*D
+    const uint src_base = ((b * pc.S + s) * pc.H + h) * pc.D;
+    const uint dst_base = ((b * pc.H + h) * pc.S + s) * pc.D;
+
+    for (uint d = 0u; d < pc.D; ++d) {
+        out_buf.data[dst_base + d] = input_buf.data[src_base + d];
+    }
+}

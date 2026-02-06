@@ -3,18 +3,25 @@
 #include <stdexcept>
 
 #include "fp16_add_spv.h"
+#include "fp16_kv_cache_copy_spv.h"
 #include "fp16_mul_spv.h"
+#include "fp16_rmsnorm_spv.h"
+#include "fp16_rope_spv.h"
+#include "fp16_silu_mul_interleaved_spv.h"
+#include "fp16_transpose_spv.h"
 
 namespace mruntime::vulkan {
 
 namespace {
 
-KernelCreateInfo make_kernel_create_info(const uint8_t* spirv, size_t spirv_size) {
+KernelCreateInfo make_kernel_create_info(
+    const uint8_t* spirv, size_t spirv_size,
+    uint32_t storage_buffer_count, uint32_t push_constant_size) {
     KernelCreateInfo info;
     info.spirv = spirv;
     info.spirv_size = spirv_size;
-    info.storage_buffer_count = 3;
-    info.push_constant_size = sizeof(uint32_t);
+    info.storage_buffer_count = storage_buffer_count;
+    info.push_constant_size = push_constant_size;
     return info;
 }
 
@@ -31,8 +38,38 @@ VkFp16Ops VkFp16Ops::Create(VkKernelRuntime* runtime) {
 
     VkFp16Ops ops;
     ops.runtime_ = runtime;
-    ops.add_kernel_ = runtime->get_or_create_kernel(make_kernel_create_info(shaders::kFp16AddSpv, shaders::kFp16AddSpvSize));
-    ops.mul_kernel_ = runtime->get_or_create_kernel(make_kernel_create_info(shaders::kFp16MulSpv, shaders::kFp16MulSpvSize));
+
+    // add / mul: 3 buffers, 1 uint push constant
+    ops.add_kernel_ = runtime->get_or_create_kernel(
+        make_kernel_create_info(shaders::kFp16AddSpv, shaders::kFp16AddSpvSize, 3, sizeof(uint32_t)));
+    ops.mul_kernel_ = runtime->get_or_create_kernel(
+        make_kernel_create_info(shaders::kFp16MulSpv, shaders::kFp16MulSpvSize, 3, sizeof(uint32_t)));
+
+    // silu_mul_interleaved: 2 buffers (gate_up, out), 2 uint push constants
+    ops.silu_mul_interleaved_kernel_ = runtime->get_or_create_kernel(
+        make_kernel_create_info(shaders::kFp16SiluMulInterleavedSpv, shaders::kFp16SiluMulInterleavedSpvSize,
+                                2, 2 * sizeof(uint32_t)));
+
+    // rmsnorm: 3 buffers (input, weight, out), push = {uint, uint, float}
+    ops.rmsnorm_kernel_ = runtime->get_or_create_kernel(
+        make_kernel_create_info(shaders::kFp16RmsnormSpv, shaders::kFp16RmsnormSpvSize,
+                                3, 2 * sizeof(uint32_t) + sizeof(float)));
+
+    // rope: 3 buffers (q RW, k RW, cos_sin RO), push = 6 uint
+    ops.rope_kernel_ = runtime->get_or_create_kernel(
+        make_kernel_create_info(shaders::kFp16RopeSpv, shaders::kFp16RopeSpvSize,
+                                3, 6 * sizeof(uint32_t)));
+
+    // transpose: 2 buffers (input, out), push = 4 uint
+    ops.transpose_kernel_ = runtime->get_or_create_kernel(
+        make_kernel_create_info(shaders::kFp16TransposeSpv, shaders::kFp16TransposeSpvSize,
+                                2, 4 * sizeof(uint32_t)));
+
+    // kv_cache_copy: 4 buffers (k_in, v_in, k_cache, v_cache), push = 6 uint
+    ops.kv_cache_copy_kernel_ = runtime->get_or_create_kernel(
+        make_kernel_create_info(shaders::kFp16KvCacheCopySpv, shaders::kFp16KvCacheCopySpvSize,
+                                4, 6 * sizeof(uint32_t)));
+
     return ops;
 }
 
@@ -91,6 +128,203 @@ void VkFp16Ops::mul(
         &push_constants,
         sizeof(push_constants),
         2
+    );
+}
+
+void VkFp16Ops::silu_mul_interleaved(
+    const VkDescriptorBufferInfo& gate_up,
+    const VkDescriptorBufferInfo& out,
+    uint32_t intermediate_size,
+    uint32_t num_tokens
+) const {
+    if (runtime_ == nullptr) {
+        throw std::runtime_error("VkFp16Ops::silu_mul_interleaved: runtime is null");
+    }
+    if (num_tokens == 0 || intermediate_size == 0) {
+        return;
+    }
+
+    const VkDescriptorBufferInfo buffers[2] = {gate_up, out};
+
+    struct {
+        uint32_t intermediate_size;
+        uint32_t num_tokens;
+    } push_constants = {intermediate_size, num_tokens};
+
+    runtime_->dispatch_1d(
+        silu_mul_interleaved_kernel_,
+        buffers,
+        2,
+        num_tokens * intermediate_size,
+        kLocalSizeX,
+        &push_constants,
+        sizeof(push_constants),
+        1
+    );
+}
+
+void VkFp16Ops::rmsnorm(
+    const VkDescriptorBufferInfo& input,
+    const VkDescriptorBufferInfo& weight,
+    const VkDescriptorBufferInfo& output,
+    uint32_t hidden_size,
+    uint32_t num_tokens,
+    float eps
+) const {
+    if (runtime_ == nullptr) {
+        throw std::runtime_error("VkFp16Ops::rmsnorm: runtime is null");
+    }
+    if (num_tokens == 0 || hidden_size == 0) {
+        return;
+    }
+
+    const VkDescriptorBufferInfo buffers[3] = {input, weight, output};
+
+    struct {
+        uint32_t hidden_size;
+        uint32_t num_tokens;
+        float eps;
+    } push_constants = {hidden_size, num_tokens, eps};
+
+    // Dispatch exactly num_tokens workgroups (one per token).
+    // Pass element_count = num_tokens * kLocalSizeX so dispatch_1d computes
+    // ceil(num_tokens * 256 / 256) = num_tokens workgroups.
+    runtime_->dispatch_1d(
+        rmsnorm_kernel_,
+        buffers,
+        3,
+        num_tokens * kLocalSizeX,
+        kLocalSizeX,
+        &push_constants,
+        sizeof(push_constants),
+        2
+    );
+}
+
+void VkFp16Ops::rope(
+    const VkDescriptorBufferInfo& q,
+    const VkDescriptorBufferInfo& k,
+    const VkDescriptorBufferInfo& rope_cos_sin,
+    uint32_t batch,
+    uint32_t seq_len,
+    uint32_t num_q_heads,
+    uint32_t num_kv_heads,
+    uint32_t head_dim,
+    uint32_t position_offset
+) const {
+    if (runtime_ == nullptr) {
+        throw std::runtime_error("VkFp16Ops::rope: runtime is null");
+    }
+    if (batch == 0 || seq_len == 0 || head_dim == 0) {
+        return;
+    }
+
+    const VkDescriptorBufferInfo buffers[3] = {q, k, rope_cos_sin};
+
+    struct {
+        uint32_t batch;
+        uint32_t seq_len;
+        uint32_t num_q_heads;
+        uint32_t num_kv_heads;
+        uint32_t head_dim;
+        uint32_t position_offset;
+    } push_constants = {batch, seq_len, num_q_heads, num_kv_heads, head_dim, position_offset};
+
+    const uint32_t half_dim = head_dim / 2;
+    const uint32_t total = batch * seq_len * (num_q_heads + num_kv_heads) * half_dim;
+
+    runtime_->dispatch_1d(
+        rope_kernel_,
+        buffers,
+        3,
+        total,
+        kLocalSizeX,
+        &push_constants,
+        sizeof(push_constants),
+        -1
+    );
+}
+
+void VkFp16Ops::transpose_bshd_to_bhsd(
+    const VkDescriptorBufferInfo& input,
+    const VkDescriptorBufferInfo& output,
+    uint32_t B,
+    uint32_t S,
+    uint32_t H,
+    uint32_t D
+) const {
+    if (runtime_ == nullptr) {
+        throw std::runtime_error("VkFp16Ops::transpose_bshd_to_bhsd: runtime is null");
+    }
+    if (B == 0 || S == 0 || H == 0 || D == 0) {
+        return;
+    }
+
+    const VkDescriptorBufferInfo buffers[2] = {input, output};
+
+    struct {
+        uint32_t B;
+        uint32_t S;
+        uint32_t H;
+        uint32_t D;
+    } push_constants = {B, S, H, D};
+
+    // One invocation per (b, h, s) triple.
+    const uint32_t total_tasks = B * H * S;
+
+    runtime_->dispatch_1d(
+        transpose_kernel_,
+        buffers,
+        2,
+        total_tasks,
+        kLocalSizeX,
+        &push_constants,
+        sizeof(push_constants),
+        1
+    );
+}
+
+void VkFp16Ops::kv_cache_copy(
+    const VkDescriptorBufferInfo& k_in,
+    const VkDescriptorBufferInfo& v_in,
+    const VkDescriptorBufferInfo& k_cache,
+    const VkDescriptorBufferInfo& v_cache,
+    uint32_t batch,
+    uint32_t seq_len,
+    uint32_t num_kv_heads,
+    uint32_t head_dim,
+    uint32_t max_seq_len,
+    uint32_t position_offset
+) const {
+    if (runtime_ == nullptr) {
+        throw std::runtime_error("VkFp16Ops::kv_cache_copy: runtime is null");
+    }
+    if (batch == 0 || seq_len == 0 || num_kv_heads == 0 || head_dim == 0) {
+        return;
+    }
+
+    const VkDescriptorBufferInfo buffers[4] = {k_in, v_in, k_cache, v_cache};
+
+    struct {
+        uint32_t batch;
+        uint32_t seq_len;
+        uint32_t num_kv_heads;
+        uint32_t head_dim;
+        uint32_t max_seq_len;
+        uint32_t position_offset;
+    } push_constants = {batch, seq_len, num_kv_heads, head_dim, max_seq_len, position_offset};
+
+    const uint32_t total = batch * seq_len * num_kv_heads;
+
+    runtime_->dispatch_1d(
+        kv_cache_copy_kernel_,
+        buffers,
+        4,
+        total,
+        kLocalSizeX,
+        &push_constants,
+        sizeof(push_constants),
+        -1
     );
 }
 

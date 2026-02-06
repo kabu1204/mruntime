@@ -1,0 +1,434 @@
+#include <vulkan/vulkan.h>
+
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <cstring>
+#include <iostream>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+#include "mruntime/dtype.h"
+#include "vk_buffer_arena.h"
+#include "vk_context.h"
+#include "vk_fp16_ops.h"
+#include "vk_helpers.h"
+#include "vk_kernel_runtime.h"
+
+namespace {
+
+struct TestContext {
+    mruntime::vulkan::VkContext context;
+    mruntime::vulkan::VkKernelRuntime runtime;
+    mruntime::vulkan::VkFp16Ops fp16_ops;
+    VkDeviceSize alignment;
+
+    static TestContext Create() {
+        TestContext tc;
+        tc.context = mruntime::vulkan::VkContext::Create();
+        tc.alignment = std::max<VkDeviceSize>(64, tc.context.min_storage_buffer_offset_alignment());
+        tc.runtime = mruntime::vulkan::VkKernelRuntime::Create(tc.context);
+        tc.fp16_ops = mruntime::vulkan::VkFp16Ops::Create(&tc.runtime);
+        return tc;
+    }
+};
+
+mruntime::vulkan::VkBufferArena make_arena(
+    const TestContext& tc, VkDeviceSize capacity) {
+    mruntime::vulkan::VkBufferArenaCreateInfo info;
+    info.capacity_bytes = capacity;
+    info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    info.memory_properties =
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    info.default_alignment = tc.alignment;
+    return mruntime::vulkan::VkBufferArena::Create(
+        tc.context.physical_device(), tc.context.device(), info);
+}
+
+void check_close(const char* test_name, const uint16_t* got_fp16, const float* expected,
+                  uint32_t n, float tolerance) {
+    for (uint32_t i = 0; i < n; ++i) {
+        float got = mruntime::fp16_bits_to_float(got_fp16[i]);
+        float diff = std::fabs(got - expected[i]);
+        if (!std::isfinite(got) || diff > tolerance) {
+            throw std::runtime_error(
+                std::string(test_name) + " mismatch at i=" + std::to_string(i) +
+                ": got=" + std::to_string(got) +
+                ", expected=" + std::to_string(expected[i]) +
+                ", diff=" + std::to_string(diff));
+        }
+    }
+}
+
+void check_exact_fp16(const char* test_name, const uint16_t* got, const uint16_t* expected,
+                      uint32_t n) {
+    for (uint32_t i = 0; i < n; ++i) {
+        if (got[i] != expected[i]) {
+            throw std::runtime_error(
+                std::string(test_name) + " mismatch at i=" + std::to_string(i) +
+                ": got=0x" + std::to_string(got[i]) +
+                ", expected=0x" + std::to_string(expected[i]));
+        }
+    }
+}
+
+// ---- silu_mul_interleaved ----
+
+void test_silu_mul_interleaved(TestContext& tc) {
+    const uint32_t num_tokens = 4;
+    const uint32_t intermediate_size = 512;
+    const uint32_t gate_up_row = 2 * intermediate_size;
+    const uint32_t gate_up_count = num_tokens * gate_up_row;
+    const uint32_t out_count = num_tokens * intermediate_size;
+
+    const VkDeviceSize gate_up_bytes = gate_up_count * sizeof(uint16_t);
+    const VkDeviceSize out_bytes = out_count * sizeof(uint16_t);
+
+    auto arena = make_arena(tc, gate_up_bytes + out_bytes + 2 * tc.alignment);
+
+    const VkDeviceSize gate_up_offset = arena.alloc(gate_up_bytes);
+    const VkDeviceSize out_offset = arena.alloc(out_bytes);
+
+    uint16_t* gate_up_data = arena.host_ptr<uint16_t>(gate_up_offset);
+    uint16_t* out_data = arena.host_ptr<uint16_t>(out_offset);
+
+    // Fill gate_up with deterministic values.
+    for (uint32_t i = 0; i < gate_up_count; ++i) {
+        float val = -2.0f + 0.004f * static_cast<float>(i % 1024);
+        gate_up_data[i] = mruntime::float_to_fp16_bits(val);
+    }
+
+    // CPU reference.
+    std::vector<float> expected(out_count);
+    for (uint32_t t = 0; t < num_tokens; ++t) {
+        for (uint32_t j = 0; j < intermediate_size; ++j) {
+            float gate = mruntime::fp16_bits_to_float(
+                gate_up_data[t * gate_up_row + j]);
+            float up = mruntime::fp16_bits_to_float(
+                gate_up_data[t * gate_up_row + intermediate_size + j]);
+            float silu = gate / (1.0f + std::exp(-gate));
+            expected[t * intermediate_size + j] = silu * up;
+        }
+    }
+
+    std::memset(out_data, 0, out_bytes);
+    tc.fp16_ops.silu_mul_interleaved(
+        arena.descriptor(gate_up_offset, gate_up_bytes),
+        arena.descriptor(out_offset, out_bytes),
+        intermediate_size, num_tokens);
+
+    check_close("silu_mul_interleaved", out_data, expected.data(), out_count, 1e-2f);
+    std::cout << "  silu_mul_interleaved PASSED\n";
+}
+
+// ---- rmsnorm ----
+
+void test_rmsnorm(TestContext& tc) {
+    const std::vector<uint32_t> hidden_sizes = {256, 896};
+
+    for (uint32_t hidden_size : hidden_sizes) {
+        const uint32_t num_tokens = 4;
+        const float eps = 1e-6f;
+        const uint32_t input_count = num_tokens * hidden_size;
+
+        const VkDeviceSize input_bytes = input_count * sizeof(uint16_t);
+        const VkDeviceSize weight_bytes = hidden_size * sizeof(uint16_t);
+        const VkDeviceSize out_bytes = input_count * sizeof(uint16_t);
+
+        auto arena = make_arena(tc, input_bytes + weight_bytes + out_bytes + 3 * tc.alignment);
+
+        const VkDeviceSize input_offset = arena.alloc(input_bytes);
+        const VkDeviceSize weight_offset = arena.alloc(weight_bytes);
+        const VkDeviceSize out_offset = arena.alloc(out_bytes);
+
+        uint16_t* input_data = arena.host_ptr<uint16_t>(input_offset);
+        uint16_t* weight_data = arena.host_ptr<uint16_t>(weight_offset);
+        uint16_t* out_data = arena.host_ptr<uint16_t>(out_offset);
+
+        for (uint32_t i = 0; i < input_count; ++i) {
+            float val = -1.0f + 0.002f * static_cast<float>(i % 1000);
+            input_data[i] = mruntime::float_to_fp16_bits(val);
+        }
+        for (uint32_t i = 0; i < hidden_size; ++i) {
+            float val = 0.5f + 0.001f * static_cast<float>(i);
+            weight_data[i] = mruntime::float_to_fp16_bits(val);
+        }
+
+        // CPU reference.
+        std::vector<float> expected(input_count);
+        for (uint32_t t = 0; t < num_tokens; ++t) {
+            float sum_sq = 0.0f;
+            for (uint32_t i = 0; i < hidden_size; ++i) {
+                float v = mruntime::fp16_bits_to_float(input_data[t * hidden_size + i]);
+                sum_sq += v * v;
+            }
+            float rms_inv = 1.0f / std::sqrt(sum_sq / static_cast<float>(hidden_size) + eps);
+            for (uint32_t i = 0; i < hidden_size; ++i) {
+                float v = mruntime::fp16_bits_to_float(input_data[t * hidden_size + i]);
+                float w = mruntime::fp16_bits_to_float(weight_data[i]);
+                expected[t * hidden_size + i] = v * rms_inv * w;
+            }
+        }
+
+        std::memset(out_data, 0, out_bytes);
+        tc.fp16_ops.rmsnorm(
+            arena.descriptor(input_offset, input_bytes),
+            arena.descriptor(weight_offset, weight_bytes),
+            arena.descriptor(out_offset, out_bytes),
+            hidden_size, num_tokens, eps);
+
+        check_close(("rmsnorm(hidden=" + std::to_string(hidden_size) + ")").c_str(),
+                     out_data, expected.data(), input_count, 5e-3f);
+        std::cout << "  rmsnorm(hidden=" << hidden_size << ") PASSED\n";
+    }
+}
+
+// ---- rope ----
+
+void test_rope(TestContext& tc) {
+    const uint32_t batch = 1;
+    const uint32_t seq_len = 4;
+    const uint32_t num_q_heads = 4;
+    const uint32_t num_kv_heads = 2;
+    const uint32_t head_dim = 64;
+    const uint32_t position_offset = 0;
+    const uint32_t half_dim = head_dim / 2;
+
+    const uint32_t q_count = batch * seq_len * num_q_heads * head_dim;
+    const uint32_t k_count = batch * seq_len * num_kv_heads * head_dim;
+    // cos_sin table: (position_offset + seq_len) positions, each head_dim floats
+    const uint32_t max_pos = position_offset + seq_len;
+    const uint32_t cos_sin_count = max_pos * head_dim;
+
+    const VkDeviceSize q_bytes = q_count * sizeof(uint16_t);
+    const VkDeviceSize k_bytes = k_count * sizeof(uint16_t);
+    const VkDeviceSize cos_sin_bytes = cos_sin_count * sizeof(float);
+
+    auto arena = make_arena(tc, q_bytes + k_bytes + cos_sin_bytes + 3 * tc.alignment);
+
+    const VkDeviceSize q_offset = arena.alloc(q_bytes);
+    const VkDeviceSize k_offset = arena.alloc(k_bytes);
+    const VkDeviceSize cos_sin_offset = arena.alloc(cos_sin_bytes);
+
+    uint16_t* q_data = arena.host_ptr<uint16_t>(q_offset);
+    uint16_t* k_data = arena.host_ptr<uint16_t>(k_offset);
+    float* cos_sin_data = arena.host_ptr<float>(cos_sin_offset);
+
+    // Fill Q, K with deterministic values.
+    for (uint32_t i = 0; i < q_count; ++i) {
+        float val = -1.0f + 0.002f * static_cast<float>(i % 1000);
+        q_data[i] = mruntime::float_to_fp16_bits(val);
+    }
+    for (uint32_t i = 0; i < k_count; ++i) {
+        float val = 0.5f - 0.001f * static_cast<float>(i % 1000);
+        k_data[i] = mruntime::float_to_fp16_bits(val);
+    }
+
+    // Fill cos/sin table with interleaved (cos, sin) pairs per position:
+    // cos_sin[pos * head_dim + i*2] = cos, cos_sin[pos * head_dim + i*2 + 1] = sin
+    for (uint32_t pos = 0; pos < max_pos; ++pos) {
+        for (uint32_t i = 0; i < half_dim; ++i) {
+            float freq = 1.0f / std::pow(10000.0f, 2.0f * static_cast<float>(i) / static_cast<float>(head_dim));
+            float angle = static_cast<float>(pos) * freq;
+            cos_sin_data[pos * head_dim + i * 2] = std::cos(angle);
+            cos_sin_data[pos * head_dim + i * 2 + 1] = std::sin(angle);
+        }
+    }
+
+    // Save copies for CPU reference.
+    std::vector<uint16_t> q_copy(q_data, q_data + q_count);
+    std::vector<uint16_t> k_copy(k_data, k_data + k_count);
+
+    // CPU reference.
+    std::vector<float> q_expected(q_count);
+    std::vector<float> k_expected(k_count);
+
+    for (uint32_t b = 0; b < batch; ++b) {
+        for (uint32_t s = 0; s < seq_len; ++s) {
+            uint32_t pos = position_offset + s;
+            // Q heads
+            for (uint32_t h = 0; h < num_q_heads; ++h) {
+                uint32_t base = ((b * seq_len + s) * num_q_heads + h) * head_dim;
+                for (uint32_t i = 0; i < half_dim; ++i) {
+                    float x0 = mruntime::fp16_bits_to_float(q_copy[base + i]);
+                    float x1 = mruntime::fp16_bits_to_float(q_copy[base + half_dim + i]);
+                    float cos_val = cos_sin_data[pos * head_dim + i * 2];
+                    float sin_val = cos_sin_data[pos * head_dim + i * 2 + 1];
+                    q_expected[base + i] = x0 * cos_val - x1 * sin_val;
+                    q_expected[base + half_dim + i] = x1 * cos_val + x0 * sin_val;
+                }
+            }
+            // K heads
+            for (uint32_t h = 0; h < num_kv_heads; ++h) {
+                uint32_t base = ((b * seq_len + s) * num_kv_heads + h) * head_dim;
+                for (uint32_t i = 0; i < half_dim; ++i) {
+                    float x0 = mruntime::fp16_bits_to_float(k_copy[base + i]);
+                    float x1 = mruntime::fp16_bits_to_float(k_copy[base + half_dim + i]);
+                    float cos_val = cos_sin_data[pos * head_dim + i * 2];
+                    float sin_val = cos_sin_data[pos * head_dim + i * 2 + 1];
+                    k_expected[base + i] = x0 * cos_val - x1 * sin_val;
+                    k_expected[base + half_dim + i] = x1 * cos_val + x0 * sin_val;
+                }
+            }
+        }
+    }
+
+    tc.fp16_ops.rope(
+        arena.descriptor(q_offset, q_bytes),
+        arena.descriptor(k_offset, k_bytes),
+        arena.descriptor(cos_sin_offset, cos_sin_bytes),
+        batch, seq_len, num_q_heads, num_kv_heads, head_dim, position_offset);
+
+    check_close("rope(Q)", q_data, q_expected.data(), q_count, 5e-3f);
+    check_close("rope(K)", k_data, k_expected.data(), k_count, 5e-3f);
+    std::cout << "  rope PASSED\n";
+}
+
+// ---- transpose BSHD -> BHSD ----
+
+void test_transpose(TestContext& tc) {
+    const uint32_t B = 2, S = 4, H = 4, D = 64;
+    const uint32_t total = B * S * H * D;
+
+    const VkDeviceSize input_bytes = total * sizeof(uint16_t);
+    const VkDeviceSize out_bytes = total * sizeof(uint16_t);
+
+    auto arena = make_arena(tc, input_bytes + out_bytes + 2 * tc.alignment);
+
+    const VkDeviceSize input_offset = arena.alloc(input_bytes);
+    const VkDeviceSize out_offset = arena.alloc(out_bytes);
+
+    uint16_t* input_data = arena.host_ptr<uint16_t>(input_offset);
+    uint16_t* out_data = arena.host_ptr<uint16_t>(out_offset);
+
+    // Fill with unique values so we can verify the permutation exactly.
+    for (uint32_t i = 0; i < total; ++i) {
+        // Use distinct fp16 values; just use the index bits directly (they'll be valid fp16).
+        input_data[i] = mruntime::float_to_fp16_bits(static_cast<float>(i));
+    }
+
+    // CPU reference: BSHD -> BHSD
+    std::vector<uint16_t> expected(total);
+    for (uint32_t b = 0; b < B; ++b) {
+        for (uint32_t s = 0; s < S; ++s) {
+            for (uint32_t h = 0; h < H; ++h) {
+                for (uint32_t d = 0; d < D; ++d) {
+                    uint32_t src_idx = ((b * S + s) * H + h) * D + d;
+                    uint32_t dst_idx = ((b * H + h) * S + s) * D + d;
+                    expected[dst_idx] = input_data[src_idx];
+                }
+            }
+        }
+    }
+
+    std::memset(out_data, 0, out_bytes);
+    tc.fp16_ops.transpose_bshd_to_bhsd(
+        arena.descriptor(input_offset, input_bytes),
+        arena.descriptor(out_offset, out_bytes),
+        B, S, H, D);
+
+    check_exact_fp16("transpose", out_data, expected.data(), total);
+    std::cout << "  transpose PASSED\n";
+}
+
+// ---- kv_cache_copy ----
+
+void test_kv_cache_copy(TestContext& tc) {
+    const uint32_t batch = 2;
+    const uint32_t seq_len = 4;
+    const uint32_t num_kv_heads = 2;
+    const uint32_t head_dim = 64;
+    const uint32_t max_seq_len = 32;
+    const uint32_t position_offset = 3;
+
+    const uint32_t kv_count = batch * seq_len * num_kv_heads * head_dim;
+    const uint32_t cache_count = batch * num_kv_heads * max_seq_len * head_dim;
+
+    const VkDeviceSize kv_bytes = kv_count * sizeof(uint16_t);
+    const VkDeviceSize cache_bytes = cache_count * sizeof(uint16_t);
+
+    auto arena = make_arena(tc, 2 * kv_bytes + 2 * cache_bytes + 4 * tc.alignment);
+
+    const VkDeviceSize k_in_offset = arena.alloc(kv_bytes);
+    const VkDeviceSize v_in_offset = arena.alloc(kv_bytes);
+    const VkDeviceSize k_cache_offset = arena.alloc(cache_bytes);
+    const VkDeviceSize v_cache_offset = arena.alloc(cache_bytes);
+
+    uint16_t* k_in_data = arena.host_ptr<uint16_t>(k_in_offset);
+    uint16_t* v_in_data = arena.host_ptr<uint16_t>(v_in_offset);
+    uint16_t* k_cache_data = arena.host_ptr<uint16_t>(k_cache_offset);
+    uint16_t* v_cache_data = arena.host_ptr<uint16_t>(v_cache_offset);
+
+    for (uint32_t i = 0; i < kv_count; ++i) {
+        k_in_data[i] = mruntime::float_to_fp16_bits(1.0f + 0.01f * static_cast<float>(i));
+        v_in_data[i] = mruntime::float_to_fp16_bits(-1.0f + 0.01f * static_cast<float>(i));
+    }
+
+    // Initialize cache to zero.
+    std::memset(k_cache_data, 0, cache_bytes);
+    std::memset(v_cache_data, 0, cache_bytes);
+
+    // CPU reference.
+    std::vector<uint16_t> k_cache_expected(cache_count, 0);
+    std::vector<uint16_t> v_cache_expected(cache_count, 0);
+
+    for (uint32_t b = 0; b < batch; ++b) {
+        for (uint32_t s = 0; s < seq_len; ++s) {
+            for (uint32_t h = 0; h < num_kv_heads; ++h) {
+                uint32_t src_base = ((b * seq_len + s) * num_kv_heads + h) * head_dim;
+                uint32_t cache_pos = position_offset + s;
+                uint32_t dst_base = ((b * num_kv_heads + h) * max_seq_len + cache_pos) * head_dim;
+                for (uint32_t d = 0; d < head_dim; ++d) {
+                    k_cache_expected[dst_base + d] = k_in_data[src_base + d];
+                    v_cache_expected[dst_base + d] = v_in_data[src_base + d];
+                }
+            }
+        }
+    }
+
+    tc.fp16_ops.kv_cache_copy(
+        arena.descriptor(k_in_offset, kv_bytes),
+        arena.descriptor(v_in_offset, kv_bytes),
+        arena.descriptor(k_cache_offset, cache_bytes),
+        arena.descriptor(v_cache_offset, cache_bytes),
+        batch, seq_len, num_kv_heads, head_dim, max_seq_len, position_offset);
+
+    check_exact_fp16("kv_cache_copy(K)", k_cache_data, k_cache_expected.data(), cache_count);
+    check_exact_fp16("kv_cache_copy(V)", v_cache_data, v_cache_expected.data(), cache_count);
+    std::cout << "  kv_cache_copy PASSED\n";
+}
+
+void run_all_tests() {
+    TestContext tc = TestContext::Create();
+
+    VkPhysicalDeviceProperties properties = {};
+    vkGetPhysicalDeviceProperties(tc.context.physical_device(), &properties);
+    std::cout << "Using Vulkan device: " << properties.deviceName << "\n";
+
+    test_silu_mul_interleaved(tc);
+    test_rmsnorm(tc);
+    test_rope(tc);
+    test_transpose(tc);
+    test_kv_cache_copy(tc);
+}
+
+}  // namespace
+
+int main() {
+    try {
+        run_all_tests();
+        std::cout << "vulkan_fp16_kernels_test PASSED\n";
+        return 0;
+    } catch (const mruntime::vulkan::VulkanError& error) {
+        if (error.result() == VK_ERROR_INCOMPATIBLE_DRIVER) {
+            std::cout << "vulkan_fp16_kernels_test SKIPPED: Vulkan not supported on this machine\n";
+            return 77;
+        }
+        std::cerr << "vulkan_fp16_kernels_test FAILED: " << error.what() << "\n";
+        return 1;
+    } catch (const std::exception& error) {
+        std::cerr << "vulkan_fp16_kernels_test FAILED: " << error.what() << "\n";
+        return 1;
+    }
+}

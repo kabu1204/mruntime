@@ -83,7 +83,7 @@ VkContext VkContext::Create(const VkContextCreateInfo& info) {
     app.applicationVersion = 1;
     app.pEngineName = "mruntime";
     app.engineVersion = 1;
-    app.apiVersion = VK_API_VERSION_1_1;
+    app.apiVersion = VK_API_VERSION_1_3;
 
     VkInstanceCreateInfo instance_ci = {};
     instance_ci.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
@@ -105,6 +105,14 @@ VkContext VkContext::Create(const VkContextCreateInfo& info) {
 
     bool selected_has_portability_subset = false;
     for (VkPhysicalDevice dev : devices) {
+        VkPhysicalDeviceProperties dev_props = {};
+        vkGetPhysicalDeviceProperties(dev, &dev_props);
+        if (VK_API_VERSION_MAJOR(dev_props.apiVersion) < 1 ||
+            (VK_API_VERSION_MAJOR(dev_props.apiVersion) == 1 &&
+             VK_API_VERSION_MINOR(dev_props.apiVersion) < 3)) {
+            continue;
+        }
+
         bool has_portability_subset = false;
         if (!device_supports_required_extensions(dev, &has_portability_subset)) {
             continue;
@@ -123,7 +131,7 @@ VkContext VkContext::Create(const VkContextCreateInfo& info) {
     }
 
     if (ctx.physical_device_ == VK_NULL_HANDLE) {
-        throw std::runtime_error("No Vulkan physical device satisfies required extensions/features");
+        throw std::runtime_error("No Vulkan 1.3+ physical device satisfies required extensions/features");
     }
 
     const uint32_t queue_family_index = find_compute_queue_family(ctx.physical_device_);
@@ -233,4 +241,3 @@ void VkContext::reset() noexcept {
 }
 
 }  // namespace mruntime::vulkan
-

@@ -102,7 +102,7 @@ if(MRUNTIME_ENABLE_VULKAN)
         add_custom_command(
             OUTPUT "${shader_spv}"
             COMMAND "${MRUNTIME_GLSLANG_VALIDATOR_EXECUTABLE}"
-                --target-env vulkan1.1
+                --target-env vulkan1.3
                 -V "${shader_source}"
                 -o "${shader_spv}"
             DEPENDS "${shader_source}"
@@ -146,6 +146,31 @@ if(MRUNTIME_ENABLE_VULKAN)
         fp16_mul
         "${CMAKE_SOURCE_DIR}/src/vulkan/shaders/fp16_mul.comp"
         kFp16MulSpv
+    )
+    mruntime_add_vulkan_shader(
+        fp16_silu_mul_interleaved
+        "${CMAKE_SOURCE_DIR}/src/vulkan/shaders/fp16_silu_mul_interleaved.comp"
+        kFp16SiluMulInterleavedSpv
+    )
+    mruntime_add_vulkan_shader(
+        fp16_rmsnorm
+        "${CMAKE_SOURCE_DIR}/src/vulkan/shaders/fp16_rmsnorm.comp"
+        kFp16RmsnormSpv
+    )
+    mruntime_add_vulkan_shader(
+        fp16_rope
+        "${CMAKE_SOURCE_DIR}/src/vulkan/shaders/fp16_rope.comp"
+        kFp16RopeSpv
+    )
+    mruntime_add_vulkan_shader(
+        fp16_transpose
+        "${CMAKE_SOURCE_DIR}/src/vulkan/shaders/fp16_transpose.comp"
+        kFp16TransposeSpv
+    )
+    mruntime_add_vulkan_shader(
+        fp16_kv_cache_copy
+        "${CMAKE_SOURCE_DIR}/src/vulkan/shaders/fp16_kv_cache_copy.comp"
+        kFp16KvCacheCopySpv
     )
 
     add_custom_target(mruntime_vulkan_shaders DEPENDS "${MRUNTIME_VULKAN_SHADER_HEADERS}")
