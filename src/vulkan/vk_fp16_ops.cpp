@@ -357,8 +357,8 @@ void VkFp16Ops::gemm(
         uint32_t K;
     } push_constants = {M, N, K};
 
-    static constexpr uint32_t kTileM = 8;
-    static constexpr uint32_t kTileN = 8;
+    static constexpr uint32_t kTileM = 64;
+    static constexpr uint32_t kTileN = 64;
 
     runtime_->dispatch_2d(
         gemm_kernel_,

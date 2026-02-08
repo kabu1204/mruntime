@@ -16,6 +16,7 @@ Makefile
 # Local agent instructions (kept out of git)
 # NOTE: `git clean -fd` keeps ignored files; `git clean -fdx` removes them.
 /AGENTS.md
+/CLAUDE.md
 # Local model assets
 /models/
 

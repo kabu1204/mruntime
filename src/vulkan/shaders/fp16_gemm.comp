@@ -3,17 +3,22 @@
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 
-// Tiled GEMM: C = A @ B^T
+// Register-blocked tiled GEMM: C = A @ B^T
 // A: [M, K] row-major FP16
 // B: [N, K] row-major FP16  (transposed access: B[n, :])
 // C: [M, N] row-major FP16
 // FP32 accumulation, FP16 output.
+//
+// Each workgroup computes a 64x64 output tile.
+// Each thread computes a 4x4 sub-tile (16 FMAs per K iteration).
+// Shared memory stores tiles in FP16 to halve bandwidth.
 
-#define TILE_M 8
-#define TILE_N 8
-#define TILE_K 32
+#define TILE_M 64
+#define TILE_N 64
+#define TILE_K 16
+#define THREAD_TILE 4
 
-layout(local_size_x = TILE_N, local_size_y = TILE_M, local_size_z = 1) in;
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
 layout(set = 0, binding = 0, std430) readonly buffer ABuffer {
     float16_t a[];
@@ -33,63 +38,99 @@ layout(push_constant) uniform PushConstants {
     uint K;
 } pc;
 
-shared float tile_a[TILE_M][TILE_K];
-shared float tile_b[TILE_N][TILE_K];
+shared float16_t tile_a[TILE_M][TILE_K];
+shared float16_t tile_b[TILE_N][TILE_K];
 
 void main() {
-    const uint local_n = gl_LocalInvocationID.x;  // column within tile
-    const uint local_m = gl_LocalInvocationID.y;  // row within tile
-    const uint global_m = gl_WorkGroupID.y * TILE_M + local_m;
-    const uint global_n = gl_WorkGroupID.x * TILE_N + local_n;
-    const uint tid = local_m * TILE_N + local_n;  // flat thread id [0..63]
+    const uint tx = gl_LocalInvocationID.x;  // 0..15
+    const uint ty = gl_LocalInvocationID.y;  // 0..15
+    const uint tid = ty * 16 + tx;           // flat thread id [0..255]
 
-    float acc = 0.0;
+    // Base row/col of this thread's 4x4 sub-tile in the 64x64 output tile.
+    const uint sub_m = ty * THREAD_TILE;
+    const uint sub_n = tx * THREAD_TILE;
 
-    // Number of tiles along K dimension.
+    // Global base coordinates for this workgroup's tile.
+    const uint tile_row = gl_WorkGroupID.y * TILE_M;
+    const uint tile_col = gl_WorkGroupID.x * TILE_N;
+
+    // 16 FP32 accumulators (4x4 sub-tile).
+    float acc[THREAD_TILE][THREAD_TILE];
+    for (uint i = 0; i < THREAD_TILE; ++i)
+        for (uint j = 0; j < THREAD_TILE; ++j)
+            acc[i][j] = 0.0;
+
     const uint num_k_tiles = (pc.K + TILE_K - 1) / TILE_K;
 
     for (uint kt = 0; kt < num_k_tiles; ++kt) {
         const uint k_base = kt * TILE_K;
 
-        // Cooperative load: 64 threads load TILE_M * TILE_K = 256 elements (4 each).
-        for (uint i = tid; i < TILE_M * TILE_K; i += TILE_M * TILE_N) {
-            uint row = i / TILE_K;
-            uint col = i % TILE_K;
-            uint gm = gl_WorkGroupID.y * TILE_M + row;
+        // --- Cooperative load A tile: 64x16 = 1024 elements, 256 threads, 4 each ---
+        for (uint i = 0; i < 4; ++i) {
+            uint idx = tid * 4 + i;
+            uint row = idx >> 4;   // idx / 16
+            uint col = idx & 15;   // idx % 16
+            uint gm = tile_row + row;
             uint gk = k_base + col;
-            if (gm < pc.M && gk < pc.K) {
-                tile_a[row][col] = float(a_buf.a[gm * pc.K + gk]);
-            } else {
-                tile_a[row][col] = 0.0;
-            }
+            tile_a[row][col] = (gm < pc.M && gk < pc.K)
+                ? a_buf.a[gm * pc.K + gk]
+                : float16_t(0.0);
         }
 
-        // Cooperative load B tile: TILE_N * TILE_K = 256 elements.
-        for (uint i = tid; i < TILE_N * TILE_K; i += TILE_M * TILE_N) {
-            uint row = i / TILE_K;
-            uint col = i % TILE_K;
-            uint gn = gl_WorkGroupID.x * TILE_N + row;
+        // --- Cooperative load B tile: 64x16 = 1024 elements, 256 threads, 4 each ---
+        for (uint i = 0; i < 4; ++i) {
+            uint idx = tid * 4 + i;
+            uint row = idx >> 4;   // idx / 16
+            uint col = idx & 15;   // idx % 16
+            uint gn = tile_col + row;
             uint gk = k_base + col;
-            if (gn < pc.N && gk < pc.K) {
-                tile_b[row][col] = float(b_buf.b[gn * pc.K + gk]);
-            } else {
-                tile_b[row][col] = 0.0;
-            }
+            tile_b[row][col] = (gn < pc.N && gk < pc.K)
+                ? b_buf.b[gn * pc.K + gk]
+                : float16_t(0.0);
         }
 
         barrier();
 
-        // Accumulate dot product for this tile.
-        uint k_end = min(TILE_K, pc.K - k_base);
-        for (uint k = 0; k < k_end; ++k) {
-            acc += tile_a[local_m][k] * tile_b[local_n][k];
+        // --- Accumulate: 4x4 register block, TILE_K iterations (constant, unrollable) ---
+        for (uint k = 0; k < TILE_K; ++k) {
+            float a0 = float(tile_a[sub_m + 0][k]);
+            float a1 = float(tile_a[sub_m + 1][k]);
+            float a2 = float(tile_a[sub_m + 2][k]);
+            float a3 = float(tile_a[sub_m + 3][k]);
+            float b0 = float(tile_b[sub_n + 0][k]);
+            float b1 = float(tile_b[sub_n + 1][k]);
+            float b2 = float(tile_b[sub_n + 2][k]);
+            float b3 = float(tile_b[sub_n + 3][k]);
+
+            acc[0][0] += a0 * b0;
+            acc[0][1] += a0 * b1;
+            acc[0][2] += a0 * b2;
+            acc[0][3] += a0 * b3;
+            acc[1][0] += a1 * b0;
+            acc[1][1] += a1 * b1;
+            acc[1][2] += a1 * b2;
+            acc[1][3] += a1 * b3;
+            acc[2][0] += a2 * b0;
+            acc[2][1] += a2 * b1;
+            acc[2][2] += a2 * b2;
+            acc[2][3] += a2 * b3;
+            acc[3][0] += a3 * b0;
+            acc[3][1] += a3 * b1;
+            acc[3][2] += a3 * b2;
+            acc[3][3] += a3 * b3;
         }
 
         barrier();
     }
 
-    // Write output.
-    if (global_m < pc.M && global_n < pc.N) {
-        c_buf.c[global_m * pc.N + global_n] = float16_t(acc);
+    // --- Write 4x4 output sub-tile ---
+    for (uint i = 0; i < THREAD_TILE; ++i) {
+        for (uint j = 0; j < THREAD_TILE; ++j) {
+            uint gm = tile_row + sub_m + i;
+            uint gn = tile_col + sub_n + j;
+            if (gm < pc.M && gn < pc.N) {
+                c_buf.c[gm * pc.N + gn] = float16_t(acc[i][j]);
+            }
+        }
     }
 }
