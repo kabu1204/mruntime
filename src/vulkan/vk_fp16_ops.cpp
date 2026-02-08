@@ -3,6 +3,7 @@
 #include <stdexcept>
 
 #include "fp16_add_spv.h"
+#include "fp16_gemm_spv.h"
 #include "fp16_kv_cache_copy_spv.h"
 #include "fp16_mul_spv.h"
 #include "fp16_rmsnorm_spv.h"
@@ -69,6 +70,11 @@ VkFp16Ops VkFp16Ops::Create(VkKernelRuntime* runtime) {
     ops.kv_cache_copy_kernel_ = runtime->get_or_create_kernel(
         make_kernel_create_info(shaders::kFp16KvCacheCopySpv, shaders::kFp16KvCacheCopySpvSize,
                                 4, 6 * sizeof(uint32_t)));
+
+    // gemm: 3 buffers (A, B, C), push = {uint M, uint N, uint K}
+    ops.gemm_kernel_ = runtime->get_or_create_kernel(
+        make_kernel_create_info(shaders::kFp16GemmSpv, shaders::kFp16GemmSpvSize,
+                                3, 3 * sizeof(uint32_t)));
 
     return ops;
 }
@@ -325,6 +331,46 @@ void VkFp16Ops::kv_cache_copy(
         &push_constants,
         sizeof(push_constants),
         -1
+    );
+}
+
+void VkFp16Ops::gemm(
+    const VkDescriptorBufferInfo& a,
+    const VkDescriptorBufferInfo& b,
+    const VkDescriptorBufferInfo& c,
+    uint32_t M,
+    uint32_t N,
+    uint32_t K
+) const {
+    if (runtime_ == nullptr) {
+        throw std::runtime_error("VkFp16Ops::gemm: runtime is null");
+    }
+    if (M == 0 || N == 0 || K == 0) {
+        return;
+    }
+
+    const VkDescriptorBufferInfo buffers[3] = {a, b, c};
+
+    struct {
+        uint32_t M;
+        uint32_t N;
+        uint32_t K;
+    } push_constants = {M, N, K};
+
+    static constexpr uint32_t kTileM = 8;
+    static constexpr uint32_t kTileN = 8;
+
+    runtime_->dispatch_2d(
+        gemm_kernel_,
+        buffers,
+        3,
+        N,  // width  = columns
+        M,  // height = rows
+        kTileN,
+        kTileM,
+        &push_constants,
+        sizeof(push_constants),
+        2  // host-read buffer index = C
     );
 }
 

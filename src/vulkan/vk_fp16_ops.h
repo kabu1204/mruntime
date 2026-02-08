@@ -82,6 +82,16 @@ class VkFp16Ops {
         uint32_t position_offset
     ) const;
 
+    // C = A @ B^T.  A:[M,K], B:[N,K], C:[M,N] — all row-major FP16.
+    void gemm(
+        const VkDescriptorBufferInfo& a,
+        const VkDescriptorBufferInfo& b,
+        const VkDescriptorBufferInfo& c,
+        uint32_t M,
+        uint32_t N,
+        uint32_t K
+    ) const;
+
   private:
     static constexpr uint32_t kLocalSizeX = 256;
 
@@ -93,6 +103,7 @@ class VkFp16Ops {
     VkKernel rope_kernel_ = {};
     VkKernel transpose_kernel_ = {};
     VkKernel kv_cache_copy_kernel_ = {};
+    VkKernel gemm_kernel_ = {};
 };
 
 }  // namespace mruntime::vulkan

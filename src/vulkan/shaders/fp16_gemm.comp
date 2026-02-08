@@ -1,0 +1,95 @@
+#version 460
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+// Tiled GEMM: C = A @ B^T
+// A: [M, K] row-major FP16
+// B: [N, K] row-major FP16  (transposed access: B[n, :])
+// C: [M, N] row-major FP16
+// FP32 accumulation, FP16 output.
+
+#define TILE_M 8
+#define TILE_N 8
+#define TILE_K 32
+
+layout(local_size_x = TILE_N, local_size_y = TILE_M, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer ABuffer {
+    float16_t a[];
+} a_buf;
+
+layout(set = 0, binding = 1, std430) readonly buffer BBuffer {
+    float16_t b[];
+} b_buf;
+
+layout(set = 0, binding = 2, std430) writeonly buffer CBuffer {
+    float16_t c[];
+} c_buf;
+
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint N;
+    uint K;
+} pc;
+
+shared float tile_a[TILE_M][TILE_K];
+shared float tile_b[TILE_N][TILE_K];
+
+void main() {
+    const uint local_n = gl_LocalInvocationID.x;  // column within tile
+    const uint local_m = gl_LocalInvocationID.y;  // row within tile
+    const uint global_m = gl_WorkGroupID.y * TILE_M + local_m;
+    const uint global_n = gl_WorkGroupID.x * TILE_N + local_n;
+    const uint tid = local_m * TILE_N + local_n;  // flat thread id [0..63]
+
+    float acc = 0.0;
+
+    // Number of tiles along K dimension.
+    const uint num_k_tiles = (pc.K + TILE_K - 1) / TILE_K;
+
+    for (uint kt = 0; kt < num_k_tiles; ++kt) {
+        const uint k_base = kt * TILE_K;
+
+        // Cooperative load: 64 threads load TILE_M * TILE_K = 256 elements (4 each).
+        for (uint i = tid; i < TILE_M * TILE_K; i += TILE_M * TILE_N) {
+            uint row = i / TILE_K;
+            uint col = i % TILE_K;
+            uint gm = gl_WorkGroupID.y * TILE_M + row;
+            uint gk = k_base + col;
+            if (gm < pc.M && gk < pc.K) {
+                tile_a[row][col] = float(a_buf.a[gm * pc.K + gk]);
+            } else {
+                tile_a[row][col] = 0.0;
+            }
+        }
+
+        // Cooperative load B tile: TILE_N * TILE_K = 256 elements.
+        for (uint i = tid; i < TILE_N * TILE_K; i += TILE_M * TILE_N) {
+            uint row = i / TILE_K;
+            uint col = i % TILE_K;
+            uint gn = gl_WorkGroupID.x * TILE_N + row;
+            uint gk = k_base + col;
+            if (gn < pc.N && gk < pc.K) {
+                tile_b[row][col] = float(b_buf.b[gn * pc.K + gk]);
+            } else {
+                tile_b[row][col] = 0.0;
+            }
+        }
+
+        barrier();
+
+        // Accumulate dot product for this tile.
+        uint k_end = min(TILE_K, pc.K - k_base);
+        for (uint k = 0; k < k_end; ++k) {
+            acc += tile_a[local_m][k] * tile_b[local_n][k];
+        }
+
+        barrier();
+    }
+
+    // Write output.
+    if (global_m < pc.M && global_n < pc.N) {
+        c_buf.c[global_m * pc.N + global_n] = float16_t(acc);
+    }
+}

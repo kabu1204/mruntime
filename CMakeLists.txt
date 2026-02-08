@@ -172,6 +172,11 @@ if(MRUNTIME_ENABLE_VULKAN)
         "${CMAKE_SOURCE_DIR}/src/vulkan/shaders/fp16_kv_cache_copy.comp"
         kFp16KvCacheCopySpv
     )
+    mruntime_add_vulkan_shader(
+        fp16_gemm
+        "${CMAKE_SOURCE_DIR}/src/vulkan/shaders/fp16_gemm.comp"
+        kFp16GemmSpv
+    )
 
     add_custom_target(mruntime_vulkan_shaders DEPENDS "${MRUNTIME_VULKAN_SHADER_HEADERS}")
 endif()

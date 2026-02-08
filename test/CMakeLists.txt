@@ -67,6 +67,17 @@ if(MRUNTIME_ENABLE_VULKAN)
     add_dependencies(vulkan_fp16_kernels_test mruntime_vulkan_shaders)
     add_test(NAME vulkan_fp16_kernels_test COMMAND vulkan_fp16_kernels_test)
     set_tests_properties(vulkan_fp16_kernels_test PROPERTIES SKIP_RETURN_CODE 77)
+
+    add_executable(vulkan_gemm_test vulkan_gemm_test.cpp)
+    target_link_libraries(vulkan_gemm_test PRIVATE mruntime Vulkan::Vulkan)
+    target_include_directories(vulkan_gemm_test PRIVATE
+        ${MRUNTIME_VULKAN_GENERATED_DIR}
+        ${CMAKE_SOURCE_DIR}/include
+        ${CMAKE_SOURCE_DIR}/src/vulkan
+    )
+    add_dependencies(vulkan_gemm_test mruntime_vulkan_shaders)
+    add_test(NAME vulkan_gemm_test COMMAND vulkan_gemm_test)
+    set_tests_properties(vulkan_gemm_test PROPERTIES SKIP_RETURN_CODE 77)
 endif()
 
 # Some tests assume working-directory == ${CMAKE_BINARY_DIR} (out-of-source build root).
