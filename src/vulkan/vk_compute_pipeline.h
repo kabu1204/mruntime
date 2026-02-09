@@ -44,7 +44,8 @@ class VkComputePipeline {
         uint32_t push_constants_size,
         VkBuffer host_read_buffer = VK_NULL_HANDLE,
         VkDeviceSize host_read_offset = 0,
-        VkDeviceSize host_read_size = 0
+        VkDeviceSize host_read_size = 0,
+        VkQueryPool query_pool = VK_NULL_HANDLE
     ) const;
 
   private:

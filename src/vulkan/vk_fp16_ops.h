@@ -89,11 +89,24 @@ class VkFp16Ops {
         const VkDescriptorBufferInfo& c,
         uint32_t M,
         uint32_t N,
-        uint32_t K
+        uint32_t K,
+        VkQueryPool query_pool = VK_NULL_HANDLE
+    ) const;
+
+    // y = W @ x. x:[K], W:[N,K], y:[N] — all row-major FP16.
+    void gemv(
+        const VkDescriptorBufferInfo& x,
+        const VkDescriptorBufferInfo& w,
+        const VkDescriptorBufferInfo& y,
+        uint32_t N,
+        uint32_t K,
+        VkQueryPool query_pool = VK_NULL_HANDLE
     ) const;
 
   private:
     static constexpr uint32_t kLocalSizeX = 256;
+    static constexpr uint32_t kGemvRows4Vec4LocalSizeX = 128;
+    static constexpr uint32_t kGemvRows4Vec4RowsPerWg = 4;
 
     VkKernelRuntime* runtime_ = nullptr;
     VkKernel add_kernel_ = {};
@@ -103,6 +116,7 @@ class VkFp16Ops {
     VkKernel rope_kernel_ = {};
     VkKernel transpose_kernel_ = {};
     VkKernel kv_cache_copy_kernel_ = {};
+    VkKernel gemv_rows4_vec4_kernel_ = {};
     VkKernel gemm_kernel_ = {};
 };
 

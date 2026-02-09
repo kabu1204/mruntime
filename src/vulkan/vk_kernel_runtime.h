@@ -55,7 +55,8 @@ class VkKernelRuntime {
         uint32_t local_size_x,
         const void* push_constants,
         uint32_t push_constants_size,
-        int32_t host_read_buffer_index = -1
+        int32_t host_read_buffer_index = -1,
+        VkQueryPool query_pool = VK_NULL_HANDLE
     ) const;
 
     void dispatch_2d(
@@ -68,7 +69,8 @@ class VkKernelRuntime {
         uint32_t local_size_y,
         const void* push_constants,
         uint32_t push_constants_size,
-        int32_t host_read_buffer_index = -1
+        int32_t host_read_buffer_index = -1,
+        VkQueryPool query_pool = VK_NULL_HANDLE
     ) const;
 
   private:

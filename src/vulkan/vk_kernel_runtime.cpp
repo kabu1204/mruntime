@@ -135,7 +135,8 @@ void VkKernelRuntime::dispatch_1d(
     uint32_t local_size_x,
     const void* push_constants,
     uint32_t push_constants_size,
-    int32_t host_read_buffer_index
+    int32_t host_read_buffer_index,
+    VkQueryPool query_pool
 ) const {
     if (context_ == nullptr) {
         throw std::runtime_error("VkKernelRuntime::dispatch_1d: runtime not initialized");
@@ -180,7 +181,8 @@ void VkKernelRuntime::dispatch_1d(
         push_constants_size,
         host_read_buffer,
         host_read_offset,
-        host_read_size
+        host_read_size,
+        query_pool
     );
 }
 
@@ -194,7 +196,8 @@ void VkKernelRuntime::dispatch_2d(
     uint32_t local_size_y,
     const void* push_constants,
     uint32_t push_constants_size,
-    int32_t host_read_buffer_index
+    int32_t host_read_buffer_index,
+    VkQueryPool query_pool
 ) const {
     if (context_ == nullptr) {
         throw std::runtime_error("VkKernelRuntime::dispatch_2d: runtime not initialized");
@@ -240,7 +243,8 @@ void VkKernelRuntime::dispatch_2d(
         push_constants_size,
         host_read_buffer,
         host_read_offset,
-        host_read_size
+        host_read_size,
+        query_pool
     );
 }
 

@@ -3,6 +3,7 @@
 #include <stdexcept>
 
 #include "fp16_add_spv.h"
+#include "fp16_gemv_rows4_vec4_spv.h"
 #include "fp16_gemm_spv.h"
 #include "fp16_kv_cache_copy_spv.h"
 #include "fp16_mul_spv.h"
@@ -70,6 +71,11 @@ VkFp16Ops VkFp16Ops::Create(VkKernelRuntime* runtime) {
     ops.kv_cache_copy_kernel_ = runtime->get_or_create_kernel(
         make_kernel_create_info(shaders::kFp16KvCacheCopySpv, shaders::kFp16KvCacheCopySpvSize,
                                 4, 6 * sizeof(uint32_t)));
+
+    // gemv (rows4 + vec4): 3 buffers (x, W, y), push = {uint N, uint K}
+    ops.gemv_rows4_vec4_kernel_ = runtime->get_or_create_kernel(
+        make_kernel_create_info(shaders::kFp16GemvRows4Vec4Spv, shaders::kFp16GemvRows4Vec4SpvSize,
+                                3, 2 * sizeof(uint32_t)));
 
     // gemm: 3 buffers (A, B, C), push = {uint M, uint N, uint K}
     ops.gemm_kernel_ = runtime->get_or_create_kernel(
@@ -340,7 +346,8 @@ void VkFp16Ops::gemm(
     const VkDescriptorBufferInfo& c,
     uint32_t M,
     uint32_t N,
-    uint32_t K
+    uint32_t K,
+    VkQueryPool query_pool
 ) const {
     if (runtime_ == nullptr) {
         throw std::runtime_error("VkFp16Ops::gemm: runtime is null");
@@ -357,8 +364,8 @@ void VkFp16Ops::gemm(
         uint32_t K;
     } push_constants = {M, N, K};
 
-    static constexpr uint32_t kTileM = 64;
-    static constexpr uint32_t kTileN = 64;
+    constexpr uint32_t tile_M = 64;
+    constexpr uint32_t tile_N = 64;
 
     runtime_->dispatch_2d(
         gemm_kernel_,
@@ -366,11 +373,58 @@ void VkFp16Ops::gemm(
         3,
         N,  // width  = columns
         M,  // height = rows
-        kTileN,
-        kTileM,
+        tile_N,
+        tile_M,
         &push_constants,
         sizeof(push_constants),
-        2  // host-read buffer index = C
+        2,  // host-read buffer index = C
+        query_pool
+    );
+}
+
+void VkFp16Ops::gemv(
+    const VkDescriptorBufferInfo& x,
+    const VkDescriptorBufferInfo& w,
+    const VkDescriptorBufferInfo& y,
+    uint32_t N,
+    uint32_t K,
+    VkQueryPool query_pool
+) const {
+    if (runtime_ == nullptr) {
+        throw std::runtime_error("VkFp16Ops::gemv: runtime is null");
+    }
+    if (N == 0 || K == 0) {
+        return;
+    }
+
+    const VkDescriptorBufferInfo buffers[3] = {x, w, y};
+
+    struct {
+        uint32_t N;
+        uint32_t K;
+    } push_constants = {N, K};
+
+    if ((K & 3u) != 0u) {
+        throw std::runtime_error("VkFp16Ops::gemv: K must be divisible by 4");
+    }
+
+    const uint64_t group_count_x =
+        (static_cast<uint64_t>(N) + kGemvRows4Vec4RowsPerWg - 1) / kGemvRows4Vec4RowsPerWg;
+    const uint64_t element_count64 = group_count_x * kGemvRows4Vec4LocalSizeX;
+    if (element_count64 > UINT32_MAX) {
+        throw std::runtime_error("VkFp16Ops::gemv: N too large");
+    }
+
+    runtime_->dispatch_1d(
+        gemv_rows4_vec4_kernel_,
+        buffers,
+        3,
+        static_cast<uint32_t>(element_count64),
+        kGemvRows4Vec4LocalSizeX,
+        &push_constants,
+        sizeof(push_constants),
+        2,  // host-read buffer index = y
+        query_pool
     );
 }
 

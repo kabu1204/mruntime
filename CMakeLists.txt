@@ -173,6 +173,11 @@ if(MRUNTIME_ENABLE_VULKAN)
         kFp16KvCacheCopySpv
     )
     mruntime_add_vulkan_shader(
+        fp16_gemv_rows4_vec4
+        "${CMAKE_SOURCE_DIR}/src/vulkan/shaders/fp16_gemv_rows4_vec4.comp"
+        kFp16GemvRows4Vec4Spv
+    )
+    mruntime_add_vulkan_shader(
         fp16_gemm
         "${CMAKE_SOURCE_DIR}/src/vulkan/shaders/fp16_gemm.comp"
         kFp16GemmSpv

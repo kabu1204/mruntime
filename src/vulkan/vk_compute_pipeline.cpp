@@ -149,7 +149,8 @@ void VkComputePipeline::dispatch_and_wait(
     uint32_t push_constants_size,
     VkBuffer host_read_buffer,
     VkDeviceSize host_read_offset,
-    VkDeviceSize host_read_size
+    VkDeviceSize host_read_size,
+    VkQueryPool query_pool
 ) const {
     if (device_ == VK_NULL_HANDLE || ctx.device() != device_) {
         throw std::runtime_error("VkComputePipeline::dispatch_and_wait: invalid device/context");
@@ -201,7 +202,15 @@ void VkComputePipeline::dispatch_and_wait(
     if (push_constant_size_ > 0) {
         vkCmdPushConstants(cb, pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, push_constant_size_, push_constants);
     }
+
+    if (query_pool != VK_NULL_HANDLE) {
+        vkCmdResetQueryPool(cb, query_pool, 0, 2);
+        vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, query_pool, 0);
+    }
     vkCmdDispatch(cb, group_count_x, group_count_y, group_count_z);
+    if (query_pool != VK_NULL_HANDLE) {
+        vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, query_pool, 1);
+    }
 
     if (host_read_buffer != VK_NULL_HANDLE && host_read_size > 0) {
         cmd_buffer_barrier_to_host_read(cb, host_read_buffer, host_read_offset, host_read_size);
