@@ -89,6 +89,15 @@ if(MRUNTIME_ENABLE_VULKAN)
     add_dependencies(vulkan_gemv_test mruntime_vulkan_shaders)
     add_test(NAME vulkan_gemv_test COMMAND vulkan_gemv_test)
     set_tests_properties(vulkan_gemv_test PROPERTIES SKIP_RETURN_CODE 77)
+
+    add_executable(vulkan_qwen2_smoke_test vulkan_qwen2_smoke_test.cpp)
+    target_link_libraries(vulkan_qwen2_smoke_test PRIVATE mruntime Vulkan::Vulkan)
+    target_include_directories(vulkan_qwen2_smoke_test PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+        ${CMAKE_SOURCE_DIR}/src/vulkan
+    )
+    add_test(NAME vulkan_qwen2_smoke_test COMMAND vulkan_qwen2_smoke_test)
+    set_tests_properties(vulkan_qwen2_smoke_test PROPERTIES SKIP_RETURN_CODE 77)
 endif()
 
 # Some tests assume working-directory == ${CMAKE_BINARY_DIR} (out-of-source build root).

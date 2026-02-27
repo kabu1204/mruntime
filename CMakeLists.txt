@@ -199,6 +199,8 @@ set(MRUNTIME_CORE_SOURCES
 
 if(MRUNTIME_ENABLE_VULKAN)
     list(APPEND MRUNTIME_CORE_SOURCES
+        src/qwen2_forward_vk.cpp
+        src/qwen2_generate_vk.cpp
         src/vulkan/vk_buffer_arena.cpp
         src/vulkan/vk_command.cpp
         src/vulkan/vk_compute_pipeline.cpp
@@ -250,6 +252,7 @@ if(MRUNTIME_ENABLE_VULKAN)
         ${MRUNTIME_VULKAN_GENERATED_DIR}
         ${CMAKE_SOURCE_DIR}/src/vulkan
     )
+    target_compile_definitions(mruntime PUBLIC MRUNTIME_ENABLE_VULKAN=1)
     add_dependencies(mruntime mruntime_vulkan_shaders)
 endif()
 

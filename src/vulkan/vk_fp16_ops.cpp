@@ -315,7 +315,12 @@ void VkFp16Ops::kv_cache_copy(
         return;
     }
 
-    const VkDescriptorBufferInfo buffers[4] = {k_in, v_in, k_cache, v_cache};
+    VkDescriptorBufferInfo buffers[4] = {k_in, v_in, k_cache, v_cache};
+    // Host reads often follow (e.g. CPU attention over the KV cache). Ensure we emit a host-read
+    // barrier that covers both K and V cache ranges when they are suballocated from the same
+    // VkBufferArena (V is typically allocated after K). We do this by making K's descriptor range
+    // VK_WHOLE_SIZE for the barrier selection below.
+    buffers[2].range = 0;
 
     struct {
         uint32_t batch;
@@ -336,7 +341,7 @@ void VkFp16Ops::kv_cache_copy(
         kLocalSizeX,
         &push_constants,
         sizeof(push_constants),
-        -1
+        2
     );
 }
 
