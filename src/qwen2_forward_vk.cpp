@@ -635,8 +635,9 @@ Qwen2VkStatePtr qwen2_vk_create(
     vulkan::VkBufferArenaCreateInfo weights_info;
     weights_info.capacity_bytes = static_cast<VkDeviceSize>(weights_bytes) + 4 * state->alignment;
     weights_info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    // Use HOST_CACHED for weights
     weights_info.memory_properties =
-        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
     weights_info.default_alignment = state->alignment;
     state->weights_arena = vulkan::VkBufferArena::Create(
         state->vk.physical_device(), state->vk.device(), weights_info);
@@ -738,6 +739,19 @@ Qwen2VkStatePtr qwen2_vk_create(
         dst_layer.o_proj_packed = nullptr;
         dst_layer.gate_up_proj_packed = nullptr;
         dst_layer.down_proj_packed = nullptr;
+    }
+
+    // Flush weights to GPU (required for HOST_CACHED memory).
+    {
+        VkMappedMemoryRange range = {};
+        range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+        range.memory = state->weights_arena.memory();
+        range.offset = 0;
+        range.size = VK_WHOLE_SIZE;
+        VkResult result = vkFlushMappedMemoryRanges(state->vk.device(), 1, &range);
+        if (result != VK_SUCCESS) {
+            throw std::runtime_error("qwen2_vk_create: vkFlushMappedMemoryRanges failed for weights");
+        }
     }
 
     // Initialize KV cache in kv_arena: allocate K, then V, then rope tables.
