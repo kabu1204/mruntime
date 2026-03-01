@@ -43,6 +43,12 @@ Model-dependent tests require a Qwen2.5 model directory at `models/Qwen2.5-0.5B-
 ./build/mruntime_chat --model-dir models/Qwen2.5-0.5B-Instruct
 ```
 
+Vulkan (requires `-DMRUNTIME_ENABLE_VULKAN=ON` at build time):
+
+```bash
+./build/mruntime_chat --backend vulkan --model-dir models/Qwen2.5-0.5B-Instruct
+```
+
 Flags:
 - `--greedy` for deterministic decoding
 - `--temperature`, `--top-k`, `--top-p` for sampling
