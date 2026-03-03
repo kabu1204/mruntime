@@ -235,6 +235,10 @@ VkContext VkContext::Create(const VkContextCreateInfo& info) {
 
     vk_check(vkCreateDevice(ctx.physical_device_, &dev_ci, nullptr, &ctx.device_), "vkCreateDevice");
 
+    VkPipelineCacheCreateInfo cache_ci = {};
+    cache_ci.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
+    vk_check(vkCreatePipelineCache(ctx.device_, &cache_ci, nullptr, &ctx.pipeline_cache_), "vkCreatePipelineCache");
+
     vkGetDeviceQueue(ctx.device_, queue_family_index, 0, &ctx.queue_);
 
     VkCommandPoolCreateInfo pool_ci = {};
@@ -274,6 +278,7 @@ VkContext& VkContext::operator=(VkContext&& other) noexcept {
     instance_ = std::exchange(other.instance_, VK_NULL_HANDLE);
     physical_device_ = std::exchange(other.physical_device_, VK_NULL_HANDLE);
     device_ = std::exchange(other.device_, VK_NULL_HANDLE);
+    pipeline_cache_ = std::exchange(other.pipeline_cache_, VK_NULL_HANDLE);
     queue_ = std::exchange(other.queue_, VK_NULL_HANDLE);
     queue_family_index_ = std::exchange(other.queue_family_index_, UINT32_MAX);
     command_pool_ = std::exchange(other.command_pool_, VK_NULL_HANDLE);
@@ -286,6 +291,8 @@ VkContext& VkContext::operator=(VkContext&& other) noexcept {
 
 void VkContext::reset() noexcept {
     if (device_ != VK_NULL_HANDLE) {
+        vkDeviceWaitIdle(device_);
+
         if (fence_ != VK_NULL_HANDLE) {
             vkDestroyFence(device_, fence_, nullptr);
             fence_ = VK_NULL_HANDLE;
@@ -295,11 +302,15 @@ void VkContext::reset() noexcept {
             vkDestroyCommandPool(device_, command_pool_, nullptr);
             command_pool_ = VK_NULL_HANDLE;
         }
-        vkDeviceWaitIdle(device_);
+        if (pipeline_cache_ != VK_NULL_HANDLE) {
+            vkDestroyPipelineCache(device_, pipeline_cache_, nullptr);
+            pipeline_cache_ = VK_NULL_HANDLE;
+        }
         vkDestroyDevice(device_, nullptr);
         device_ = VK_NULL_HANDLE;
     }
 
+    pipeline_cache_ = VK_NULL_HANDLE;
     queue_ = VK_NULL_HANDLE;
     queue_family_index_ = UINT32_MAX;
     physical_device_ = VK_NULL_HANDLE;

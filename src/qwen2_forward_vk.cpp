@@ -610,7 +610,7 @@ Qwen2VkStatePtr qwen2_vk_create(
     state->runtime = vulkan::VkKernelRuntime::Create(state->vk);
     state->fp16_ops = vulkan::VkFp16Ops::Create(&state->runtime);
 
-    // Allocate Vulkan arenas (host-visible coherent for correctness).
+    // Allocate host-visible arenas, preferring host-visible DEVICE_LOCAL memory on unified-memory GPUs.
     const Qwen2MemorySizes sizes = qwen2_memory_sizes(cfg, max_seq_len, max_batch_tokens);
 
     vulkan::VkBufferArenaCreateInfo kv_info;
@@ -618,6 +618,7 @@ Qwen2VkStatePtr qwen2_vk_create(
     kv_info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
     kv_info.memory_properties =
         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    kv_info.preferred_memory_properties = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
     kv_info.default_alignment = state->alignment;
     state->kv_arena = vulkan::VkBufferArena::Create(
         state->vk.physical_device(), state->vk.device(), kv_info);
@@ -627,6 +628,7 @@ Qwen2VkStatePtr qwen2_vk_create(
     scratch_info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
     scratch_info.memory_properties =
         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    scratch_info.preferred_memory_properties = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
     scratch_info.default_alignment = state->alignment;
     state->scratch_arena = vulkan::VkBufferArena::Create(
         state->vk.physical_device(), state->vk.device(), scratch_info);
@@ -638,6 +640,8 @@ Qwen2VkStatePtr qwen2_vk_create(
     // Use HOST_CACHED for weights
     weights_info.memory_properties =
         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+    weights_info.preferred_memory_properties =
+        VK_MEMORY_PROPERTY_HOST_CACHED_BIT | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
     weights_info.default_alignment = state->alignment;
     state->weights_arena = vulkan::VkBufferArena::Create(
         state->vk.physical_device(), state->vk.device(), weights_info);

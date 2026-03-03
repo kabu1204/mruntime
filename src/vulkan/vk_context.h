@@ -32,6 +32,7 @@ class VkContext {
     VkInstance instance() const noexcept { return instance_; }
     VkPhysicalDevice physical_device() const noexcept { return physical_device_; }
     VkDevice device() const noexcept { return device_; }
+    VkPipelineCache pipeline_cache() const noexcept { return pipeline_cache_; }
 
     uint32_t queue_family_index() const noexcept { return queue_family_index_; }
     VkQueue queue() const noexcept { return queue_; }
@@ -51,6 +52,7 @@ class VkContext {
     VkInstance instance_ = VK_NULL_HANDLE;
     VkPhysicalDevice physical_device_ = VK_NULL_HANDLE;
     VkDevice device_ = VK_NULL_HANDLE;
+    VkPipelineCache pipeline_cache_ = VK_NULL_HANDLE;
 
     VkQueue queue_ = VK_NULL_HANDLE;
     uint32_t queue_family_index_ = UINT32_MAX;
@@ -62,4 +64,3 @@ class VkContext {
 };
 
 }  // namespace mruntime::vulkan
-

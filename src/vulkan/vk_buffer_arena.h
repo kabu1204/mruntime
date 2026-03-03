@@ -11,6 +11,7 @@ struct VkBufferArenaCreateInfo {
     VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
     VkMemoryPropertyFlags memory_properties =
         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    VkMemoryPropertyFlags preferred_memory_properties = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
     VkDeviceSize default_alignment = 0;  // 0 -> use a reasonable default.
 };
 
@@ -36,6 +37,7 @@ class VkBufferArena {
     VkDevice device() const noexcept { return device_; }
     VkBuffer buffer() const noexcept { return buffer_; }
     VkDeviceMemory memory() const noexcept { return memory_; }
+    VkMemoryPropertyFlags memory_properties() const noexcept { return memory_properties_; }
 
     VkDeviceSize capacity() const noexcept { return capacity_; }
     VkDeviceSize offset() const noexcept { return offset_; }
@@ -61,6 +63,7 @@ class VkBufferArena {
     VkDevice device_ = VK_NULL_HANDLE;
     VkBuffer buffer_ = VK_NULL_HANDLE;
     VkDeviceMemory memory_ = VK_NULL_HANDLE;
+    VkMemoryPropertyFlags memory_properties_ = 0;
     void* mapped_ = nullptr;
 
     VkDeviceSize capacity_ = 0;
@@ -69,4 +72,3 @@ class VkBufferArena {
 };
 
 }  // namespace mruntime::vulkan
-

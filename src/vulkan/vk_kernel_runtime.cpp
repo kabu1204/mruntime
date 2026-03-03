@@ -1,7 +1,9 @@
 #include "vk_kernel_runtime.h"
 
 #include <algorithm>
+#include <array>
 #include <stdexcept>
+#include <vector>
 
 namespace mruntime::vulkan {
 
@@ -115,6 +117,7 @@ VkKernel VkKernelRuntime::get_or_create_kernel(const KernelCreateInfo& info) {
         create_info.spirv_size = key.spirv.size();
         create_info.storage_buffer_count = key.storage_buffer_count;
         create_info.push_constant_size = key.push_constant_size;
+        create_info.pipeline_cache = context_->pipeline_cache();
 
         auto pipeline = std::make_unique<VkComputePipeline>(VkComputePipeline::Create(context_->device(), create_info));
         it = pipeline_cache_.emplace(std::move(key), std::move(pipeline)).first;
@@ -151,7 +154,16 @@ void VkKernelRuntime::dispatch_1d(
         return;
     }
 
-    std::vector<VkDescriptorBufferInfo> normalized_buffers(buffer_count);
+    constexpr uint32_t kStackBufferCapacity = 8;
+    std::array<VkDescriptorBufferInfo, kStackBufferCapacity> stack_buffers = {};
+    std::vector<VkDescriptorBufferInfo> heap_buffers;
+    VkDescriptorBufferInfo* normalized_buffers = nullptr;
+    if (buffer_count <= kStackBufferCapacity) {
+        normalized_buffers = stack_buffers.data();
+    } else {
+        heap_buffers.resize(buffer_count);
+        normalized_buffers = heap_buffers.data();
+    }
     for (uint32_t i = 0; i < buffer_count; ++i) {
         normalized_buffers[i] = normalize_descriptor_range(buffers[i]);
     }
@@ -162,8 +174,8 @@ void VkKernelRuntime::dispatch_1d(
     VkDeviceSize host_read_offset = 0;
     VkDeviceSize host_read_size = 0;
     select_host_barrier_target(
-        normalized_buffers.data(),
-        static_cast<uint32_t>(normalized_buffers.size()),
+        normalized_buffers,
+        buffer_count,
         host_read_buffer_index,
         &host_read_buffer,
         &host_read_offset,
@@ -172,8 +184,8 @@ void VkKernelRuntime::dispatch_1d(
 
     kernel.pipeline->dispatch_and_wait(
         *context_,
-        normalized_buffers.data(),
-        static_cast<uint32_t>(normalized_buffers.size()),
+        normalized_buffers,
+        buffer_count,
         group_count_x,
         1,
         1,
@@ -212,7 +224,16 @@ void VkKernelRuntime::dispatch_2d(
         return;
     }
 
-    std::vector<VkDescriptorBufferInfo> normalized_buffers(buffer_count);
+    constexpr uint32_t kStackBufferCapacity = 8;
+    std::array<VkDescriptorBufferInfo, kStackBufferCapacity> stack_buffers = {};
+    std::vector<VkDescriptorBufferInfo> heap_buffers;
+    VkDescriptorBufferInfo* normalized_buffers = nullptr;
+    if (buffer_count <= kStackBufferCapacity) {
+        normalized_buffers = stack_buffers.data();
+    } else {
+        heap_buffers.resize(buffer_count);
+        normalized_buffers = heap_buffers.data();
+    }
     for (uint32_t i = 0; i < buffer_count; ++i) {
         normalized_buffers[i] = normalize_descriptor_range(buffers[i]);
     }
@@ -224,8 +245,8 @@ void VkKernelRuntime::dispatch_2d(
     VkDeviceSize host_read_offset = 0;
     VkDeviceSize host_read_size = 0;
     select_host_barrier_target(
-        normalized_buffers.data(),
-        static_cast<uint32_t>(normalized_buffers.size()),
+        normalized_buffers,
+        buffer_count,
         host_read_buffer_index,
         &host_read_buffer,
         &host_read_offset,
@@ -234,8 +255,8 @@ void VkKernelRuntime::dispatch_2d(
 
     kernel.pipeline->dispatch_and_wait(
         *context_,
-        normalized_buffers.data(),
-        static_cast<uint32_t>(normalized_buffers.size()),
+        normalized_buffers,
+        buffer_count,
         group_count_x,
         group_count_y,
         1,

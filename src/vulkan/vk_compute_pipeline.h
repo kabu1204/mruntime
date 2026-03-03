@@ -14,6 +14,7 @@ struct ComputePipelineCreateInfo {
     size_t spirv_size = 0;
     uint32_t storage_buffer_count = 0;
     uint32_t push_constant_size = 0;
+    VkPipelineCache pipeline_cache = VK_NULL_HANDLE;
 };
 
 class VkComputePipeline {
@@ -61,6 +62,7 @@ class VkComputePipeline {
 
     VkDescriptorPool descriptor_pool_ = VK_NULL_HANDLE;
     VkDescriptorSet descriptor_set_ = VK_NULL_HANDLE;
+    VkDescriptorUpdateTemplate descriptor_update_template_ = VK_NULL_HANDLE;
 };
 
 }  // namespace mruntime::vulkan

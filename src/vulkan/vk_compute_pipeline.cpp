@@ -1,5 +1,6 @@
 #include "vk_compute_pipeline.h"
 
+#include <cstddef>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -89,7 +90,7 @@ VkComputePipeline VkComputePipeline::Create(VkDevice device, const ComputePipeli
     vk_ci.stage = stage;
     vk_ci.layout = out.pipeline_layout_;
 
-    vk_check(vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &vk_ci, nullptr, &out.pipeline_),
+    vk_check(vkCreateComputePipelines(device, info.pipeline_cache, 1, &vk_ci, nullptr, &out.pipeline_),
         "vkCreateComputePipelines");
 
     // Descriptor pool & one reusable descriptor set.
@@ -110,6 +111,27 @@ VkComputePipeline VkComputePipeline::Create(VkDevice device, const ComputePipeli
     ds_ai.descriptorSetCount = 1;
     ds_ai.pSetLayouts = &out.descriptor_set_layout_;
     vk_check(vkAllocateDescriptorSets(device, &ds_ai, &out.descriptor_set_), "vkAllocateDescriptorSets");
+
+    std::vector<VkDescriptorUpdateTemplateEntry> update_entries(info.storage_buffer_count);
+    for (uint32_t i = 0; i < info.storage_buffer_count; ++i) {
+        VkDescriptorUpdateTemplateEntry entry = {};
+        entry.dstBinding = i;
+        entry.dstArrayElement = 0;
+        entry.descriptorCount = 1;
+        entry.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        entry.offset = static_cast<size_t>(i) * sizeof(VkDescriptorBufferInfo);
+        entry.stride = sizeof(VkDescriptorBufferInfo);
+        update_entries[i] = entry;
+    }
+
+    VkDescriptorUpdateTemplateCreateInfo update_template_ci = {};
+    update_template_ci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_UPDATE_TEMPLATE_CREATE_INFO;
+    update_template_ci.descriptorUpdateEntryCount = static_cast<uint32_t>(update_entries.size());
+    update_template_ci.pDescriptorUpdateEntries = update_entries.data();
+    update_template_ci.templateType = VK_DESCRIPTOR_UPDATE_TEMPLATE_TYPE_DESCRIPTOR_SET;
+    update_template_ci.descriptorSetLayout = out.descriptor_set_layout_;
+    vk_check(vkCreateDescriptorUpdateTemplate(device, &update_template_ci, nullptr, &out.descriptor_update_template_),
+        "vkCreateDescriptorUpdateTemplate");
 
     return out;
 }
@@ -134,6 +156,7 @@ VkComputePipeline& VkComputePipeline::operator=(VkComputePipeline&& other) noexc
     pipeline_ = std::exchange(other.pipeline_, VK_NULL_HANDLE);
     descriptor_pool_ = std::exchange(other.descriptor_pool_, VK_NULL_HANDLE);
     descriptor_set_ = std::exchange(other.descriptor_set_, VK_NULL_HANDLE);
+    descriptor_update_template_ = std::exchange(other.descriptor_update_template_, VK_NULL_HANDLE);
 
     return *this;
 }
@@ -165,18 +188,7 @@ void VkComputePipeline::dispatch_and_wait(
         throw std::runtime_error("VkComputePipeline::dispatch_and_wait: push_constants is null");
     }
 
-    std::vector<VkWriteDescriptorSet> writes(buffer_count);
-    for (uint32_t i = 0; i < buffer_count; ++i) {
-        VkWriteDescriptorSet w = {};
-        w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        w.dstSet = descriptor_set_;
-        w.dstBinding = i;
-        w.descriptorCount = 1;
-        w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        w.pBufferInfo = &buffers[i];
-        writes[i] = w;
-    }
-    vkUpdateDescriptorSets(device_, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
+    vkUpdateDescriptorSetWithTemplate(device_, descriptor_set_, descriptor_update_template_, buffers);
 
     VkCommandBuffer cb = ctx.command_buffer();
     vk_check(vkResetCommandBuffer(cb, 0), "vkResetCommandBuffer");
@@ -220,6 +232,10 @@ void VkComputePipeline::destroy() noexcept {
         return;
     }
 
+    if (descriptor_update_template_ != VK_NULL_HANDLE) {
+        vkDestroyDescriptorUpdateTemplate(device_, descriptor_update_template_, nullptr);
+        descriptor_update_template_ = VK_NULL_HANDLE;
+    }
     if (descriptor_pool_ != VK_NULL_HANDLE) {
         vkDestroyDescriptorPool(device_, descriptor_pool_, nullptr);
         descriptor_pool_ = VK_NULL_HANDLE;
