@@ -178,13 +178,8 @@ void VkComputePipeline::dispatch_and_wait(
     }
     vkUpdateDescriptorSets(device_, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
 
-    VkCommandBuffer cb = allocate_command_buffer(device_, ctx.command_pool());
-    struct CommandBufferGuard {
-        VkDevice device = VK_NULL_HANDLE;
-        VkCommandPool pool = VK_NULL_HANDLE;
-        VkCommandBuffer command_buffer = VK_NULL_HANDLE;
-        ~CommandBufferGuard() { free_command_buffer(device, pool, command_buffer); }
-    } command_buffer_guard = {device_, ctx.command_pool(), cb};
+    VkCommandBuffer cb = ctx.command_buffer();
+    vk_check(vkResetCommandBuffer(cb, 0), "vkResetCommandBuffer");
 
     begin_command_buffer(cb);
 
@@ -205,11 +200,11 @@ void VkComputePipeline::dispatch_and_wait(
 
     if (query_pool != VK_NULL_HANDLE) {
         vkCmdResetQueryPool(cb, query_pool, 0, 2);
-        vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, query_pool, 0);
+        vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, query_pool, 0);
     }
     vkCmdDispatch(cb, group_count_x, group_count_y, group_count_z);
     if (query_pool != VK_NULL_HANDLE) {
-        vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, query_pool, 1);
+        vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, query_pool, 1);
     }
 
     if (host_read_buffer != VK_NULL_HANDLE && host_read_size > 0) {
@@ -217,7 +212,7 @@ void VkComputePipeline::dispatch_and_wait(
     }
 
     end_command_buffer(cb);
-    submit_and_wait(device_, ctx.queue(), cb);
+    submit_and_wait_with_fence(device_, ctx.queue(), cb, ctx.fence());
 }
 
 void VkComputePipeline::destroy() noexcept {

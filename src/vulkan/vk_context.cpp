@@ -43,6 +43,24 @@ void require_fp16_features(VkPhysicalDevice physical_device) {
     }
 }
 
+void require_vulkan13_features(VkPhysicalDevice physical_device) {
+    VkPhysicalDeviceVulkan13Features features13 = {};
+    features13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
+
+    VkPhysicalDeviceFeatures2 features2 = {};
+    features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+    features2.pNext = &features13;
+
+    vkGetPhysicalDeviceFeatures2(physical_device, &features2);
+
+    if (!features13.synchronization2) {
+        throw std::runtime_error("Required Vulkan 1.3 feature missing: synchronization2");
+    }
+    if (!features13.maintenance4) {
+        throw std::runtime_error("Required Vulkan 1.3 feature missing: maintenance4");
+    }
+}
+
 bool device_supports_required_extensions(VkPhysicalDevice physical_device, bool* out_has_portability_subset) {
     const auto exts = enumerate_device_extensions(physical_device);
     const std::array<const char*, 3> required = {
@@ -64,17 +82,32 @@ bool device_supports_required_extensions(VkPhysicalDevice physical_device, bool*
 }  // namespace
 
 VkContext VkContext::Create(const VkContextCreateInfo& info) {
-    (void)info;  // Validation not wired yet.
-
     VkContext ctx;
 
     const auto instance_exts = enumerate_instance_extensions();
     std::vector<const char*> enabled_instance_exts;
+    std::vector<const char*> enabled_layers;
     VkInstanceCreateFlags instance_flags = 0;
 
     if (has_extension(instance_exts, VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME)) {
         enabled_instance_exts.push_back(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
         instance_flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
+    }
+
+    // Validation layers: enable when requested and the layer is installed.
+    VkValidationFeaturesEXT validation_features = {};
+    std::array<VkValidationFeatureEnableEXT, 2> validation_enables = {
+        VK_VALIDATION_FEATURE_ENABLE_BEST_PRACTICES_EXT,
+        VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT,
+    };
+
+    bool use_validation = false;
+    if (info.enable_validation) {
+        const auto layers = enumerate_instance_layers();
+        if (has_layer(layers, "VK_LAYER_KHRONOS_validation")) {
+            enabled_layers.push_back("VK_LAYER_KHRONOS_validation");
+            use_validation = true;
+        }
     }
 
     VkApplicationInfo app = {};
@@ -92,6 +125,16 @@ VkContext VkContext::Create(const VkContextCreateInfo& info) {
     instance_ci.enabledExtensionCount = static_cast<uint32_t>(enabled_instance_exts.size());
     instance_ci.ppEnabledExtensionNames =
         enabled_instance_exts.empty() ? nullptr : enabled_instance_exts.data();
+    instance_ci.enabledLayerCount = static_cast<uint32_t>(enabled_layers.size());
+    instance_ci.ppEnabledLayerNames = enabled_layers.empty() ? nullptr : enabled_layers.data();
+
+    if (use_validation) {
+        validation_features.sType = VK_STRUCTURE_TYPE_VALIDATION_FEATURES_EXT;
+        validation_features.enabledValidationFeatureCount =
+            static_cast<uint32_t>(validation_enables.size());
+        validation_features.pEnabledValidationFeatures = validation_enables.data();
+        instance_ci.pNext = &validation_features;
+    }
 
     vk_check(vkCreateInstance(&instance_ci, nullptr, &ctx.instance_), "vkCreateInstance");
 
@@ -121,6 +164,7 @@ VkContext VkContext::Create(const VkContextCreateInfo& info) {
         try {
             (void)find_compute_queue_family(dev);
             require_fp16_features(dev);
+            require_vulkan13_features(dev);
         } catch (...) {
             continue;
         }
@@ -162,6 +206,12 @@ VkContext VkContext::Create(const VkContextCreateInfo& info) {
     scalar_layout.scalarBlockLayout = VK_TRUE;
     storage16.pNext = &scalar_layout;
 
+    VkPhysicalDeviceVulkan13Features features13 = {};
+    features13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
+    features13.synchronization2 = VK_TRUE;
+    features13.maintenance4 = VK_TRUE;
+    scalar_layout.pNext = &features13;
+
     VkPhysicalDeviceFeatures2 features2 = {};
     features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
     features2.pNext = &float16;
@@ -193,6 +243,19 @@ VkContext VkContext::Create(const VkContextCreateInfo& info) {
     pool_ci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
     vk_check(vkCreateCommandPool(ctx.device_, &pool_ci, nullptr, &ctx.command_pool_), "vkCreateCommandPool");
 
+    // Persistent command buffer (reset per dispatch, never freed individually).
+    VkCommandBufferAllocateInfo cb_ai = {};
+    cb_ai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    cb_ai.commandPool = ctx.command_pool_;
+    cb_ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cb_ai.commandBufferCount = 1;
+    vk_check(vkAllocateCommandBuffers(ctx.device_, &cb_ai, &ctx.command_buffer_), "vkAllocateCommandBuffers");
+
+    // Persistent fence (reset per dispatch, never destroyed individually).
+    VkFenceCreateInfo fence_ci = {};
+    fence_ci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    vk_check(vkCreateFence(ctx.device_, &fence_ci, nullptr, &ctx.fence_), "vkCreateFence");
+
     return ctx;
 }
 
@@ -214,6 +277,8 @@ VkContext& VkContext::operator=(VkContext&& other) noexcept {
     queue_ = std::exchange(other.queue_, VK_NULL_HANDLE);
     queue_family_index_ = std::exchange(other.queue_family_index_, UINT32_MAX);
     command_pool_ = std::exchange(other.command_pool_, VK_NULL_HANDLE);
+    command_buffer_ = std::exchange(other.command_buffer_, VK_NULL_HANDLE);
+    fence_ = std::exchange(other.fence_, VK_NULL_HANDLE);
     min_storage_buffer_offset_alignment_ = std::exchange(other.min_storage_buffer_offset_alignment_, VkDeviceSize{0});
 
     return *this;
@@ -221,6 +286,11 @@ VkContext& VkContext::operator=(VkContext&& other) noexcept {
 
 void VkContext::reset() noexcept {
     if (device_ != VK_NULL_HANDLE) {
+        if (fence_ != VK_NULL_HANDLE) {
+            vkDestroyFence(device_, fence_, nullptr);
+            fence_ = VK_NULL_HANDLE;
+        }
+        command_buffer_ = VK_NULL_HANDLE;
         if (command_pool_ != VK_NULL_HANDLE) {
             vkDestroyCommandPool(device_, command_pool_, nullptr);
             command_pool_ = VK_NULL_HANDLE;

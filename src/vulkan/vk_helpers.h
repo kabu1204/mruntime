@@ -103,5 +103,26 @@ inline VkDeviceSize align_up(VkDeviceSize n, VkDeviceSize align) {
     return (n + align - 1) & ~(align - 1);
 }
 
+inline std::vector<VkLayerProperties> enumerate_instance_layers() {
+    uint32_t count = 0;
+    vk_check(
+        vkEnumerateInstanceLayerProperties(&count, nullptr),
+        "vkEnumerateInstanceLayerProperties(count)");
+    std::vector<VkLayerProperties> layers(count);
+    vk_check(
+        vkEnumerateInstanceLayerProperties(&count, layers.data()),
+        "vkEnumerateInstanceLayerProperties(data)");
+    return layers;
+}
+
+inline bool has_layer(const std::vector<VkLayerProperties>& layers, const char* name) {
+    for (const auto& layer : layers) {
+        if (std::strcmp(layer.layerName, name) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 }  // namespace mruntime::vulkan
 

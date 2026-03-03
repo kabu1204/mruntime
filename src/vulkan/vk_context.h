@@ -38,6 +38,9 @@ class VkContext {
 
     VkCommandPool command_pool() const noexcept { return command_pool_; }
 
+    VkCommandBuffer command_buffer() const noexcept { return command_buffer_; }
+    VkFence fence() const noexcept { return fence_; }
+
     VkDeviceSize min_storage_buffer_offset_alignment() const noexcept {
         return min_storage_buffer_offset_alignment_;
     }
@@ -53,6 +56,8 @@ class VkContext {
     uint32_t queue_family_index_ = UINT32_MAX;
 
     VkCommandPool command_pool_ = VK_NULL_HANDLE;
+    VkCommandBuffer command_buffer_ = VK_NULL_HANDLE;
+    VkFence fence_ = VK_NULL_HANDLE;
     VkDeviceSize min_storage_buffer_offset_alignment_ = 0;
 };
 

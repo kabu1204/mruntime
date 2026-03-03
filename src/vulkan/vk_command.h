@@ -14,6 +14,8 @@ void end_command_buffer(VkCommandBuffer command_buffer);
 
 void submit_and_wait(VkDevice device, VkQueue queue, VkCommandBuffer command_buffer);
 
+void submit_and_wait_with_fence(VkDevice device, VkQueue queue, VkCommandBuffer command_buffer, VkFence fence);
+
 void cmd_buffer_barrier_to_host_read(
     VkCommandBuffer command_buffer,
     VkBuffer buffer,

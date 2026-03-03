@@ -51,12 +51,32 @@ void submit_and_wait(VkDevice device, VkQueue queue, VkCommandBuffer command_buf
         }
     } fence_guard = {device, fence};
 
-    VkSubmitInfo submit = {};
-    submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    submit.commandBufferCount = 1;
-    submit.pCommandBuffers = &command_buffer;
+    VkCommandBufferSubmitInfo cmd_info = {};
+    cmd_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO;
+    cmd_info.commandBuffer = command_buffer;
 
-    vk_check(vkQueueSubmit(queue, 1, &submit, fence), "vkQueueSubmit");
+    VkSubmitInfo2 submit = {};
+    submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2;
+    submit.commandBufferInfoCount = 1;
+    submit.pCommandBufferInfos = &cmd_info;
+
+    vk_check(vkQueueSubmit2(queue, 1, &submit, fence), "vkQueueSubmit2");
+    vk_check(vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX), "vkWaitForFences");
+}
+
+void submit_and_wait_with_fence(VkDevice device, VkQueue queue, VkCommandBuffer command_buffer, VkFence fence) {
+    vk_check(vkResetFences(device, 1, &fence), "vkResetFences");
+
+    VkCommandBufferSubmitInfo cmd_info = {};
+    cmd_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO;
+    cmd_info.commandBuffer = command_buffer;
+
+    VkSubmitInfo2 submit = {};
+    submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2;
+    submit.commandBufferInfoCount = 1;
+    submit.pCommandBufferInfos = &cmd_info;
+
+    vk_check(vkQueueSubmit2(queue, 1, &submit, fence), "vkQueueSubmit2");
     vk_check(vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX), "vkWaitForFences");
 }
 
@@ -66,25 +86,24 @@ void cmd_buffer_barrier_to_host_read(
     VkDeviceSize offset,
     VkDeviceSize size
 ) {
-    VkBufferMemoryBarrier barrier = {};
-    barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-    barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-    barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    VkBufferMemoryBarrier2 barrier = {};
+    barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2;
+    barrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    barrier.srcAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT;
+    barrier.dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT;
+    barrier.dstAccessMask = VK_ACCESS_2_HOST_READ_BIT;
     barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barrier.buffer = buffer;
     barrier.offset = offset;
     barrier.size = size;
 
-    vkCmdPipelineBarrier(
-        command_buffer,
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        VK_PIPELINE_STAGE_HOST_BIT,
-        0,
-        0, nullptr,
-        1, &barrier,
-        0, nullptr
-    );
+    VkDependencyInfo dep = {};
+    dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    dep.bufferMemoryBarrierCount = 1;
+    dep.pBufferMemoryBarriers = &barrier;
+
+    vkCmdPipelineBarrier2(command_buffer, &dep);
 }
 
 }  // namespace mruntime::vulkan
