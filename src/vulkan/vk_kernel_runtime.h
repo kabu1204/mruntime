@@ -2,6 +2,7 @@
 
 #include <vulkan/vulkan.h>
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -47,6 +48,9 @@ class VkKernelRuntime {
 
     VkKernel get_or_create_kernel(const KernelCreateInfo& info);
 
+    void set_timing_enabled(bool enabled) noexcept { timing_enabled_ = enabled; }
+    bool timing_enabled() const noexcept { return timing_enabled_; }
+
     void dispatch_1d(
         VkKernel kernel,
         const VkDescriptorBufferInfo* buffers,
@@ -74,6 +78,8 @@ class VkKernelRuntime {
     ) const;
 
   private:
+    void maybe_refresh_calibration() const;
+
     struct PipelineCacheKey {
         std::vector<uint8_t> spirv;
         uint32_t storage_buffer_count = 0;
@@ -88,6 +94,18 @@ class VkKernelRuntime {
 
     const VkContext* context_ = nullptr;
     std::unordered_map<PipelineCacheKey, std::unique_ptr<VkComputePipeline>, PipelineCacheKeyHash> pipeline_cache_;
+
+    bool timing_enabled_ = false;
+
+    struct CalibrationCache {
+        bool valid = false;
+        uint64_t device_ticks = 0;
+        uint64_t host_ns = 0;
+        uint64_t max_dev_ns = 0;
+        int64_t trace_base_us = 0;
+        std::chrono::steady_clock::time_point sampled_at = {};
+    };
+    mutable CalibrationCache calibration_cache_;
 };
 
 }  // namespace mruntime::vulkan

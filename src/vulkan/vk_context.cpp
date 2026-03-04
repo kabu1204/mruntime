@@ -79,6 +79,10 @@ bool device_supports_required_extensions(VkPhysicalDevice physical_device, bool*
     return true;
 }
 
+bool has_time_domain(const std::vector<VkTimeDomainKHR>& domains, VkTimeDomainKHR domain) {
+    return std::find(domains.begin(), domains.end(), domain) != domains.end();
+}
+
 }  // namespace
 
 VkContext VkContext::Create(const VkContextCreateInfo& info) {
@@ -184,6 +188,33 @@ VkContext VkContext::Create(const VkContextCreateInfo& info) {
     VkPhysicalDeviceProperties props = {};
     vkGetPhysicalDeviceProperties(ctx.physical_device_, &props);
     ctx.min_storage_buffer_offset_alignment_ = props.limits.minStorageBufferOffsetAlignment;
+    ctx.timestamp_period_ns_ = props.limits.timestampPeriod;
+
+    // Timestamp queries: check support on the selected queue family.
+    {
+        uint32_t qf_count = 0;
+        vkGetPhysicalDeviceQueueFamilyProperties(ctx.physical_device_, &qf_count, nullptr);
+        std::vector<VkQueueFamilyProperties> qf_props(qf_count);
+        vkGetPhysicalDeviceQueueFamilyProperties(ctx.physical_device_, &qf_count, qf_props.data());
+        if (queue_family_index < qf_count) {
+            ctx.timestamp_valid_bits_ = qf_props[queue_family_index].timestampValidBits;
+        }
+    }
+
+    // Optional calibrated timestamps extension (prefer KHR, fall back to EXT alias).
+    const auto dev_exts = enumerate_device_extensions(ctx.physical_device_);
+    const char* calibrated_ext_name = nullptr;
+#if defined(VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME)
+    if (has_extension(dev_exts, VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME)) {
+        calibrated_ext_name = VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME;
+    }
+#endif
+#if defined(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME)
+    if (calibrated_ext_name == nullptr &&
+        has_extension(dev_exts, VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME)) {
+        calibrated_ext_name = VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME;
+    }
+#endif
 
     const float queue_priority = 1.0f;
     VkDeviceQueueCreateInfo q_ci = {};
@@ -224,6 +255,9 @@ VkContext VkContext::Create(const VkContextCreateInfo& info) {
     if (selected_has_portability_subset) {
         enabled_dev_exts.push_back(kKhrPortabilitySubsetExtensionName);
     }
+    if (calibrated_ext_name != nullptr) {
+        enabled_dev_exts.push_back(calibrated_ext_name);
+    }
 
     VkDeviceCreateInfo dev_ci = {};
     dev_ci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
@@ -234,6 +268,17 @@ VkContext VkContext::Create(const VkContextCreateInfo& info) {
     dev_ci.ppEnabledExtensionNames = enabled_dev_exts.data();
 
     vk_check(vkCreateDevice(ctx.physical_device_, &dev_ci, nullptr, &ctx.device_), "vkCreateDevice");
+
+    // Timestamp query pool: optional.
+    if (ctx.timestamp_period_ns_ > 0.0f && ctx.timestamp_valid_bits_ > 0) {
+        VkQueryPoolCreateInfo qp_ci = {};
+        qp_ci.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+        qp_ci.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        qp_ci.queryCount = 2;
+        if (vkCreateQueryPool(ctx.device_, &qp_ci, nullptr, &ctx.timestamp_query_pool_) != VK_SUCCESS) {
+            ctx.timestamp_query_pool_ = VK_NULL_HANDLE;
+        }
+    }
 
     VkPipelineCacheCreateInfo cache_ci = {};
     cache_ci.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
@@ -260,6 +305,50 @@ VkContext VkContext::Create(const VkContextCreateInfo& info) {
     fence_ci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
     vk_check(vkCreateFence(ctx.device_, &fence_ci, nullptr, &ctx.fence_), "vkCreateFence");
 
+    // Optional calibrated timestamps support (best-effort).
+    if (calibrated_ext_name != nullptr) {
+        ctx.get_time_domains_ =
+            reinterpret_cast<PFN_vkGetPhysicalDeviceCalibrateableTimeDomainsKHR>(
+                vkGetInstanceProcAddr(ctx.instance_, "vkGetPhysicalDeviceCalibrateableTimeDomainsKHR"));
+        if (ctx.get_time_domains_ == nullptr) {
+            ctx.get_time_domains_ =
+                reinterpret_cast<PFN_vkGetPhysicalDeviceCalibrateableTimeDomainsKHR>(
+                    vkGetInstanceProcAddr(ctx.instance_, "vkGetPhysicalDeviceCalibrateableTimeDomainsEXT"));
+        }
+
+        ctx.get_calibrated_timestamps_ =
+            reinterpret_cast<PFN_vkGetCalibratedTimestampsKHR>(
+                vkGetDeviceProcAddr(ctx.device_, "vkGetCalibratedTimestampsKHR"));
+        if (ctx.get_calibrated_timestamps_ == nullptr) {
+            ctx.get_calibrated_timestamps_ =
+                reinterpret_cast<PFN_vkGetCalibratedTimestampsKHR>(
+                    vkGetDeviceProcAddr(ctx.device_, "vkGetCalibratedTimestampsEXT"));
+        }
+
+        if (ctx.get_time_domains_ != nullptr && ctx.get_calibrated_timestamps_ != nullptr) {
+            uint32_t domain_count = 0;
+            if (ctx.get_time_domains_(ctx.physical_device_, &domain_count, nullptr) == VK_SUCCESS &&
+                domain_count > 0) {
+                std::vector<VkTimeDomainKHR> domains(domain_count);
+                if (ctx.get_time_domains_(ctx.physical_device_, &domain_count, domains.data()) == VK_SUCCESS) {
+                    VkTimeDomainKHR host_domain = static_cast<VkTimeDomainKHR>(0);
+
+                    // Prefer CLOCK_MONOTONIC, which most closely matches std::chrono::steady_clock on common platforms.
+                    if (has_time_domain(domains, VK_TIME_DOMAIN_CLOCK_MONOTONIC_KHR)) {
+                        host_domain = VK_TIME_DOMAIN_CLOCK_MONOTONIC_KHR;
+                    } else if (has_time_domain(domains, VK_TIME_DOMAIN_CLOCK_MONOTONIC_RAW_KHR)) {
+                        host_domain = VK_TIME_DOMAIN_CLOCK_MONOTONIC_RAW_KHR;
+                    }
+
+                    if (host_domain != static_cast<VkTimeDomainKHR>(0)) {
+                        ctx.calibrated_host_domain_ = host_domain;
+                        ctx.calibrated_host_domain_is_ns_ = true;
+                    }
+                }
+            }
+        }
+    }
+
     return ctx;
 }
 
@@ -284,7 +373,15 @@ VkContext& VkContext::operator=(VkContext&& other) noexcept {
     command_pool_ = std::exchange(other.command_pool_, VK_NULL_HANDLE);
     command_buffer_ = std::exchange(other.command_buffer_, VK_NULL_HANDLE);
     fence_ = std::exchange(other.fence_, VK_NULL_HANDLE);
+    timestamp_query_pool_ = std::exchange(other.timestamp_query_pool_, VK_NULL_HANDLE);
     min_storage_buffer_offset_alignment_ = std::exchange(other.min_storage_buffer_offset_alignment_, VkDeviceSize{0});
+    timestamp_period_ns_ = std::exchange(other.timestamp_period_ns_, 0.0f);
+    timestamp_valid_bits_ = std::exchange(other.timestamp_valid_bits_, 0u);
+
+    get_time_domains_ = std::exchange(other.get_time_domains_, nullptr);
+    get_calibrated_timestamps_ = std::exchange(other.get_calibrated_timestamps_, nullptr);
+    calibrated_host_domain_ = std::exchange(other.calibrated_host_domain_, static_cast<VkTimeDomainKHR>(0));
+    calibrated_host_domain_is_ns_ = std::exchange(other.calibrated_host_domain_is_ns_, false);
 
     return *this;
 }
@@ -293,6 +390,10 @@ void VkContext::reset() noexcept {
     if (device_ != VK_NULL_HANDLE) {
         vkDeviceWaitIdle(device_);
 
+        if (timestamp_query_pool_ != VK_NULL_HANDLE) {
+            vkDestroyQueryPool(device_, timestamp_query_pool_, nullptr);
+            timestamp_query_pool_ = VK_NULL_HANDLE;
+        }
         if (fence_ != VK_NULL_HANDLE) {
             vkDestroyFence(device_, fence_, nullptr);
             fence_ = VK_NULL_HANDLE;
@@ -314,11 +415,52 @@ void VkContext::reset() noexcept {
     queue_ = VK_NULL_HANDLE;
     queue_family_index_ = UINT32_MAX;
     physical_device_ = VK_NULL_HANDLE;
+    timestamp_period_ns_ = 0.0f;
+    timestamp_valid_bits_ = 0u;
+
+    get_time_domains_ = nullptr;
+    get_calibrated_timestamps_ = nullptr;
+    calibrated_host_domain_ = static_cast<VkTimeDomainKHR>(0);
+    calibrated_host_domain_is_ns_ = false;
 
     if (instance_ != VK_NULL_HANDLE) {
         vkDestroyInstance(instance_, nullptr);
         instance_ = VK_NULL_HANDLE;
     }
+}
+
+bool VkContext::supports_calibrated_timestamps() const noexcept {
+    return device_ != VK_NULL_HANDLE &&
+           get_time_domains_ != nullptr &&
+           get_calibrated_timestamps_ != nullptr &&
+           calibrated_host_domain_is_ns_;
+}
+
+bool VkContext::calibrated_timestamps_sample(uint64_t* out_device_ticks, uint64_t* out_host_ns, uint64_t* out_max_dev_ns) const {
+    if (out_device_ticks == nullptr || out_host_ns == nullptr || out_max_dev_ns == nullptr) {
+        throw std::runtime_error("VkContext::calibrated_timestamps_sample: output pointer is null");
+    }
+    if (!supports_calibrated_timestamps()) {
+        return false;
+    }
+
+    const VkTimeDomainKHR device_domain = VK_TIME_DOMAIN_DEVICE_KHR;
+
+    VkCalibratedTimestampInfoKHR infos[2] = {};
+    infos[0].sType = VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_KHR;
+    infos[0].timeDomain = device_domain;
+    infos[1].sType = VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_KHR;
+    infos[1].timeDomain = calibrated_host_domain_;
+
+    uint64_t timestamps[2] = {};
+    uint64_t max_dev_ns = 0;
+    VkResult result = get_calibrated_timestamps_(device_, 2, infos, timestamps, &max_dev_ns);
+    vk_check(result, "vkGetCalibratedTimestampsKHR/EXT");
+
+    *out_device_ticks = timestamps[0];
+    *out_host_ns = timestamps[1];
+    *out_max_dev_ns = max_dev_ns;
+    return true;
 }
 
 }  // namespace mruntime::vulkan

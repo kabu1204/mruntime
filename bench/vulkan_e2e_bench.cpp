@@ -32,6 +32,7 @@ struct Args {
     size_t num_threads = 0;  // 0 = auto
 
     bool trace = true;
+    bool vk_timing = false;
     std::string trace_json = "trace.json";
 
     // Sampling config (default: greedy + no EOS so decode length is fixed)
@@ -100,6 +101,7 @@ auto print_usage(const char* argv0) -> void {
         << "  --threads N             Number of threads (default: auto-detect)\n"
         << "  --eos-token-id ID       Stop token id (<0 disables; default: -1)\n"
         << "  --trace 0|1             Enable trace collection (default: 1)\n"
+        << "  --vk-timing 0|1         Enable Vulkan CPU/GPU timing trace enrichment (default: 0)\n"
         << "  --trace-json PATH       Export Chrome trace JSON (default: trace.json)\n"
         << "  -h, --help              Show this help\n";
 }
@@ -134,6 +136,8 @@ auto parse_args(int argc, char** argv) -> Args {
             args.eos_token_id = static_cast<int32_t>(std::stoll(require_value("--eos-token-id")));
         } else if (a == "--trace") {
             args.trace = (std::stoi(require_value("--trace")) != 0);
+        } else if (a == "--vk-timing") {
+            args.vk_timing = (std::stoi(require_value("--vk-timing")) != 0);
         } else if (a == "--trace-json") {
             args.trace_json = require_value("--trace-json");
         } else {
@@ -218,8 +222,13 @@ int main(int argc, char** argv) {
             }
         }
 
+        if (args.vk_timing && !args.trace) {
+            throw std::runtime_error("--vk-timing requires --trace 1");
+        }
+
         mruntime::TraceCollector::instance().set_enabled(args.trace);
         mruntime::TraceCollector::instance().reset();
+        mruntime::qwen2_vk_set_timing_enabled(*vk_state, args.vk_timing);
 
         std::vector<int32_t> output_tokens(args.prompt_len + args.max_new_tokens);
         std::copy(prompt_tokens.begin(), prompt_tokens.end(), output_tokens.begin());

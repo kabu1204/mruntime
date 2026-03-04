@@ -31,6 +31,10 @@ Qwen2VkStatePtr qwen2_vk_create(
 
 void qwen2_vk_reset_kv_cache(Qwen2VkState& state);
 
+// Enable/disable Vulkan dispatch timing enrichment in trace output (GPU kernel timestamps + CPU submit/wait).
+// Note: Has no effect unless `TraceCollector` is enabled.
+void qwen2_vk_set_timing_enabled(Qwen2VkState& state, bool enabled);
+
 uint16_t* qwen2_forward_vk(
     Qwen2VkState& state,
     const int32_t* token_ids,

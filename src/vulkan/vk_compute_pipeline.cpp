@@ -1,9 +1,12 @@
 #include "vk_compute_pipeline.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <stdexcept>
 #include <utility>
 #include <vector>
+
+#include "mruntime/trace.h"
 
 #include "vk_command.h"
 #include "vk_helpers.h"
@@ -173,7 +176,8 @@ void VkComputePipeline::dispatch_and_wait(
     VkBuffer host_read_buffer,
     VkDeviceSize host_read_offset,
     VkDeviceSize host_read_size,
-    VkQueryPool query_pool
+    VkQueryPool query_pool,
+    const VkDispatchTraceInfo* trace
 ) const {
     if (device_ == VK_NULL_HANDLE || ctx.device() != device_) {
         throw std::runtime_error("VkComputePipeline::dispatch_and_wait: invalid device/context");
@@ -188,43 +192,207 @@ void VkComputePipeline::dispatch_and_wait(
         throw std::runtime_error("VkComputePipeline::dispatch_and_wait: push_constants is null");
     }
 
-    vkUpdateDescriptorSetWithTemplate(device_, descriptor_set_, descriptor_update_template_, buffers);
+    const bool enable_trace =
+        trace != nullptr &&
+        trace->enable_timing_trace &&
+        ::mruntime::TraceCollector::instance().is_enabled();
 
-    VkCommandBuffer cb = ctx.command_buffer();
-    vk_check(vkResetCommandBuffer(cb, 0), "vkResetCommandBuffer");
+    const int64_t dispatch_start_us =
+        enable_trace ? ::mruntime::TraceCollector::instance().now_us() : 0;
 
-    begin_command_buffer(cb);
+    int64_t submit_end_us = dispatch_start_us;
+    int64_t dispatch_end_us = dispatch_start_us;
 
-    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_);
-    vkCmdBindDescriptorSets(
-        cb,
-        VK_PIPELINE_BIND_POINT_COMPUTE,
-        pipeline_layout_,
-        0,
-        1,
-        &descriptor_set_,
-        0,
-        nullptr
-    );
-    if (push_constant_size_ > 0) {
-        vkCmdPushConstants(cb, pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, push_constant_size_, push_constants);
+    if (enable_trace) {
+        ::mruntime::ScopedTrace dispatch_scope("vk.dispatch", "vulkan.cpu");
+        const VkFence fence = ctx.fence();
+
+        {
+            ::mruntime::ScopedTrace launch_scope("vk.launch", "vulkan.cpu");
+
+            vkUpdateDescriptorSetWithTemplate(device_, descriptor_set_, descriptor_update_template_, buffers);
+
+            VkCommandBuffer cb = ctx.command_buffer();
+            vk_check(vkResetCommandBuffer(cb, 0), "vkResetCommandBuffer");
+
+            begin_command_buffer(cb);
+
+            vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_);
+            vkCmdBindDescriptorSets(
+                cb,
+                VK_PIPELINE_BIND_POINT_COMPUTE,
+                pipeline_layout_,
+                0,
+                1,
+                &descriptor_set_,
+                0,
+                nullptr
+            );
+            if (push_constant_size_ > 0) {
+                vkCmdPushConstants(
+                    cb,
+                    pipeline_layout_,
+                    VK_SHADER_STAGE_COMPUTE_BIT,
+                    0,
+                    push_constant_size_,
+                    push_constants
+                );
+            }
+
+            if (query_pool != VK_NULL_HANDLE) {
+                vkCmdResetQueryPool(cb, query_pool, 0, 2);
+                vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, query_pool, 0);
+            }
+            vkCmdDispatch(cb, group_count_x, group_count_y, group_count_z);
+            if (query_pool != VK_NULL_HANDLE) {
+                vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, query_pool, 1);
+            }
+
+            if (host_read_buffer != VK_NULL_HANDLE && host_read_size > 0) {
+                cmd_buffer_barrier_to_host_read(cb, host_read_buffer, host_read_offset, host_read_size);
+            }
+
+            end_command_buffer(cb);
+
+            vk_check(vkResetFences(device_, 1, &fence), "vkResetFences");
+
+            VkCommandBufferSubmitInfo cmd_info = {};
+            cmd_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO;
+            cmd_info.commandBuffer = cb;
+
+            VkSubmitInfo2 submit = {};
+            submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2;
+            submit.commandBufferInfoCount = 1;
+            submit.pCommandBufferInfos = &cmd_info;
+
+            vk_check(vkQueueSubmit2(ctx.queue(), 1, &submit, fence), "vkQueueSubmit2");
+            submit_end_us = ::mruntime::TraceCollector::instance().now_us();
+        }
+
+        {
+            ::mruntime::ScopedTrace wait_scope("vk.wait", "vulkan.cpu");
+            vk_check(vkWaitForFences(device_, 1, &fence, VK_TRUE, UINT64_MAX), "vkWaitForFences");
+        }
+
+        dispatch_end_us = ::mruntime::TraceCollector::instance().now_us();
+
+        const float timestamp_period_ns = ctx.timestamp_period_ns();
+        const uint32_t valid_bits = ctx.timestamp_valid_bits();
+        const bool has_gpu_timestamps =
+            query_pool != VK_NULL_HANDLE && timestamp_period_ns > 0.0f && valid_bits > 0;
+
+        if (has_gpu_timestamps) {
+            uint64_t timestamps[2] = {};
+            VkResult result = vkGetQueryPoolResults(
+                device_,
+                query_pool,
+                0,
+                2,
+                sizeof(timestamps),
+                timestamps,
+                sizeof(uint64_t),
+                VK_QUERY_RESULT_64_BIT
+            );
+            if (result == VK_SUCCESS) {
+                const uint64_t start_ticks = timestamps[0];
+                const uint64_t end_ticks = timestamps[1];
+
+                uint64_t delta_ticks = 0;
+                if (valid_bits >= 64) {
+                    delta_ticks = end_ticks - start_ticks;
+                } else {
+                    const uint64_t mask = (uint64_t{1} << valid_bits) - 1;
+                    delta_ticks = (end_ticks - start_ticks) & mask;
+                }
+
+                const double kernel_dur_us_d =
+                    (static_cast<double>(delta_ticks) * static_cast<double>(timestamp_period_ns)) / 1000.0;
+                const int64_t kernel_dur_us = std::max<int64_t>(0, static_cast<int64_t>(kernel_dur_us_d));
+
+                // Without calibrated timestamps, place the kernel at submit time (it cannot start earlier).
+                int64_t kernel_start_us = submit_end_us;
+                bool calibrated = false;
+
+                if (trace->has_calibrated_timestamps && trace->calibrated_trace_base_us != 0) {
+                    uint64_t dticks = 0;
+                    if (valid_bits >= 64) {
+                        dticks = start_ticks - trace->calibrated_device_ticks;
+                    } else {
+                        const uint64_t mask = (uint64_t{1} << valid_bits) - 1;
+                        dticks = (start_ticks - trace->calibrated_device_ticks) & mask;
+                    }
+
+                    const double delta_us =
+                        (static_cast<double>(dticks) * static_cast<double>(timestamp_period_ns)) / 1000.0;
+                    kernel_start_us = trace->calibrated_trace_base_us + static_cast<int64_t>(delta_us);
+                    calibrated = true;
+                }
+
+                // Sanity-check placement; fall back to dispatch start if calibration is clearly off.
+                if (kernel_start_us < dispatch_start_us || kernel_start_us > dispatch_end_us) {
+                    kernel_start_us = submit_end_us;
+                    calibrated = false;
+                }
+
+                const int64_t queue_delay_us = std::max<int64_t>(0, kernel_start_us - submit_end_us);
+
+                ::mruntime::trace_complete_at(
+                    "vk.kernel",
+                    "vulkan.gpu",
+                    kernel_start_us,
+                    kernel_dur_us,
+                    {
+                        ::mruntime::trace_arg("calibrated", calibrated ? 1 : 0),
+                        ::mruntime::trace_arg("max_dev_ns", static_cast<int64_t>(trace->calibrated_max_dev_ns)),
+                        ::mruntime::trace_arg("queue_delay_us", queue_delay_us),
+                        ::mruntime::trace_arg("gx", static_cast<int64_t>(group_count_x)),
+                        ::mruntime::trace_arg("gy", static_cast<int64_t>(group_count_y)),
+                        ::mruntime::trace_arg("gz", static_cast<int64_t>(group_count_z)),
+                    }
+                );
+            } else if (result != VK_NOT_READY) {
+                vk_check(result, "vkGetQueryPoolResults");
+            }
+        }
+    } else {
+        vkUpdateDescriptorSetWithTemplate(device_, descriptor_set_, descriptor_update_template_, buffers);
+
+        VkCommandBuffer cb = ctx.command_buffer();
+        vk_check(vkResetCommandBuffer(cb, 0), "vkResetCommandBuffer");
+
+        begin_command_buffer(cb);
+
+        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_);
+        vkCmdBindDescriptorSets(
+            cb,
+            VK_PIPELINE_BIND_POINT_COMPUTE,
+            pipeline_layout_,
+            0,
+            1,
+            &descriptor_set_,
+            0,
+            nullptr
+        );
+        if (push_constant_size_ > 0) {
+            vkCmdPushConstants(cb, pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, push_constant_size_, push_constants);
+        }
+
+        if (query_pool != VK_NULL_HANDLE) {
+            vkCmdResetQueryPool(cb, query_pool, 0, 2);
+            vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, query_pool, 0);
+        }
+        vkCmdDispatch(cb, group_count_x, group_count_y, group_count_z);
+        if (query_pool != VK_NULL_HANDLE) {
+            vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, query_pool, 1);
+        }
+
+        if (host_read_buffer != VK_NULL_HANDLE && host_read_size > 0) {
+            cmd_buffer_barrier_to_host_read(cb, host_read_buffer, host_read_offset, host_read_size);
+        }
+
+        end_command_buffer(cb);
+        submit_and_wait_with_fence(device_, ctx.queue(), cb, ctx.fence());
     }
-
-    if (query_pool != VK_NULL_HANDLE) {
-        vkCmdResetQueryPool(cb, query_pool, 0, 2);
-        vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, query_pool, 0);
-    }
-    vkCmdDispatch(cb, group_count_x, group_count_y, group_count_z);
-    if (query_pool != VK_NULL_HANDLE) {
-        vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, query_pool, 1);
-    }
-
-    if (host_read_buffer != VK_NULL_HANDLE && host_read_size > 0) {
-        cmd_buffer_barrier_to_host_read(cb, host_read_buffer, host_read_offset, host_read_size);
-    }
-
-    end_command_buffer(cb);
-    submit_and_wait_with_fence(device_, ctx.queue(), cb, ctx.fence());
 }
 
 void VkComputePipeline::destroy() noexcept {

@@ -310,6 +310,47 @@ inline void trace_counter(const char* name, int64_t value, const char* category 
     });
 }
 
+// Emit a "Complete" event at an explicit timestamp/duration.
+// Intended for sources whose timing is not derived from CPU wall-clock (e.g. GPU timestamps).
+inline void trace_complete_at(
+    const char* name,
+    const char* category,
+    int64_t timestamp_us,
+    int64_t duration_us,
+    std::initializer_list<TraceArg> args = {}
+) {
+    if (!TraceCollector::instance().is_enabled()) return;
+
+    if (duration_us < 0) {
+        duration_us = 0;
+    }
+
+    TraceEvent event{
+        .name = name,
+        .category = category,
+        .timestamp_us = timestamp_us,
+        .duration_us = duration_us,
+        .thread_id = TraceCollector::instance().current_thread_id(),
+        .id = 0,
+        .parent_id = 0,
+        .type = TraceEventType::Complete,
+        .counter_value = 0,
+        .args_count = 0,
+    };
+
+    // Attach to the current live trace scope (if any).
+    auto& stack = detail::trace_stack();
+    event.parent_id = stack.empty() ? 0 : stack.back();
+
+    for (const auto& a : args) {
+        if (event.args_count < kMaxTraceArgs) {
+            event.args[event.args_count++] = a;
+        }
+    }
+
+    TraceCollector::instance().add_event(event);
+}
+
 }  // namespace mruntime
 
 // Convenience macros - can be disabled at compile time

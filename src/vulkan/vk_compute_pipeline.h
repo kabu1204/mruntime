@@ -17,6 +17,18 @@ struct ComputePipelineCreateInfo {
     VkPipelineCache pipeline_cache = VK_NULL_HANDLE;
 };
 
+struct VkDispatchTraceInfo {
+    bool enable_timing_trace = false;
+
+    // Calibrated timestamp mapping (best-effort).
+    // When `has_calibrated_timestamps` is true, `calibrated_device_ticks` and
+    // `calibrated_trace_base_us` define the mapping anchor.
+    bool has_calibrated_timestamps = false;
+    uint64_t calibrated_device_ticks = 0;
+    int64_t calibrated_trace_base_us = 0;
+    uint64_t calibrated_max_dev_ns = 0;
+};
+
 class VkComputePipeline {
   public:
     VkComputePipeline() = default;
@@ -46,7 +58,8 @@ class VkComputePipeline {
         VkBuffer host_read_buffer = VK_NULL_HANDLE,
         VkDeviceSize host_read_offset = 0,
         VkDeviceSize host_read_size = 0,
-        VkQueryPool query_pool = VK_NULL_HANDLE
+        VkQueryPool query_pool = VK_NULL_HANDLE,
+        const VkDispatchTraceInfo* trace = nullptr
     ) const;
 
   private:

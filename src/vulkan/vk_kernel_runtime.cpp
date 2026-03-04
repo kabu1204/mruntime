@@ -2,8 +2,13 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <limits>
 #include <stdexcept>
 #include <vector>
+
+#include "mruntime/trace.h"
+#include "vk_helpers.h"
 
 namespace mruntime::vulkan {
 
@@ -130,6 +135,71 @@ VkKernel VkKernelRuntime::get_or_create_kernel(const KernelCreateInfo& info) {
     return kernel;
 }
 
+void VkKernelRuntime::maybe_refresh_calibration() const {
+    if (context_ == nullptr) {
+        return;
+    }
+    if (!context_->supports_calibrated_timestamps()) {
+        calibration_cache_.valid = false;
+        return;
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    if (calibration_cache_.valid) {
+        const auto age = now - calibration_cache_.sampled_at;
+        if (age <= std::chrono::milliseconds(100)) {
+            return;
+        }
+    }
+
+    CalibrationCache best;
+    uint64_t best_max_dev_ns = std::numeric_limits<uint64_t>::max();
+
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        const int64_t t0 = ::mruntime::TraceCollector::instance().now_us();
+        uint64_t device_ticks = 0;
+        uint64_t host_ns = 0;
+        uint64_t max_dev_ns = 0;
+
+        bool ok = false;
+        try {
+            ok = context_->calibrated_timestamps_sample(&device_ticks, &host_ns, &max_dev_ns);
+        } catch (const VulkanError& e) {
+            if (e.result() == VK_ERROR_EXTENSION_NOT_PRESENT) {
+                calibration_cache_.valid = false;
+                return;
+            }
+            throw;
+        }
+        const int64_t t1 = ::mruntime::TraceCollector::instance().now_us();
+
+        if (!ok) {
+            continue;
+        }
+
+        if (max_dev_ns < best_max_dev_ns) {
+            best.valid = true;
+            best.device_ticks = device_ticks;
+            best.host_ns = host_ns;
+            best.max_dev_ns = max_dev_ns;
+            best.trace_base_us = (t0 + t1) / 2;
+            best.sampled_at = now;
+            best_max_dev_ns = max_dev_ns;
+        }
+
+        // Stop early if we get a reasonably tight calibration.
+        if (max_dev_ns <= 50'000) {  // 50us
+            break;
+        }
+    }
+
+    if (best.valid) {
+        calibration_cache_ = best;
+    } else {
+        calibration_cache_.valid = false;
+    }
+}
+
 void VkKernelRuntime::dispatch_1d(
     VkKernel kernel,
     const VkDescriptorBufferInfo* buffers,
@@ -182,6 +252,30 @@ void VkKernelRuntime::dispatch_1d(
         &host_read_size
     );
 
+    const bool enable_trace =
+        timing_enabled_ && ::mruntime::TraceCollector::instance().is_enabled();
+
+    VkQueryPool effective_query_pool = query_pool;
+    if (effective_query_pool == VK_NULL_HANDLE && enable_trace) {
+        effective_query_pool = context_->timestamp_query_pool();
+    }
+
+    VkDispatchTraceInfo trace_info;
+    const VkDispatchTraceInfo* trace_ptr = nullptr;
+    if (enable_trace) {
+        maybe_refresh_calibration();
+
+        trace_info.enable_timing_trace = true;
+        if (calibration_cache_.valid) {
+            trace_info.calibrated_device_ticks = calibration_cache_.device_ticks;
+            trace_info.calibrated_trace_base_us = calibration_cache_.trace_base_us;
+            trace_info.calibrated_max_dev_ns = calibration_cache_.max_dev_ns;
+            trace_info.has_calibrated_timestamps = (calibration_cache_.max_dev_ns <= 1'000'000);  // 1ms
+        }
+
+        trace_ptr = &trace_info;
+    }
+
     kernel.pipeline->dispatch_and_wait(
         *context_,
         normalized_buffers,
@@ -194,7 +288,8 @@ void VkKernelRuntime::dispatch_1d(
         host_read_buffer,
         host_read_offset,
         host_read_size,
-        query_pool
+        effective_query_pool,
+        trace_ptr
     );
 }
 
@@ -253,6 +348,30 @@ void VkKernelRuntime::dispatch_2d(
         &host_read_size
     );
 
+    const bool enable_trace =
+        timing_enabled_ && ::mruntime::TraceCollector::instance().is_enabled();
+
+    VkQueryPool effective_query_pool = query_pool;
+    if (effective_query_pool == VK_NULL_HANDLE && enable_trace) {
+        effective_query_pool = context_->timestamp_query_pool();
+    }
+
+    VkDispatchTraceInfo trace_info;
+    const VkDispatchTraceInfo* trace_ptr = nullptr;
+    if (enable_trace) {
+        maybe_refresh_calibration();
+
+        trace_info.enable_timing_trace = true;
+        if (calibration_cache_.valid) {
+            trace_info.calibrated_device_ticks = calibration_cache_.device_ticks;
+            trace_info.calibrated_trace_base_us = calibration_cache_.trace_base_us;
+            trace_info.calibrated_max_dev_ns = calibration_cache_.max_dev_ns;
+            trace_info.has_calibrated_timestamps = (calibration_cache_.max_dev_ns <= 1'000'000);  // 1ms
+        }
+
+        trace_ptr = &trace_info;
+    }
+
     kernel.pipeline->dispatch_and_wait(
         *context_,
         normalized_buffers,
@@ -265,7 +384,8 @@ void VkKernelRuntime::dispatch_2d(
         host_read_buffer,
         host_read_offset,
         host_read_size,
-        query_pool
+        effective_query_pool,
+        trace_ptr
     );
 }
 

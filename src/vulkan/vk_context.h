@@ -42,9 +42,21 @@ class VkContext {
     VkCommandBuffer command_buffer() const noexcept { return command_buffer_; }
     VkFence fence() const noexcept { return fence_; }
 
+    VkQueryPool timestamp_query_pool() const noexcept { return timestamp_query_pool_; }
+    float timestamp_period_ns() const noexcept { return timestamp_period_ns_; }
+    uint32_t timestamp_valid_bits() const noexcept { return timestamp_valid_bits_; }
+
     VkDeviceSize min_storage_buffer_offset_alignment() const noexcept {
         return min_storage_buffer_offset_alignment_;
     }
+
+    bool supports_calibrated_timestamps() const noexcept;
+
+    // Sample calibrated timestamps from the device and a host time domain.
+    // Returns false when calibrated timestamps are unsupported or no suitable host time domain is available.
+    //
+    // `out_host_ns` is in nanoseconds for the supported host time domains (CLOCK_MONOTONIC / CLOCK_MONOTONIC_RAW).
+    bool calibrated_timestamps_sample(uint64_t* out_device_ticks, uint64_t* out_host_ns, uint64_t* out_max_dev_ns) const;
 
   private:
     void reset() noexcept;
@@ -60,7 +72,16 @@ class VkContext {
     VkCommandPool command_pool_ = VK_NULL_HANDLE;
     VkCommandBuffer command_buffer_ = VK_NULL_HANDLE;
     VkFence fence_ = VK_NULL_HANDLE;
+    VkQueryPool timestamp_query_pool_ = VK_NULL_HANDLE;
     VkDeviceSize min_storage_buffer_offset_alignment_ = 0;
+
+    float timestamp_period_ns_ = 0.0f;
+    uint32_t timestamp_valid_bits_ = 0;
+
+    PFN_vkGetPhysicalDeviceCalibrateableTimeDomainsKHR get_time_domains_ = nullptr;
+    PFN_vkGetCalibratedTimestampsKHR get_calibrated_timestamps_ = nullptr;
+    VkTimeDomainKHR calibrated_host_domain_ = static_cast<VkTimeDomainKHR>(0);
+    bool calibrated_host_domain_is_ns_ = false;
 };
 
 }  // namespace mruntime::vulkan

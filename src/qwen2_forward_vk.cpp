@@ -805,6 +805,10 @@ void qwen2_vk_reset_kv_cache(Qwen2VkState& state) {
     state.kv_cache.seq_len = 0;
 }
 
+void qwen2_vk_set_timing_enabled(Qwen2VkState& state, bool enabled) {
+    state.runtime.set_timing_enabled(enabled);
+}
+
 uint16_t* qwen2_forward_vk(
     Qwen2VkState& state,
     const int32_t* token_ids,
