@@ -11,6 +11,7 @@ option(MRUNTIME_BUILD_TESTS "Build unit tests" ON)
 option(MRUNTIME_BUILD_BENCH "Build benchmarks" ON)
 option(MRUNTIME_BUILD_CLI "Build CLI tools" ON)
 option(MRUNTIME_ENABLE_VULKAN "Enable Vulkan backend (experimental)" OFF)
+option(MRUNTIME_ENABLE_VULKAN_SLANG "Use Slang instead of GLSL for Vulkan shaders (experimental)" OFF)
 
 include(FetchContent)
 
@@ -82,20 +83,40 @@ set(MRUNTIME_VULKAN_SHADER_HEADERS "")
 if(MRUNTIME_ENABLE_VULKAN)
     find_package(Vulkan REQUIRED)
 
-    # Used to compile GLSL compute shaders into SPIR-V during the build.
-    # Vulkan SDK provides this tool.
-    find_program(MRUNTIME_GLSLANG_VALIDATOR_EXECUTABLE NAMES glslangValidator)
-    if(NOT MRUNTIME_GLSLANG_VALIDATOR_EXECUTABLE)
-        message(
-            FATAL_ERROR
-            "glslangValidator not found. Install Vulkan SDK or set MRUNTIME_GLSLANG_VALIDATOR_EXECUTABLE."
+    if(MRUNTIME_ENABLE_VULKAN_SLANG)
+        # Used to compile Slang compute shaders into SPIR-V during the build.
+        # Vulkan SDK may provide this tool.
+        if(DEFINED MRUNTIME_SLANGC_EXECUTABLE AND MRUNTIME_SLANGC_EXECUTABLE STREQUAL "")
+            unset(MRUNTIME_SLANGC_EXECUTABLE CACHE)
+        endif()
+
+        find_program(
+            MRUNTIME_SLANGC_EXECUTABLE
+            NAMES slangc
+            DOC "Path to slangc"
         )
+        if(NOT MRUNTIME_SLANGC_EXECUTABLE OR NOT EXISTS "${MRUNTIME_SLANGC_EXECUTABLE}")
+            message(
+                FATAL_ERROR
+                "slangc not found. Install Vulkan SDK or set MRUNTIME_SLANGC_EXECUTABLE."
+            )
+        endif()
+    else()
+        # Used to compile GLSL compute shaders into SPIR-V during the build.
+        # Vulkan SDK provides this tool.
+        find_program(MRUNTIME_GLSLANG_VALIDATOR_EXECUTABLE NAMES glslangValidator)
+        if(NOT MRUNTIME_GLSLANG_VALIDATOR_EXECUTABLE)
+            message(
+                FATAL_ERROR
+                "glslangValidator not found. Install Vulkan SDK or set MRUNTIME_GLSLANG_VALIDATOR_EXECUTABLE."
+            )
+        endif()
     endif()
 
     set(MRUNTIME_VULKAN_GENERATED_DIR "${CMAKE_BINARY_DIR}/generated/vulkan")
     file(MAKE_DIRECTORY "${MRUNTIME_VULKAN_GENERATED_DIR}")
 
-    function(mruntime_add_vulkan_shader shader_stem shader_source var_name)
+    function(mruntime_add_vulkan_glsl_shader shader_stem shader_source var_name)
         set(shader_spv "${MRUNTIME_VULKAN_GENERATED_DIR}/${shader_stem}.spv")
         set(shader_hdr "${MRUNTIME_VULKAN_GENERATED_DIR}/${shader_stem}_spv.h")
 
@@ -132,54 +153,113 @@ if(MRUNTIME_ENABLE_VULKAN)
         )
     endfunction()
 
-    mruntime_add_vulkan_shader(
+    function(mruntime_add_vulkan_slang_shader shader_stem shader_source var_name)
+        set(shader_spv "${MRUNTIME_VULKAN_GENERATED_DIR}/${shader_stem}.spv")
+        set(shader_hdr "${MRUNTIME_VULKAN_GENERATED_DIR}/${shader_stem}_spv.h")
+
+        add_custom_command(
+            OUTPUT "${shader_spv}"
+            COMMAND "${MRUNTIME_SLANGC_EXECUTABLE}"
+                -target spirv
+                -profile glsl_460+spirv_1_6
+                -entry main
+                -stage compute
+                -fvk-use-scalar-layout
+                "${shader_source}"
+                -o "${shader_spv}"
+            DEPENDS "${shader_source}"
+            COMMENT "Compiling Slang -> SPIR-V: ${shader_stem}.slang"
+            VERBATIM
+        )
+
+        add_custom_command(
+            OUTPUT "${shader_hdr}"
+            COMMAND "${CMAKE_COMMAND}"
+                -DINPUT="${shader_spv}"
+                -DOUTPUT="${shader_hdr}"
+                -DVAR_NAME="${var_name}"
+                -DNAMESPACE="mruntime::vulkan::shaders"
+                -P "${CMAKE_SOURCE_DIR}/cmake/spirv_to_header.cmake"
+            DEPENDS
+                "${shader_spv}"
+                "${CMAKE_SOURCE_DIR}/cmake/spirv_to_header.cmake"
+            COMMENT "Embedding SPIR-V into header: ${shader_stem}_spv.h"
+            VERBATIM
+        )
+
+        set(MRUNTIME_VULKAN_SHADER_HEADERS
+            ${MRUNTIME_VULKAN_SHADER_HEADERS}
+            "${shader_hdr}"
+            PARENT_SCOPE
+        )
+    endfunction()
+
+    macro(mruntime_add_vulkan_shader_variant shader_stem glsl_source slang_source var_name)
+        if(MRUNTIME_ENABLE_VULKAN_SLANG)
+            mruntime_add_vulkan_slang_shader(${shader_stem} "${slang_source}" ${var_name})
+        else()
+            mruntime_add_vulkan_glsl_shader(${shader_stem} "${glsl_source}" ${var_name})
+        endif()
+    endmacro()
+
+    mruntime_add_vulkan_shader_variant(
         vector_add
         "${CMAKE_SOURCE_DIR}/src/vulkan/shaders/vector_add.comp"
+        "${CMAKE_SOURCE_DIR}/src/vulkan/shaders/vector_add_slang.slang"
         kVectorAddSpv
     )
-    mruntime_add_vulkan_shader(
+    mruntime_add_vulkan_shader_variant(
         fp16_add
         "${CMAKE_SOURCE_DIR}/src/vulkan/shaders/fp16_add.comp"
+        "${CMAKE_SOURCE_DIR}/src/vulkan/shaders/fp16_add_slang.slang"
         kFp16AddSpv
     )
-    mruntime_add_vulkan_shader(
+    mruntime_add_vulkan_shader_variant(
         fp16_mul
         "${CMAKE_SOURCE_DIR}/src/vulkan/shaders/fp16_mul.comp"
+        "${CMAKE_SOURCE_DIR}/src/vulkan/shaders/fp16_mul_slang.slang"
         kFp16MulSpv
     )
-    mruntime_add_vulkan_shader(
+    mruntime_add_vulkan_shader_variant(
         fp16_silu_mul_interleaved
         "${CMAKE_SOURCE_DIR}/src/vulkan/shaders/fp16_silu_mul_interleaved.comp"
+        "${CMAKE_SOURCE_DIR}/src/vulkan/shaders/fp16_silu_mul_interleaved_slang.slang"
         kFp16SiluMulInterleavedSpv
     )
-    mruntime_add_vulkan_shader(
+    mruntime_add_vulkan_shader_variant(
         fp16_rmsnorm
         "${CMAKE_SOURCE_DIR}/src/vulkan/shaders/fp16_rmsnorm.comp"
+        "${CMAKE_SOURCE_DIR}/src/vulkan/shaders/fp16_rmsnorm_slang.slang"
         kFp16RmsnormSpv
     )
-    mruntime_add_vulkan_shader(
+    mruntime_add_vulkan_shader_variant(
         fp16_rope
         "${CMAKE_SOURCE_DIR}/src/vulkan/shaders/fp16_rope.comp"
+        "${CMAKE_SOURCE_DIR}/src/vulkan/shaders/fp16_rope_slang.slang"
         kFp16RopeSpv
     )
-    mruntime_add_vulkan_shader(
+    mruntime_add_vulkan_shader_variant(
         fp16_transpose
         "${CMAKE_SOURCE_DIR}/src/vulkan/shaders/fp16_transpose.comp"
+        "${CMAKE_SOURCE_DIR}/src/vulkan/shaders/fp16_transpose_slang.slang"
         kFp16TransposeSpv
     )
-    mruntime_add_vulkan_shader(
+    mruntime_add_vulkan_shader_variant(
         fp16_kv_cache_copy
         "${CMAKE_SOURCE_DIR}/src/vulkan/shaders/fp16_kv_cache_copy.comp"
+        "${CMAKE_SOURCE_DIR}/src/vulkan/shaders/fp16_kv_cache_copy_slang.slang"
         kFp16KvCacheCopySpv
     )
-    mruntime_add_vulkan_shader(
+    mruntime_add_vulkan_shader_variant(
         fp16_gemv_rows4_vec4
         "${CMAKE_SOURCE_DIR}/src/vulkan/shaders/fp16_gemv_rows4_vec4.comp"
+        "${CMAKE_SOURCE_DIR}/src/vulkan/shaders/fp16_gemv_rows4_vec4_slang.slang"
         kFp16GemvRows4Vec4Spv
     )
-    mruntime_add_vulkan_shader(
+    mruntime_add_vulkan_shader_variant(
         fp16_gemm
         "${CMAKE_SOURCE_DIR}/src/vulkan/shaders/fp16_gemm.comp"
+        "${CMAKE_SOURCE_DIR}/src/vulkan/shaders/fp16_gemm_slang.slang"
         kFp16GemmSpv
     )
 

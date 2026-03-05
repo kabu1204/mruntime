@@ -29,6 +29,10 @@ cmake -S . -B build -DMRUNTIME_BUILD_TESTS=ON -DMRUNTIME_BUILD_BENCH=ON -DMRUNTI
 cmake --build build -j
 ```
 
+Vulkan shader dialect is selected at configure time when Vulkan is enabled:
+- `-DMRUNTIME_ENABLE_VULKAN_SLANG=OFF` (default): compile Vulkan shaders from GLSL (`glslangValidator`).
+- `-DMRUNTIME_ENABLE_VULKAN_SLANG=ON`: compile Vulkan shaders from Slang (`slangc`).
+
 ## Tests
 
 ```bash

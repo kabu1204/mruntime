@@ -3,6 +3,7 @@
 
 # CMake / build artifacts
 /build/
+/build-*/
 /cmake-build-*/
 compile_commands.json
 CMakeCache.txt

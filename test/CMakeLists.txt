@@ -109,6 +109,7 @@ if(MRUNTIME_ENABLE_VULKAN)
     )
     add_test(NAME vulkan_qwen2_smoke_test COMMAND vulkan_qwen2_smoke_test)
     set_tests_properties(vulkan_qwen2_smoke_test PROPERTIES SKIP_RETURN_CODE 77)
+
 endif()
 
 # Some tests assume working-directory == ${CMAKE_BINARY_DIR} (out-of-source build root).

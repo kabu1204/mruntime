@@ -356,14 +356,17 @@ inline void trace_complete_at(
 // Convenience macros - can be disabled at compile time
 #ifndef MRUNTIME_TRACE_DISABLED
 
+#define MRUNTIME_CONCAT_(a, b) a##b
+#define MRUNTIME_CONCAT(a, b) MRUNTIME_CONCAT_(a, b)
+
 #define TRACE_SCOPE(name) \
-    ::mruntime::ScopedTrace _trace_scope_##__LINE__(name)
+    ::mruntime::ScopedTrace MRUNTIME_CONCAT(_trace_scope_, __LINE__)(name)
 
 #define TRACE_SCOPE_CAT(name, category) \
-    ::mruntime::ScopedTrace _trace_scope_##__LINE__(name, category)
+    ::mruntime::ScopedTrace MRUNTIME_CONCAT(_trace_scope_, __LINE__)(name, category)
 
 #define TRACE_SCOPE_ARGS_CAT(name, category, ...) \
-    ::mruntime::ScopedTrace _trace_scope_##__LINE__(name, category, {__VA_ARGS__})
+    ::mruntime::ScopedTrace MRUNTIME_CONCAT(_trace_scope_, __LINE__)(name, category, {__VA_ARGS__})
 
 #define TRACE_BEGIN(name) ::mruntime::trace_begin(name)
 #define TRACE_END(name) ::mruntime::trace_end(name)
