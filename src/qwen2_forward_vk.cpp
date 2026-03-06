@@ -290,10 +290,36 @@ void qwen2_attention_vk(
         );
     }
 
-    // Flash attention (CPU) with GQA.
-    {
+    const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+    const bool can_use_vk_decode_attention =
+        num_tokens == 1 &&
+        num_kv_heads != 0 &&
+        (num_heads % num_kv_heads) == 0 &&
+        total_seq_len <= max_seq_len &&
+        head_dim <= 512;
+
+    if (can_use_vk_decode_attention) {
+        TRACE_SCOPE_CAT("flash_attention_decode_vk", "attention");
+        state.fp16_ops.attention_decode_gqa(
+            descriptor_for_ptr(state.scratch_arena, scratch.q_transposed, num_tokens * q_dim * sizeof(uint16_t)),
+            descriptor_for_ptr(
+                state.kv_arena,
+                k_cache,
+                static_cast<VkDeviceSize>(num_kv_heads) * max_seq_len * head_dim * sizeof(uint16_t)),
+            descriptor_for_ptr(
+                state.kv_arena,
+                v_cache,
+                static_cast<VkDeviceSize>(num_kv_heads) * max_seq_len * head_dim * sizeof(uint16_t)),
+            descriptor_for_ptr(state.scratch_arena, scratch.attn_out, num_tokens * q_dim * sizeof(uint16_t)),
+            static_cast<uint32_t>(num_heads),
+            static_cast<uint32_t>(num_kv_heads),
+            static_cast<uint32_t>(total_seq_len),
+            static_cast<uint32_t>(max_seq_len),
+            static_cast<uint32_t>(head_dim),
+            scale
+        );
+    } else {
         TRACE_SCOPE_CAT("flash_attention_cpu", "attention");
-        const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
         qwen2_flash_attention_gqa_fp16(
             scratch.q_transposed,  // Q: [1, num_heads, q_len, head_dim]
             k_cache,               // K: [1, num_kv_heads, max_seq_len, head_dim]

@@ -141,6 +141,28 @@ public struct Workgroup
         }
     }
 
+    public static void load_strided_slice<Storage : IFloatStorage1D, int WorkgroupSize>(
+        StructuredBuffer<half> src,
+        uint base,
+        uint stride,
+        uint count,
+        uint tid)
+    {
+        for (uint index = tid; index < count; index += uint(WorkgroupSize)) {
+            Storage::store(index, float(src[base + index * stride]));
+        }
+    }
+
+    public static VectorSegment4 vector_segment4<int WorkgroupSize>(uint tid)
+    {
+        VectorSegment4 segment;
+        segment.x = tid;
+        segment.y = tid + uint(WorkgroupSize);
+        segment.z = tid + 2u * uint(WorkgroupSize);
+        segment.w = tid + 3u * uint(WorkgroupSize);
+        return segment;
+    }
+
     public static float tree_reduce_sum<Storage : IFloatStorage1D, int WorkgroupSize>(float wave_sum, uint tid)
     {
         const uint lane = WaveGetLaneIndex();
@@ -168,6 +190,37 @@ public struct Workgroup
         float total = 0.0;
         for (uint wave = 0u; wave < wave_count; ++wave) {
             total += Storage::load(wave);
+        }
+        return total;
+    }
+
+    public static float tree_reduce_max<Storage : IFloatStorage1D, int WorkgroupSize>(float wave_max, uint tid)
+    {
+        const uint lane = WaveGetLaneIndex();
+        const uint wave_size = WaveGetLaneCount();
+        const uint wave_id = tid / wave_size;
+        const uint wave_count = (uint(WorkgroupSize) + wave_size - 1u) / wave_size;
+
+        if (wave_count == 1u) {
+            if (lane == 0u) {
+                return wave_max;
+            }
+            return 0.0;
+        }
+
+        if (lane == 0u) {
+            Storage::store(wave_id, wave_max);
+        }
+
+        GroupMemoryBarrierWithGroupSync();
+
+        if (tid != 0u) {
+            return 0.0;
+        }
+
+        float total = Storage::load(0u);
+        for (uint wave = 1u; wave < wave_count; ++wave) {
+            total = max(total, Storage::load(wave));
         }
         return total;
     }
@@ -223,6 +276,70 @@ public struct Thread
         }
 
         dst[index] = half(Op::apply(float(lhs[index]), float(rhs[index])));
+    }
+
+    public static float dot_strided_slice<QueryStorage : IFloatStorage1D>(
+        StructuredBuffer<half> src,
+        uint base,
+        uint stride,
+        uint count)
+    {
+        float score = 0.0;
+        for (uint index = 0u; index < count; ++index) {
+            score += QueryStorage::load(index) * float(src[base + index * stride]);
+        }
+        return score;
+    }
+
+    public static void accumulate_weighted_strided_slices4<WeightStorage : IFloatStorage1D>(
+        inout float4 accum,
+        StructuredBuffer<half> src,
+        uint base,
+        uint slice_stride,
+        uint value_stride,
+        uint slice_count,
+        uint value_count,
+        VectorSegment4 segment)
+    {
+        [loop]
+        for (uint slice = 0u; slice < slice_count; ++slice) {
+            const float weight = WeightStorage::load(slice);
+            const uint slice_base = base + slice * slice_stride;
+            if (segment.x < value_count) {
+                accum.x += weight * float(src[slice_base + segment.x * value_stride]);
+            }
+            if (segment.y < value_count) {
+                accum.y += weight * float(src[slice_base + segment.y * value_stride]);
+            }
+            if (segment.z < value_count) {
+                accum.z += weight * float(src[slice_base + segment.z * value_stride]);
+            }
+            if (segment.w < value_count) {
+                accum.w += weight * float(src[slice_base + segment.w * value_stride]);
+            }
+        }
+    }
+
+    public static void store_strided_values4(
+        RWStructuredBuffer<half> dst,
+        uint base,
+        uint stride,
+        uint count,
+        VectorSegment4 segment,
+        float4 values)
+    {
+        if (segment.x < count) {
+            dst[base + segment.x * stride] = half(values.x);
+        }
+        if (segment.y < count) {
+            dst[base + segment.y * stride] = half(values.y);
+        }
+        if (segment.z < count) {
+            dst[base + segment.z * stride] = half(values.z);
+        }
+        if (segment.w < count) {
+            dst[base + segment.w * stride] = half(values.w);
+        }
     }
 
     public static void apply_interleaved_gate_up<Activation : IPointwiseOp>(
@@ -350,6 +467,11 @@ public struct Subgroup
     public static float reduce_sum(float value)
     {
         return WaveActiveSum(value);
+    }
+
+    public static float reduce_max(float value)
+    {
+        return WaveActiveMax(value);
     }
 
     public static float4 reduce_sum(float4 value)

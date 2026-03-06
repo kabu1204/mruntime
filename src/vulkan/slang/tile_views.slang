@@ -60,3 +60,11 @@ public struct RowBlock4
 {
     public uint row_base;
 }
+
+public struct VectorSegment4
+{
+    public uint x;
+    public uint y;
+    public uint z;
+    public uint w;
+}

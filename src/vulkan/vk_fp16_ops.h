@@ -82,6 +82,21 @@ class VkFp16Ops {
         uint32_t position_offset
     ) const;
 
+    // Decode-only grouped-query attention.
+    // Q:[1,num_q_heads,1,head_dim], K/V:[1,num_kv_heads,kv_stride,head_dim], O:[1,num_q_heads,1,head_dim].
+    void attention_decode_gqa(
+        const VkDescriptorBufferInfo& q,
+        const VkDescriptorBufferInfo& k,
+        const VkDescriptorBufferInfo& v,
+        const VkDescriptorBufferInfo& out,
+        uint32_t num_q_heads,
+        uint32_t num_kv_heads,
+        uint32_t kv_len,
+        uint32_t kv_stride,
+        uint32_t head_dim,
+        float scale
+    ) const;
+
     // C = A @ B^T.  A:[M,K], B:[N,K], C:[M,N] — all row-major FP16.
     void gemm(
         const VkDescriptorBufferInfo& a,
@@ -116,6 +131,7 @@ class VkFp16Ops {
     VkKernel rope_kernel_ = {};
     VkKernel transpose_kernel_ = {};
     VkKernel kv_cache_copy_kernel_ = {};
+    VkKernel attention_decode_gqa_kernel_ = {};
     VkKernel gemv_rows4_vec4_kernel_ = {};
     VkKernel gemm_kernel_ = {};
 };
