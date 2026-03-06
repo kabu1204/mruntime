@@ -1,9 +1,8 @@
 // FP16 elementwise add: out[i] = a[i] + b[i]
-//
-// Bindings match mruntime's Vulkan kernel conventions:
-// - descriptor set 0
-// - storage buffers at bindings 0..N-1
-// - one push-constant block
+
+import pointwise_ops;
+import scope_primitives;
+import tile_views;
 
 struct PushConstants {
     uint n;
@@ -24,9 +23,6 @@ RWStructuredBuffer<half> out_data;
 [shader("compute")]
 [numthreads(256, 1, 1)]
 void main(uint3 tid : SV_DispatchThreadID) {
-    const uint i = tid.x;
-    if (i >= pc.n) {
-        return;
-    }
-    out_data[i] = a[i] + b[i];
+    GlobalTensor1D out_tensor = {pc.n};
+    Thread::apply_binary_elementwise<AddOp>(a, b, out_data, out_tensor, Thread::linear_id(tid));
 }
