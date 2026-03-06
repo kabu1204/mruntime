@@ -4,6 +4,7 @@
 
 #include "fp16_add_spv.h"
 #include "fp16_attention_decode_gqa_spv.h"
+#include "fp16_attention_prefill_gqa_spv.h"
 #include "fp16_gemv_rows4_vec4_spv.h"
 #include "fp16_gemm_spv.h"
 #include "fp16_kv_cache_copy_spv.h"
@@ -80,6 +81,14 @@ VkFp16Ops VkFp16Ops::Create(VkKernelRuntime* runtime) {
             shaders::kFp16AttentionDecodeGqaSpvSize,
             4,
             5 * sizeof(uint32_t) + sizeof(float)));
+
+    // prefill GQA attention: 4 buffers (Q, K, V, O), push = 6 uint + 1 float
+    ops.attention_prefill_gqa_kernel_ = runtime->get_or_create_kernel(
+        make_kernel_create_info(
+            shaders::kFp16AttentionPrefillGqaSpv,
+            shaders::kFp16AttentionPrefillGqaSpvSize,
+            4,
+            6 * sizeof(uint32_t) + sizeof(float)));
 
     // gemv (rows4 + vec4): 3 buffers (x, W, y), push = {uint N, uint K}
     ops.gemv_rows4_vec4_kernel_ = runtime->get_or_create_kernel(
@@ -397,8 +406,66 @@ void VkFp16Ops::attention_decode_gqa(
         attention_decode_gqa_kernel_,
         buffers,
         4,
-        num_q_heads * kGemvRows4Vec4LocalSizeX,
-        kGemvRows4Vec4LocalSizeX,
+        num_q_heads * kAttentionGqaLocalSizeX,
+        kAttentionGqaLocalSizeX,
+        &push_constants,
+        sizeof(push_constants),
+        -1
+    );
+}
+
+void VkFp16Ops::attention_prefill_gqa(
+    const VkDescriptorBufferInfo& q,
+    const VkDescriptorBufferInfo& k,
+    const VkDescriptorBufferInfo& v,
+    const VkDescriptorBufferInfo& out,
+    uint32_t num_q_heads,
+    uint32_t num_kv_heads,
+    uint32_t q_len,
+    uint32_t kv_len,
+    uint32_t kv_stride,
+    uint32_t head_dim,
+    float scale
+) const {
+    if (runtime_ == nullptr) {
+        throw std::runtime_error("VkFp16Ops::attention_prefill_gqa: runtime is null");
+    }
+    if (num_q_heads == 0 || num_kv_heads == 0 || q_len == 0 || kv_len == 0 || head_dim == 0) {
+        return;
+    }
+    if (q_len > kv_len) {
+        throw std::runtime_error("VkFp16Ops::attention_prefill_gqa: q_len must be <= kv_len");
+    }
+    if (kv_len > kv_stride) {
+        throw std::runtime_error("VkFp16Ops::attention_prefill_gqa: kv_len must be <= kv_stride");
+    }
+    if ((num_q_heads % num_kv_heads) != 0u) {
+        throw std::runtime_error("VkFp16Ops::attention_prefill_gqa: num_q_heads must be divisible by num_kv_heads");
+    }
+    if (head_dim > 512u) {
+        throw std::runtime_error("VkFp16Ops::attention_prefill_gqa: head_dim must be <= 512");
+    }
+
+    const VkDescriptorBufferInfo buffers[4] = {q, k, v, out};
+
+    struct {
+        uint32_t num_q_heads;
+        uint32_t num_kv_heads;
+        uint32_t q_len;
+        uint32_t kv_len;
+        uint32_t kv_stride;
+        uint32_t head_dim;
+        float scale;
+    } push_constants = {num_q_heads, num_kv_heads, q_len, kv_len, kv_stride, head_dim, scale};
+
+    runtime_->dispatch_2d(
+        attention_prefill_gqa_kernel_,
+        buffers,
+        4,
+        num_q_heads,
+        q_len,
+        1,
+        1,
         &push_constants,
         sizeof(push_constants),
         -1

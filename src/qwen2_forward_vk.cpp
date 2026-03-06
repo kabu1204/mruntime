@@ -291,12 +291,13 @@ void qwen2_attention_vk(
     }
 
     const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
-    const bool can_use_vk_decode_attention =
-        num_tokens == 1 &&
+    const bool can_use_vk_attention =
         num_kv_heads != 0 &&
         (num_heads % num_kv_heads) == 0 &&
         total_seq_len <= max_seq_len &&
         head_dim <= 512;
+    const bool can_use_vk_decode_attention = can_use_vk_attention && num_tokens == 1;
+    const bool can_use_vk_prefill_attention = can_use_vk_attention && num_tokens > 1;
 
     if (can_use_vk_decode_attention) {
         TRACE_SCOPE_CAT("flash_attention_decode_vk", "attention");
@@ -313,6 +314,27 @@ void qwen2_attention_vk(
             descriptor_for_ptr(state.scratch_arena, scratch.attn_out, num_tokens * q_dim * sizeof(uint16_t)),
             static_cast<uint32_t>(num_heads),
             static_cast<uint32_t>(num_kv_heads),
+            static_cast<uint32_t>(total_seq_len),
+            static_cast<uint32_t>(max_seq_len),
+            static_cast<uint32_t>(head_dim),
+            scale
+        );
+    } else if (can_use_vk_prefill_attention) {
+        TRACE_SCOPE_CAT("flash_attention_prefill_vk", "attention");
+        state.fp16_ops.attention_prefill_gqa(
+            descriptor_for_ptr(state.scratch_arena, scratch.q_transposed, num_tokens * q_dim * sizeof(uint16_t)),
+            descriptor_for_ptr(
+                state.kv_arena,
+                k_cache,
+                static_cast<VkDeviceSize>(num_kv_heads) * max_seq_len * head_dim * sizeof(uint16_t)),
+            descriptor_for_ptr(
+                state.kv_arena,
+                v_cache,
+                static_cast<VkDeviceSize>(num_kv_heads) * max_seq_len * head_dim * sizeof(uint16_t)),
+            descriptor_for_ptr(state.scratch_arena, scratch.attn_out, num_tokens * q_dim * sizeof(uint16_t)),
+            static_cast<uint32_t>(num_heads),
+            static_cast<uint32_t>(num_kv_heads),
+            static_cast<uint32_t>(num_tokens),
             static_cast<uint32_t>(total_seq_len),
             static_cast<uint32_t>(max_seq_len),
             static_cast<uint32_t>(head_dim),

@@ -500,6 +500,109 @@ void test_attention_decode_gqa(
     std::cout << "  " << label << " PASSED\n";
 }
 
+void test_attention_prefill_gqa(
+    TestContext& tc,
+    uint32_t num_q_heads,
+    uint32_t num_kv_heads,
+    uint32_t q_len,
+    uint32_t head_dim,
+    uint32_t kv_len,
+    uint32_t kv_stride
+) {
+    const std::string label =
+        "attention_prefill_gqa(qh=" + std::to_string(num_q_heads) +
+        ",kvh=" + std::to_string(num_kv_heads) +
+        ",q_len=" + std::to_string(q_len) +
+        ",d=" + std::to_string(head_dim) +
+        ",kv_len=" + std::to_string(kv_len) + ")";
+
+    const uint32_t q_count = num_q_heads * q_len * head_dim;
+    const uint32_t kv_count = num_kv_heads * kv_stride * head_dim;
+    const uint32_t out_count = q_count;
+    const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+
+    const VkDeviceSize q_bytes = q_count * sizeof(uint16_t);
+    const VkDeviceSize kv_bytes = kv_count * sizeof(uint16_t);
+    const VkDeviceSize out_bytes = out_count * sizeof(uint16_t);
+
+    auto arena = make_arena(tc, q_bytes + 2 * kv_bytes + out_bytes + 4 * tc.alignment);
+
+    const VkDeviceSize q_offset = arena.alloc(q_bytes);
+    const VkDeviceSize k_offset = arena.alloc(kv_bytes);
+    const VkDeviceSize v_offset = arena.alloc(kv_bytes);
+    const VkDeviceSize out_offset = arena.alloc(out_bytes);
+
+    uint16_t* q_data = arena.host_ptr<uint16_t>(q_offset);
+    uint16_t* k_data = arena.host_ptr<uint16_t>(k_offset);
+    uint16_t* v_data = arena.host_ptr<uint16_t>(v_offset);
+    uint16_t* out_data = arena.host_ptr<uint16_t>(out_offset);
+
+    for (uint32_t i = 0; i < q_count; ++i) {
+        q_data[i] = mruntime::float_to_fp16_bits(-0.15f + 0.003f * static_cast<float>(i % 131));
+    }
+
+    for (uint32_t head = 0; head < num_kv_heads; ++head) {
+        for (uint32_t seq = 0; seq < kv_stride; ++seq) {
+            for (uint32_t dim = 0; dim < head_dim; ++dim) {
+                const uint32_t idx = (head * kv_stride + seq) * head_dim + dim;
+                if (seq < kv_len) {
+                    const float k_val =
+                        0.012f * static_cast<float>(head + 1) +
+                        0.004f * static_cast<float>(seq % 47) -
+                        0.001f * static_cast<float>(dim % 19);
+                    const float v_val =
+                        -0.018f * static_cast<float>(head + 1) +
+                        0.0035f * static_cast<float>(seq % 59) +
+                        0.0012f * static_cast<float>(dim % 31);
+                    k_data[idx] = mruntime::float_to_fp16_bits(k_val);
+                    v_data[idx] = mruntime::float_to_fp16_bits(v_val);
+                } else {
+                    k_data[idx] = mruntime::float_to_fp16_bits(300.0f);
+                    v_data[idx] = mruntime::float_to_fp16_bits(-300.0f);
+                }
+            }
+        }
+    }
+
+    std::vector<uint16_t> expected_fp16(out_count);
+    std::vector<float> expected(out_count);
+    mruntime::qwen2_flash_attention_gqa_fp16(
+        q_data,
+        k_data,
+        v_data,
+        expected_fp16.data(),
+        1,
+        num_q_heads,
+        num_kv_heads,
+        q_len,
+        kv_len,
+        kv_stride,
+        head_dim,
+        scale,
+        true,
+        nullptr);
+    for (uint32_t i = 0; i < out_count; ++i) {
+        expected[i] = mruntime::fp16_bits_to_float(expected_fp16[i]);
+    }
+
+    std::memset(out_data, 0, out_bytes);
+    tc.fp16_ops.attention_prefill_gqa(
+        arena.descriptor(q_offset, q_bytes),
+        arena.descriptor(k_offset, kv_bytes),
+        arena.descriptor(v_offset, kv_bytes),
+        arena.descriptor(out_offset, out_bytes),
+        num_q_heads,
+        num_kv_heads,
+        q_len,
+        kv_len,
+        kv_stride,
+        head_dim,
+        scale);
+
+    check_close(label.c_str(), out_data, expected.data(), out_count, 5e-2f);
+    std::cout << "  " << label << " PASSED\n";
+}
+
 void run_all_tests() {
     TestContext tc = TestContext::Create();
 
@@ -515,6 +618,9 @@ void run_all_tests() {
     test_attention_decode_gqa(tc, 4, 2, 8, 5, 9);
     test_attention_decode_gqa(tc, 4, 2, 32, 37, 64);
     test_attention_decode_gqa(tc, 14, 2, 64, 129, 256);
+    test_attention_prefill_gqa(tc, 4, 2, 5, 8, 5, 9);
+    test_attention_prefill_gqa(tc, 4, 2, 8, 32, 37, 64);
+    test_attention_prefill_gqa(tc, 14, 2, 3, 64, 129, 256);
 }
 
 }  // namespace

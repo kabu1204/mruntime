@@ -194,6 +194,11 @@ public struct Workgroup
         return total;
     }
 
+    public static float reduce_sum<Storage : IFloatStorage1D, int WorkgroupSize>(float value, uint tid)
+    {
+        return tree_reduce_sum<Storage, WorkgroupSize>(Subgroup::reduce_sum(value), tid);
+    }
+
     public static float tree_reduce_max<Storage : IFloatStorage1D, int WorkgroupSize>(float wave_max, uint tid)
     {
         const uint lane = WaveGetLaneIndex();
@@ -223,6 +228,21 @@ public struct Workgroup
             total = max(total, Storage::load(wave));
         }
         return total;
+    }
+
+    public static float reduce_max<Storage : IFloatStorage1D, int WorkgroupSize>(float value, uint tid)
+    {
+        return tree_reduce_max<Storage, WorkgroupSize>(Subgroup::reduce_max(value), tid);
+    }
+
+    public static float broadcast_scalar<Storage : IFloatStorage1D>(float value, uint tid)
+    {
+        if (tid == 0u) {
+            Storage::store(0u, value);
+        }
+
+        GroupMemoryBarrierWithGroupSync();
+        return Storage::load(0u);
     }
 
     public static float4 tree_reduce_sum<Storage : IFloat4Storage1D, int WorkgroupSize>(float4 wave_sum, uint tid)
@@ -289,6 +309,30 @@ public struct Thread
             score += QueryStorage::load(index) * float(src[base + index * stride]);
         }
         return score;
+    }
+
+    public static float scaled_dot_strided_slice<QueryStorage : IFloatStorage1D>(
+        StructuredBuffer<half> src,
+        uint base,
+        uint stride,
+        uint count,
+        float scale)
+    {
+        return dot_strided_slice<QueryStorage>(src, base, stride, count) * scale;
+    }
+
+    public static float store_exp_of_scaled_dot<QueryStorage : IFloatStorage1D, Storage : IFloatStorage1D>(
+        StructuredBuffer<half> src,
+        uint base,
+        uint stride,
+        uint count,
+        float scale,
+        float shift,
+        uint index)
+    {
+        const float value = exp(scaled_dot_strided_slice<QueryStorage>(src, base, stride, count, scale) - shift);
+        Storage::store(index, value);
+        return value;
     }
 
     public static void accumulate_weighted_strided_slices4<WeightStorage : IFloatStorage1D>(

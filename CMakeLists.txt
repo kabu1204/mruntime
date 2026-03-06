@@ -274,6 +274,12 @@ if(MRUNTIME_ENABLE_VULKAN)
         kFp16AttentionDecodeGqaSpv
     )
     mruntime_add_vulkan_shader_variant(
+        fp16_attention_prefill_gqa
+        "${CMAKE_SOURCE_DIR}/src/vulkan/glsl/fp16_attention_prefill_gqa.comp"
+        "${CMAKE_SOURCE_DIR}/src/vulkan/slang/fp16_attention_prefill_gqa.slang"
+        kFp16AttentionPrefillGqaSpv
+    )
+    mruntime_add_vulkan_shader_variant(
         fp16_gemv_rows4_vec4
         "${CMAKE_SOURCE_DIR}/src/vulkan/glsl/fp16_gemv_rows4_vec4.comp"
         "${CMAKE_SOURCE_DIR}/src/vulkan/slang/fp16_gemv_rows4_vec4.slang"

@@ -129,7 +129,7 @@ void run_smoke() {
 
     auto vk_state = mruntime::qwen2_vk_create(cfg, weights, max_seq_len, max_batch_tokens);
 
-    const std::vector<int32_t> prompt = {1, 2, 3, 4};
+    const std::vector<int32_t> prompt = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12};
 
     const uint16_t* cpu_last = mruntime::qwen2_prefill(
         cfg,

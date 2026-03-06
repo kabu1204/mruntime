@@ -1,8 +1,8 @@
-// Decode-only FP16 GQA attention.
-// Q: [1, num_q_heads, 1, head_dim] BHSD FP16
+// Causal FP16 GQA prefill attention.
+// Q: [1, num_q_heads, q_len, head_dim] BHSD FP16
 // K: [1, num_kv_heads, kv_stride, head_dim] BHSD FP16
 // V: [1, num_kv_heads, kv_stride, head_dim] BHSD FP16
-// O: [1, num_q_heads, 1, head_dim] BHSD FP16
+// O: [1, num_q_heads, q_len, head_dim] BHSD FP16
 
 import layout_traits;
 import scope_primitives;
@@ -17,6 +17,7 @@ static const float NEG_INF = -3.402823466e38;
 struct PushConstants {
     uint num_q_heads;
     uint num_kv_heads;
+    uint q_len;
     uint kv_len;
     uint kv_stride;
     uint head_dim;
@@ -89,29 +90,32 @@ void main(
 {
     const uint tid = local_id.x;
     const uint q_head = group_id.x;
+    const uint q_seq = group_id.y;
 
-    BHSDTensor q_tensor = {1u, pc.num_q_heads, 1u, pc.head_dim};
+    BHSDTensor q_tensor = {1u, pc.num_q_heads, pc.q_len, pc.head_dim};
     BHSDTensor kv_tensor = {1u, pc.num_kv_heads, pc.kv_stride, pc.head_dim};
     BHSDTensor o_tensor = q_tensor;
 
-    if (q_head >= q_tensor.heads) {
+    if (q_head >= q_tensor.heads || q_seq >= q_tensor.seq_len) {
         return;
     }
 
     const uint heads_per_kv = q_tensor.heads / kv_tensor.heads;
     const uint kv_head = q_head / heads_per_kv;
-    const uint q_base = BHSDLayout::offset(q_tensor, 0u, q_head, 0u, 0u);
-    const uint o_base = BHSDLayout::offset(o_tensor, 0u, q_head, 0u, 0u);
+    const uint q_base = BHSDLayout::offset(q_tensor, 0u, q_head, q_seq, 0u);
+    const uint o_base = BHSDLayout::offset(o_tensor, 0u, q_head, q_seq, 0u);
+    const uint base_position = pc.kv_len - pc.q_len;
+    const uint attended_kv_len = base_position + q_seq + 1u;
     const VectorSegment4 segment = Workgroup::vector_segment4<WG_SIZE>(tid);
 
     Workgroup::load_strided_slice<SharedQueryStorage, WG_SIZE>(q_data, q_base, 1u, q_tensor.head_dim, tid);
     GroupMemoryBarrierWithGroupSync();
 
     float max_score = NEG_INF;
-    for (uint seq_base = 0u; seq_base < pc.kv_len; seq_base += SCORE_TILE) {
-        const uint seq = seq_base + tid;
-        if (tid < uint(SCORE_TILE) && seq < pc.kv_len) {
-            const uint k_base = BHSDLayout::offset(kv_tensor, 0u, kv_head, seq, 0u);
+    for (uint seq_base = 0u; seq_base < attended_kv_len; seq_base += SCORE_TILE) {
+        const uint seq_count = min(uint(SCORE_TILE), attended_kv_len - seq_base);
+        if (tid < seq_count) {
+            const uint k_base = BHSDLayout::offset(kv_tensor, 0u, kv_head, seq_base + tid, 0u);
             max_score = max(
                 max_score,
                 Thread::scaled_dot_strided_slice<SharedQueryStorage>(
@@ -129,8 +133,8 @@ void main(
     float norm_sum = 0.0;
     float4 accum = float4(0.0);
 
-    for (uint seq_base = 0u; seq_base < pc.kv_len; seq_base += SCORE_TILE) {
-        const uint seq_count = min(uint(SCORE_TILE), pc.kv_len - seq_base);
+    for (uint seq_base = 0u; seq_base < attended_kv_len; seq_base += SCORE_TILE) {
+        const uint seq_count = min(uint(SCORE_TILE), attended_kv_len - seq_base);
         if (tid < seq_count) {
             const uint k_base = BHSDLayout::offset(kv_tensor, 0u, kv_head, seq_base + tid, 0u);
             norm_sum += Thread::store_exp_of_scaled_dot<SharedQueryStorage, SharedScoreTileStorage>(
