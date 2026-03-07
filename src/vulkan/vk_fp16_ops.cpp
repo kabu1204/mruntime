@@ -29,6 +29,8 @@ KernelCreateInfo make_kernel_create_info(
     return info;
 }
 
+constexpr uint32_t kPointwiseChunkWidth = 8;
+
 void validate_runtime(VkKernelRuntime* runtime) {
     if (runtime == nullptr) {
         throw std::runtime_error("VkFp16Ops::Create: runtime is null");
@@ -124,7 +126,7 @@ void VkFp16Ops::add(
         add_kernel_,
         buffers,
         3,
-        n,
+        (n + kPointwiseChunkWidth - 1u) / kPointwiseChunkWidth,
         kLocalSizeX,
         &push_constants,
         sizeof(push_constants),
@@ -153,7 +155,7 @@ void VkFp16Ops::mul(
         mul_kernel_,
         buffers,
         3,
-        n,
+        (n + kPointwiseChunkWidth - 1u) / kPointwiseChunkWidth,
         kLocalSizeX,
         &push_constants,
         sizeof(push_constants),
@@ -181,11 +183,12 @@ void VkFp16Ops::silu_mul_interleaved(
         uint32_t num_tokens;
     } push_constants = {intermediate_size, num_tokens};
 
+    const uint32_t total_elements = num_tokens * intermediate_size;
     runtime_->dispatch_1d(
         silu_mul_interleaved_kernel_,
         buffers,
         2,
-        num_tokens * intermediate_size,
+        (total_elements + kPointwiseChunkWidth - 1u) / kPointwiseChunkWidth,
         kLocalSizeX,
         &push_constants,
         sizeof(push_constants),

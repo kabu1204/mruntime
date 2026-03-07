@@ -126,7 +126,7 @@ void test_silu_mul_interleaved(TestContext& tc) {
 // ---- rmsnorm ----
 
 void test_rmsnorm(TestContext& tc) {
-    const std::vector<uint32_t> hidden_sizes = {256, 896};
+    const std::vector<uint32_t> hidden_sizes = {256, 896, 897};
 
     for (uint32_t hidden_size : hidden_sizes) {
         const uint32_t num_tokens = 4;
@@ -289,48 +289,48 @@ void test_rope(TestContext& tc) {
 // ---- transpose BSHD -> BHSD ----
 
 void test_transpose(TestContext& tc) {
-    const uint32_t B = 2, S = 4, H = 4, D = 64;
-    const uint32_t total = B * S * H * D;
+    const uint32_t B = 2, S = 4, H = 4;
+    const std::vector<uint32_t> head_dims = {64, 65};
 
-    const VkDeviceSize input_bytes = total * sizeof(uint16_t);
-    const VkDeviceSize out_bytes = total * sizeof(uint16_t);
+    for (uint32_t D : head_dims) {
+        const uint32_t total = B * S * H * D;
+        const VkDeviceSize input_bytes = total * sizeof(uint16_t);
+        const VkDeviceSize out_bytes = total * sizeof(uint16_t);
 
-    auto arena = make_arena(tc, input_bytes + out_bytes + 2 * tc.alignment);
+        auto arena = make_arena(tc, input_bytes + out_bytes + 2 * tc.alignment);
 
-    const VkDeviceSize input_offset = arena.alloc(input_bytes);
-    const VkDeviceSize out_offset = arena.alloc(out_bytes);
+        const VkDeviceSize input_offset = arena.alloc(input_bytes);
+        const VkDeviceSize out_offset = arena.alloc(out_bytes);
 
-    uint16_t* input_data = arena.host_ptr<uint16_t>(input_offset);
-    uint16_t* out_data = arena.host_ptr<uint16_t>(out_offset);
+        uint16_t* input_data = arena.host_ptr<uint16_t>(input_offset);
+        uint16_t* out_data = arena.host_ptr<uint16_t>(out_offset);
 
-    // Fill with unique values so we can verify the permutation exactly.
-    for (uint32_t i = 0; i < total; ++i) {
-        // Use distinct fp16 values; just use the index bits directly (they'll be valid fp16).
-        input_data[i] = mruntime::float_to_fp16_bits(static_cast<float>(i));
-    }
+        for (uint32_t i = 0; i < total; ++i) {
+            input_data[i] = mruntime::float_to_fp16_bits(static_cast<float>(i));
+        }
 
-    // CPU reference: BSHD -> BHSD
-    std::vector<uint16_t> expected(total);
-    for (uint32_t b = 0; b < B; ++b) {
-        for (uint32_t s = 0; s < S; ++s) {
-            for (uint32_t h = 0; h < H; ++h) {
-                for (uint32_t d = 0; d < D; ++d) {
-                    uint32_t src_idx = ((b * S + s) * H + h) * D + d;
-                    uint32_t dst_idx = ((b * H + h) * S + s) * D + d;
-                    expected[dst_idx] = input_data[src_idx];
+        std::vector<uint16_t> expected(total);
+        for (uint32_t b = 0; b < B; ++b) {
+            for (uint32_t s = 0; s < S; ++s) {
+                for (uint32_t h = 0; h < H; ++h) {
+                    for (uint32_t d = 0; d < D; ++d) {
+                        uint32_t src_idx = ((b * S + s) * H + h) * D + d;
+                        uint32_t dst_idx = ((b * H + h) * S + s) * D + d;
+                        expected[dst_idx] = input_data[src_idx];
+                    }
                 }
             }
         }
+
+        std::memset(out_data, 0, out_bytes);
+        tc.fp16_ops.transpose_bshd_to_bhsd(
+            arena.descriptor(input_offset, input_bytes),
+            arena.descriptor(out_offset, out_bytes),
+            B, S, H, D);
+
+        check_exact_fp16(("transpose(D=" + std::to_string(D) + ")").c_str(), out_data, expected.data(), total);
+        std::cout << "  transpose(D=" << D << ") PASSED\n";
     }
-
-    std::memset(out_data, 0, out_bytes);
-    tc.fp16_ops.transpose_bshd_to_bhsd(
-        arena.descriptor(input_offset, input_bytes),
-        arena.descriptor(out_offset, out_bytes),
-        B, S, H, D);
-
-    check_exact_fp16("transpose", out_data, expected.data(), total);
-    std::cout << "  transpose PASSED\n";
 }
 
 // ---- kv_cache_copy ----
@@ -339,65 +339,67 @@ void test_kv_cache_copy(TestContext& tc) {
     const uint32_t batch = 2;
     const uint32_t seq_len = 4;
     const uint32_t num_kv_heads = 2;
-    const uint32_t head_dim = 64;
     const uint32_t max_seq_len = 32;
     const uint32_t position_offset = 3;
+    const std::vector<uint32_t> head_dims = {64, 65};
 
-    const uint32_t kv_count = batch * seq_len * num_kv_heads * head_dim;
-    const uint32_t cache_count = batch * num_kv_heads * max_seq_len * head_dim;
+    for (uint32_t head_dim : head_dims) {
+        const uint32_t kv_count = batch * seq_len * num_kv_heads * head_dim;
+        const uint32_t cache_count = batch * num_kv_heads * max_seq_len * head_dim;
 
-    const VkDeviceSize kv_bytes = kv_count * sizeof(uint16_t);
-    const VkDeviceSize cache_bytes = cache_count * sizeof(uint16_t);
+        const VkDeviceSize kv_bytes = kv_count * sizeof(uint16_t);
+        const VkDeviceSize cache_bytes = cache_count * sizeof(uint16_t);
 
-    auto arena = make_arena(tc, 2 * kv_bytes + 2 * cache_bytes + 4 * tc.alignment);
+        auto arena = make_arena(tc, 2 * kv_bytes + 2 * cache_bytes + 4 * tc.alignment);
 
-    const VkDeviceSize k_in_offset = arena.alloc(kv_bytes);
-    const VkDeviceSize v_in_offset = arena.alloc(kv_bytes);
-    const VkDeviceSize k_cache_offset = arena.alloc(cache_bytes);
-    const VkDeviceSize v_cache_offset = arena.alloc(cache_bytes);
+        const VkDeviceSize k_in_offset = arena.alloc(kv_bytes);
+        const VkDeviceSize v_in_offset = arena.alloc(kv_bytes);
+        const VkDeviceSize k_cache_offset = arena.alloc(cache_bytes);
+        const VkDeviceSize v_cache_offset = arena.alloc(cache_bytes);
 
-    uint16_t* k_in_data = arena.host_ptr<uint16_t>(k_in_offset);
-    uint16_t* v_in_data = arena.host_ptr<uint16_t>(v_in_offset);
-    uint16_t* k_cache_data = arena.host_ptr<uint16_t>(k_cache_offset);
-    uint16_t* v_cache_data = arena.host_ptr<uint16_t>(v_cache_offset);
+        uint16_t* k_in_data = arena.host_ptr<uint16_t>(k_in_offset);
+        uint16_t* v_in_data = arena.host_ptr<uint16_t>(v_in_offset);
+        uint16_t* k_cache_data = arena.host_ptr<uint16_t>(k_cache_offset);
+        uint16_t* v_cache_data = arena.host_ptr<uint16_t>(v_cache_offset);
 
-    for (uint32_t i = 0; i < kv_count; ++i) {
-        k_in_data[i] = mruntime::float_to_fp16_bits(1.0f + 0.01f * static_cast<float>(i));
-        v_in_data[i] = mruntime::float_to_fp16_bits(-1.0f + 0.01f * static_cast<float>(i));
-    }
+        for (uint32_t i = 0; i < kv_count; ++i) {
+            k_in_data[i] = mruntime::float_to_fp16_bits(1.0f + 0.01f * static_cast<float>(i));
+            v_in_data[i] = mruntime::float_to_fp16_bits(-1.0f + 0.01f * static_cast<float>(i));
+        }
 
-    // Initialize cache to zero.
-    std::memset(k_cache_data, 0, cache_bytes);
-    std::memset(v_cache_data, 0, cache_bytes);
+        std::memset(k_cache_data, 0, cache_bytes);
+        std::memset(v_cache_data, 0, cache_bytes);
 
-    // CPU reference.
-    std::vector<uint16_t> k_cache_expected(cache_count, 0);
-    std::vector<uint16_t> v_cache_expected(cache_count, 0);
+        std::vector<uint16_t> k_cache_expected(cache_count, 0);
+        std::vector<uint16_t> v_cache_expected(cache_count, 0);
 
-    for (uint32_t b = 0; b < batch; ++b) {
-        for (uint32_t s = 0; s < seq_len; ++s) {
-            for (uint32_t h = 0; h < num_kv_heads; ++h) {
-                uint32_t src_base = ((b * seq_len + s) * num_kv_heads + h) * head_dim;
-                uint32_t cache_pos = position_offset + s;
-                uint32_t dst_base = ((b * num_kv_heads + h) * max_seq_len + cache_pos) * head_dim;
-                for (uint32_t d = 0; d < head_dim; ++d) {
-                    k_cache_expected[dst_base + d] = k_in_data[src_base + d];
-                    v_cache_expected[dst_base + d] = v_in_data[src_base + d];
+        for (uint32_t b = 0; b < batch; ++b) {
+            for (uint32_t s = 0; s < seq_len; ++s) {
+                for (uint32_t h = 0; h < num_kv_heads; ++h) {
+                    uint32_t src_base = ((b * seq_len + s) * num_kv_heads + h) * head_dim;
+                    uint32_t cache_pos = position_offset + s;
+                    uint32_t dst_base = ((b * num_kv_heads + h) * max_seq_len + cache_pos) * head_dim;
+                    for (uint32_t d = 0; d < head_dim; ++d) {
+                        k_cache_expected[dst_base + d] = k_in_data[src_base + d];
+                        v_cache_expected[dst_base + d] = v_in_data[src_base + d];
+                    }
                 }
             }
         }
+
+        tc.fp16_ops.kv_cache_copy(
+            arena.descriptor(k_in_offset, kv_bytes),
+            arena.descriptor(v_in_offset, kv_bytes),
+            arena.descriptor(k_cache_offset, cache_bytes),
+            arena.descriptor(v_cache_offset, cache_bytes),
+            batch, seq_len, num_kv_heads, head_dim, max_seq_len, position_offset);
+
+        check_exact_fp16(("kv_cache_copy(K, head_dim=" + std::to_string(head_dim) + ")").c_str(),
+                         k_cache_data, k_cache_expected.data(), cache_count);
+        check_exact_fp16(("kv_cache_copy(V, head_dim=" + std::to_string(head_dim) + ")").c_str(),
+                         v_cache_data, v_cache_expected.data(), cache_count);
+        std::cout << "  kv_cache_copy(head_dim=" << head_dim << ") PASSED\n";
     }
-
-    tc.fp16_ops.kv_cache_copy(
-        arena.descriptor(k_in_offset, kv_bytes),
-        arena.descriptor(v_in_offset, kv_bytes),
-        arena.descriptor(k_cache_offset, cache_bytes),
-        arena.descriptor(v_cache_offset, cache_bytes),
-        batch, seq_len, num_kv_heads, head_dim, max_seq_len, position_offset);
-
-    check_exact_fp16("kv_cache_copy(K)", k_cache_data, k_cache_expected.data(), cache_count);
-    check_exact_fp16("kv_cache_copy(V)", v_cache_data, v_cache_expected.data(), cache_count);
-    std::cout << "  kv_cache_copy PASSED\n";
 }
 
 void test_attention_decode_gqa(

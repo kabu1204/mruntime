@@ -28,23 +28,27 @@ struct PushConstants {
 ConstantBuffer<PushConstants> pc;
 
 [vk::binding(0, 0)]
-StructuredBuffer<half> q_data;
+ByteAddressBuffer q_data;
 
 [vk::binding(1, 0)]
-StructuredBuffer<half> k_data;
+ByteAddressBuffer k_data;
 
 [vk::binding(2, 0)]
-StructuredBuffer<half> v_data;
+ByteAddressBuffer v_data;
 
 [vk::binding(3, 0)]
 RWStructuredBuffer<half> o_data;
 
 groupshared float shared_q[MAX_HEAD_DIM];
 groupshared float score_tile[SCORE_TILE];
-groupshared float subgroup_reduce[32];
+groupshared float subgroup_reduce[WG_SIZE];
 
 public struct SharedQueryStorage : IFloatStorage1D
 {
+    public static const uint kExtent = MAX_HEAD_DIM;
+    public static const StorageScope kScope = StorageScope::Workgroup;
+    public static const bool kBarrierSafe = true;
+
     public static void store(uint index, float value)
     {
         shared_q[index] = value;
@@ -58,6 +62,10 @@ public struct SharedQueryStorage : IFloatStorage1D
 
 public struct SharedScoreTileStorage : IFloatStorage1D
 {
+    public static const uint kExtent = SCORE_TILE;
+    public static const StorageScope kScope = StorageScope::Workgroup;
+    public static const bool kBarrierSafe = true;
+
     public static void store(uint index, float value)
     {
         score_tile[index] = value;
@@ -71,6 +79,10 @@ public struct SharedScoreTileStorage : IFloatStorage1D
 
 public struct SharedScalarStorage : IFloatStorage1D
 {
+    public static const uint kExtent = WG_SIZE;
+    public static const StorageScope kScope = StorageScope::Workgroup;
+    public static const bool kBarrierSafe = true;
+
     public static void store(uint index, float value)
     {
         subgroup_reduce[index] = value;
@@ -92,79 +104,114 @@ void main(
     const uint q_head = group_id.x;
     const uint q_seq = group_id.y;
 
-    BHSDTensor q_tensor = {1u, pc.num_q_heads, pc.q_len, pc.head_dim};
-    BHSDTensor kv_tensor = {1u, pc.num_kv_heads, pc.kv_stride, pc.head_dim};
-    BHSDTensor o_tensor = q_tensor;
-
-    if (q_head >= q_tensor.heads || q_seq >= q_tensor.seq_len) {
+    if (q_head >= pc.num_q_heads || q_seq >= pc.q_len) {
+        return;
+    }
+    if (pc.head_dim > uint(MAX_HEAD_DIM)) {
         return;
     }
 
-    const uint heads_per_kv = q_tensor.heads / kv_tensor.heads;
+    const uint heads_per_kv = pc.num_q_heads / pc.num_kv_heads;
     const uint kv_head = q_head / heads_per_kv;
-    const uint q_base = BHSDLayout::offset(q_tensor, 0u, q_head, q_seq, 0u);
-    const uint o_base = BHSDLayout::offset(o_tensor, 0u, q_head, q_seq, 0u);
+    const uint q_batch_stride = pc.num_q_heads * pc.q_len * pc.head_dim;
+    const uint q_head_stride = pc.q_len * pc.head_dim;
+    const uint q_seq_stride = pc.head_dim;
+    const uint kv_batch_stride = pc.num_kv_heads * pc.kv_stride * pc.head_dim;
+    const uint kv_head_stride = pc.kv_stride * pc.head_dim;
+    const uint kv_seq_stride = pc.head_dim;
+    const uint q_base = StridedLayout::offset4(0u, q_batch_stride, q_head_stride, q_seq_stride, 1u, 0u, q_head, q_seq, 0u);
+    const uint kv_base = StridedLayout::offset4(0u, kv_batch_stride, kv_head_stride, kv_seq_stride, 1u, 0u, kv_head, 0u, 0u);
     const uint base_position = pc.kv_len - pc.q_len;
     const uint attended_kv_len = base_position + q_seq + 1u;
-    const VectorSegment4 segment = Workgroup::vector_segment4<WG_SIZE>(tid);
+    const Fp16Span q_slice = {q_base, 1u, pc.head_dim};
+    const Fp16SliceSet kv_slices = {kv_base, kv_seq_stride, 1u, attended_kv_len, pc.head_dim};
+    const RWFp16Span o_slice = {q_base, 1u, pc.head_dim};
+    const uint index0 = tid;
+    const uint index1 = tid + uint(WG_SIZE);
+    const uint index2 = tid + 2u * uint(WG_SIZE);
+    const uint index3 = tid + 3u * uint(WG_SIZE);
 
-    Workgroup::load_strided_slice<SharedQueryStorage, WG_SIZE>(q_data, q_base, 1u, q_tensor.head_dim, tid);
+    Workgroup::gather_slice<SharedQueryStorage, WG_SIZE>(q_data, q_slice, tid);
     GroupMemoryBarrierWithGroupSync();
 
     float max_score = NEG_INF;
-    for (uint seq_base = 0u; seq_base < attended_kv_len; seq_base += SCORE_TILE) {
-        const uint seq_count = min(uint(SCORE_TILE), attended_kv_len - seq_base);
-        if (tid < seq_count) {
-            const uint k_base = BHSDLayout::offset(kv_tensor, 0u, kv_head, seq_base + tid, 0u);
-            max_score = max(
-                max_score,
-                Thread::scaled_dot_strided_slice<SharedQueryStorage>(
-                    k_data,
-                    k_base,
-                    1u,
-                    kv_tensor.head_dim,
-                    pc.scale));
+    [loop]
+    for (uint slice_base = 0u; slice_base < kv_slices.slice_count; slice_base += uint(SCORE_TILE)) {
+        const uint tile_count = min(uint(SCORE_TILE), kv_slices.slice_count - slice_base);
+        if (tid < tile_count) {
+            const Fp16Span score_slice = kv_slices.slice(slice_base + tid);
+            float score = 0.0;
+            uint index = 0u;
+            const uint vectorized_end = score_slice.vectorized_count8();
+
+            for (; index < vectorized_end; index += 8u) {
+                const FloatPack8 src_values = Thread::load_fp16_pack8(k_data, score_slice.offset(index));
+                score += dot(Thread::gather_storage4<SharedQueryStorage>(index + 0u), src_values.lo);
+                score += dot(Thread::gather_storage4<SharedQueryStorage>(index + 4u), src_values.hi);
+            }
+
+            for (; index < score_slice.count; ++index) {
+                score += SharedQueryStorage::load(index) * Thread::load_fp16(k_data, score_slice.offset(index));
+            }
+
+            max_score = max(max_score, score * pc.scale);
         }
     }
 
     const float stabilized_max = Workgroup::broadcast_scalar<SharedScalarStorage>(
-        Workgroup::reduce_max<SharedScalarStorage, WG_SIZE>(max_score, tid),
+        Workgroup::leader_reduce_max<SharedScalarStorage, WG_SIZE>(max_score, tid),
         tid);
-    float norm_sum = 0.0;
-    float4 accum = float4(0.0);
 
-    for (uint seq_base = 0u; seq_base < attended_kv_len; seq_base += SCORE_TILE) {
-        const uint seq_count = min(uint(SCORE_TILE), attended_kv_len - seq_base);
-        if (tid < seq_count) {
-            const uint k_base = BHSDLayout::offset(kv_tensor, 0u, kv_head, seq_base + tid, 0u);
-            norm_sum += Thread::store_exp_of_scaled_dot<SharedQueryStorage, SharedScoreTileStorage>(
-                k_data,
-                k_base,
-                1u,
-                kv_tensor.head_dim,
-                pc.scale,
-                stabilized_max,
-                tid);
+    float4 accum = float4(0.0);
+    float norm_sum = 0.0;
+    [loop]
+    for (uint slice_base = 0u; slice_base < kv_slices.slice_count; slice_base += uint(SCORE_TILE)) {
+        const uint tile_count = min(uint(SCORE_TILE), kv_slices.slice_count - slice_base);
+        if (tid < tile_count) {
+            const Fp16Span score_slice = kv_slices.slice(slice_base + tid);
+            float score = 0.0;
+            uint index = 0u;
+            const uint vectorized_end = score_slice.vectorized_count8();
+
+            for (; index < vectorized_end; index += 8u) {
+                const FloatPack8 src_values = Thread::load_fp16_pack8(k_data, score_slice.offset(index));
+                score += dot(Thread::gather_storage4<SharedQueryStorage>(index + 0u), src_values.lo);
+                score += dot(Thread::gather_storage4<SharedQueryStorage>(index + 4u), src_values.hi);
+            }
+
+            for (; index < score_slice.count; ++index) {
+                score += SharedQueryStorage::load(index) * Thread::load_fp16(k_data, score_slice.offset(index));
+            }
+
+            const float weight = exp(score * pc.scale - stabilized_max);
+            SharedScoreTileStorage::store(tid, weight);
+            norm_sum += weight;
         }
         GroupMemoryBarrierWithGroupSync();
 
-        const uint v_base = BHSDLayout::offset(kv_tensor, 0u, kv_head, seq_base, 0u);
-        Thread::accumulate_weighted_strided_slices4<SharedScoreTileStorage>(
-            accum,
-            v_data,
-            v_base,
-            kv_tensor.head_dim,
-            1u,
-            seq_count,
-            kv_tensor.head_dim,
-            segment);
+        for (uint slice = 0u; slice < tile_count; ++slice) {
+            const float weight = SharedScoreTileStorage::load(slice);
+            const Fp16Span value_slice = kv_slices.slice(slice_base + slice);
+            if (index0 < value_slice.count) {
+                accum.x += weight * Thread::load_fp16(v_data, value_slice.offset(index0));
+            }
+            if (index1 < value_slice.count) {
+                accum.y += weight * Thread::load_fp16(v_data, value_slice.offset(index1));
+            }
+            if (index2 < value_slice.count) {
+                accum.z += weight * Thread::load_fp16(v_data, value_slice.offset(index2));
+            }
+            if (index3 < value_slice.count) {
+                accum.w += weight * Thread::load_fp16(v_data, value_slice.offset(index3));
+            }
+        }
         GroupMemoryBarrierWithGroupSync();
     }
 
     const float total_norm = Workgroup::broadcast_scalar<SharedScalarStorage>(
-        Workgroup::reduce_sum<SharedScalarStorage, WG_SIZE>(norm_sum, tid),
+        Workgroup::leader_reduce_sum<SharedScalarStorage, WG_SIZE>(norm_sum, tid),
         tid);
 
     const float inv_norm = (total_norm > 0.0) ? (1.0 / total_norm) : 0.0;
-    Thread::store_strided_values4(o_data, o_base, 1u, o_tensor.head_dim, segment, accum * inv_norm);
+    Thread::scatter_values4(o_data, o_slice, tid, WG_SIZE, accum * inv_norm);
 }

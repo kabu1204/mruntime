@@ -4,6 +4,7 @@
 // C: [M, N] row-major FP16
 
 import compute_arch;
+import layout_traits;
 import register_tile;
 import scope_primitives;
 import storage_traits;
@@ -42,6 +43,11 @@ groupshared half2 tile_b[TILE_N][SHMEM_K2];
 
 public struct SharedTileAStorage : IHalf2TileStorage
 {
+    public static const uint kRows = TILE_M;
+    public static const uint kCols = SHMEM_K2;
+    public static const StorageScope kScope = StorageScope::Workgroup;
+    public static const bool kBarrierSafe = true;
+
     public static void store(uint row, uint col, half2 value)
     {
         tile_a[row][col] = value;
@@ -55,6 +61,11 @@ public struct SharedTileAStorage : IHalf2TileStorage
 
 public struct SharedTileBStorage : IHalf2TileStorage
 {
+    public static const uint kRows = TILE_N;
+    public static const uint kCols = SHMEM_K2;
+    public static const StorageScope kScope = StorageScope::Workgroup;
+    public static const bool kBarrierSafe = true;
+
     public static void store(uint row, uint col, half2 value)
     {
         tile_b[row][col] = value;
@@ -87,7 +98,8 @@ void main(
     for (uint tile_k = 0u; tile_k < num_k_tiles; ++tile_k) {
         const uint k_base = tile_k * uint(TILE_K);
 
-        Workgroup::load_matrix_rows_half2_tile<
+        Workgroup::stage_tile_half2<
+            RowMajorTensorLayout,
             SharedTileAStorage,
             WG_X,
             WG_Y,
@@ -95,7 +107,8 @@ void main(
             TILE_K2,
             LOADS_PER_THREAD>(a_data, global_a, tile_a_region, k_base, local_id);
 
-        Workgroup::load_matrix_rows_half2_tile<
+        Workgroup::stage_tile_half2<
+            RowMajorTensorLayout,
             SharedTileBStorage,
             WG_X,
             WG_Y,
@@ -116,5 +129,10 @@ void main(
         GroupMemoryBarrierWithGroupSync();
     }
 
-    Workgroup::store_matrix_tile<THREAD_TILE, THREAD_TILE>(c_data, global_c, accum, tile_c_region, local_id);
+    Workgroup::scatter_register_tile<RowMajorTensorLayout, THREAD_TILE, THREAD_TILE>(
+        c_data,
+        global_c,
+        accum,
+        tile_c_region,
+        local_id);
 }

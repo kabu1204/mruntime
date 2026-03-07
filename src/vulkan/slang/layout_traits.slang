@@ -1,6 +1,11 @@
 import tile_views;
 
-public struct RowMajorTensorLayout
+public interface ITensor2DLayout
+{
+    static uint offset(GlobalTensor2D tensor, uint row, uint col);
+}
+
+public struct RowMajorTensorLayout : ITensor2DLayout
 {
     public static uint offset(GlobalTensor2D tensor, uint row, uint col)
     {
@@ -8,62 +13,49 @@ public struct RowMajorTensorLayout
     }
 }
 
-public struct RowMajorVector4Layout
+public struct ColMajorTensorLayout : ITensor2DLayout
 {
-    public static uint offset(GlobalVector4Tensor2D tensor, uint row, uint col4)
+    public static uint offset(GlobalTensor2D tensor, uint row, uint col)
     {
-        return row * tensor.stride4 + col4;
+        return col * tensor.stride + row;
     }
 }
 
-public struct GateUpInterleavedLayout
+public struct StridedLayout
 {
-    public static uint total_elements(GateUpInterleavedTensor tensor)
+    public static uint offset(uint base, uint stride, uint index)
     {
-        return tensor.num_tokens * tensor.intermediate_size;
+        return base + index * stride;
     }
 
-    public static uint row_offset(GateUpInterleavedTensor tensor, uint token)
+    public static uint offset2(uint base, uint stride0, uint stride1, uint i0, uint i1)
     {
-        return token * 2u * tensor.intermediate_size;
+        return base + i0 * stride0 + i1 * stride1;
     }
 
-    public static uint gate_offset(GateUpInterleavedTensor tensor, uint token, uint index)
+    public static uint offset3(
+        uint base,
+        uint stride0,
+        uint stride1,
+        uint stride2,
+        uint i0,
+        uint i1,
+        uint i2)
     {
-        return row_offset(tensor, token) + index;
+        return base + i0 * stride0 + i1 * stride1 + i2 * stride2;
     }
 
-    public static uint up_offset(GateUpInterleavedTensor tensor, uint token, uint index)
+    public static uint offset4(
+        uint base,
+        uint stride0,
+        uint stride1,
+        uint stride2,
+        uint stride3,
+        uint i0,
+        uint i1,
+        uint i2,
+        uint i3)
     {
-        return row_offset(tensor, token) + tensor.intermediate_size + index;
-    }
-}
-
-public struct BSHDLayout
-{
-    public static uint offset(BSHDTensor tensor, uint batch, uint seq, uint head, uint dim)
-    {
-        return (((batch * tensor.seq_len + seq) * tensor.heads + head) * tensor.head_dim) + dim;
-    }
-
-    public static uint row_task_count(BSHDTensor tensor)
-    {
-        return tensor.batch * tensor.seq_len * tensor.heads;
-    }
-}
-
-public struct BHSDLayout
-{
-    public static uint offset(BHSDTensor tensor, uint batch, uint head, uint seq, uint dim)
-    {
-        return (((batch * tensor.heads + head) * tensor.seq_len + seq) * tensor.head_dim) + dim;
-    }
-}
-
-public struct RopeLookupLayout
-{
-    public static uint offset(RopeLookupTensor tensor, uint position, uint dim_half)
-    {
-        return position * tensor.half_dim + dim_half;
+        return base + i0 * stride0 + i1 * stride1 + i2 * stride2 + i3 * stride3;
     }
 }

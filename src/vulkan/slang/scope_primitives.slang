@@ -5,6 +5,12 @@ import register_tile;
 import storage_traits;
 import tile_views;
 
+public struct FloatPack8
+{
+    public float4 lo;
+    public float4 hi;
+}
+
 public struct Workgroup
 {
     public static uint flatten_local_id<int WorkgroupX>(uint3 local_id)
@@ -12,7 +18,8 @@ public struct Workgroup
         return local_id.y * uint(WorkgroupX) + local_id.x;
     }
 
-    public static void load_matrix_rows_half2_tile<
+    public static void stage_tile_half2<
+        Layout : ITensor2DLayout,
         Storage : IHalf2TileStorage,
         int WorkgroupX,
         int WorkgroupY,
@@ -22,9 +29,17 @@ public struct Workgroup
             StructuredBuffer<half> src,
             GlobalTensor2D tensor,
             SharedTileRegion region,
-            uint k_base,
+            uint col_base,
             uint3 local_id)
     {
+        static_assert(
+            LoadsPerThread * WorkgroupX * WorkgroupY == TileRows * TileK2,
+            "Tile loader requires exact work coverage.");
+        static_assert(Storage::kRows >= uint(TileRows), "Tile storage row extent is too small.");
+        static_assert(Storage::kCols >= uint(TileK2), "Tile storage column extent is too small.");
+        static_assert(Storage::kScope == StorageScope::Workgroup, "Tile storage must be workgroup-visible.");
+        static_assert(Storage::kBarrierSafe, "Tile storage must survive workgroup barriers.");
+
         const uint tid = flatten_local_id<WorkgroupX>(local_id);
         const uint workgroup_size = uint(WorkgroupX * WorkgroupY);
 
@@ -32,27 +47,28 @@ public struct Workgroup
         for (int iter = 0; iter < LoadsPerThread; ++iter) {
             const uint idx = uint(iter) * workgroup_size + tid;
             const uint row = idx / uint(TileK2);
-            const uint k2 = idx % uint(TileK2);
+            const uint col2 = idx % uint(TileK2);
 
             half v0 = half(0.0);
             half v1 = half(0.0);
 
             const uint global_row = region.row + row;
-            const uint global_col0 = region.col + k_base + 2u * k2;
+            const uint global_col0 = region.col + col_base + 2u * col2;
             const uint global_col1 = global_col0 + 1u;
 
-            if (global_row < tensor.rows && global_col0 < tensor.cols) {
-                v0 = src[RowMajorTensorLayout::offset(tensor, global_row, global_col0)];
+            if (tensor.contains(global_row, global_col0)) {
+                v0 = src[Layout::offset(tensor, global_row, global_col0)];
             }
-            if (global_row < tensor.rows && global_col1 < tensor.cols) {
-                v1 = src[RowMajorTensorLayout::offset(tensor, global_row, global_col1)];
+            if (tensor.contains(global_row, global_col1)) {
+                v1 = src[Layout::offset(tensor, global_row, global_col1)];
             }
 
-            Storage::store(row, k2, half2(v0, v1));
+            Storage::store(row, col2, half2(v0, v1));
         }
     }
 
-    public static void store_matrix_tile<
+    public static void scatter_register_tile<
+        Layout : ITensor2DLayout,
         int ThreadRows,
         int ThreadCols>(
             RWStructuredBuffer<half> dst,
@@ -70,117 +86,53 @@ public struct Workgroup
             for (int col = 0; col < ThreadCols; ++col) {
                 const uint global_row = region.row + sub_m + uint(row);
                 const uint global_col = region.col + sub_n + uint(col);
-                if (global_row < tensor.rows && global_col < tensor.cols) {
-                    dst[RowMajorTensorLayout::offset(tensor, global_row, global_col)] = half(accum.values[row][col]);
+                if (tensor.contains(global_row, global_col)) {
+                    dst[Layout::offset(tensor, global_row, global_col)] = half(accum.values[row][col]);
                 }
             }
         }
     }
 
-    public static float4 load_rows4_dot(
-        StructuredBuffer<half4> x,
-        StructuredBuffer<half4> weights,
-        GlobalVector4Tensor2D weight_matrix,
-        RowBlock4 rows,
-        uint col4)
-    {
-        const float4 x_value = float4(x[col4]);
-        float4 partial = float4(0.0);
-
-        [unroll]
-        for (int row = 0; row < 4; ++row) {
-            const uint global_row = rows.row_base + uint(row);
-            if (global_row < weight_matrix.rows) {
-                partial[row] = dot(x_value, float4(weights[RowMajorVector4Layout::offset(weight_matrix, global_row, col4)]));
-            }
-        }
-
-        return partial;
-    }
-
-    public static float4 accumulate_rows4_vec4_dot<int WorkgroupSize>(
-        StructuredBuffer<half4> x,
-        StructuredBuffer<half4> weights,
-        GlobalVector4Tensor1D vector,
-        GlobalVector4Tensor2D weight_matrix,
-        RowBlock4 rows,
+    public static void gather_slice<Storage : IFloatStorage1D, int WorkgroupSize>(
+        ByteAddressBuffer src,
+        Fp16Span slice,
         uint tid)
     {
-        float4 partial = float4(0.0);
-        const uint stride = uint(WorkgroupSize);
+        static_assert(Storage::kScope == StorageScope::Workgroup, "Tile scratch must be workgroup-visible.");
+        static_assert(Storage::kBarrierSafe, "Tile scratch must survive a workgroup barrier.");
 
-        for (uint col4 = tid; col4 < vector.size4; col4 += 2u * stride) {
-            partial += load_rows4_dot(x, weights, weight_matrix, rows, col4);
+        const uint vectorized_end = slice.vectorized_count8();
+        const uint chunk = 8u;
+        const uint chunk_stride = uint(WorkgroupSize) * chunk;
 
-            const uint next_col4 = col4 + stride;
-            if (next_col4 < vector.size4) {
-                partial += load_rows4_dot(x, weights, weight_matrix, rows, next_col4);
+        for (uint index = tid * chunk; index < vectorized_end; index += chunk_stride) {
+            const FloatPack8 values = Thread::load_fp16_pack8(src, slice.offset(index));
+            Storage::store(index + 0u, values.lo.x);
+            Storage::store(index + 1u, values.lo.y);
+            Storage::store(index + 2u, values.lo.z);
+            Storage::store(index + 3u, values.lo.w);
+            Storage::store(index + 4u, values.hi.x);
+            Storage::store(index + 5u, values.hi.y);
+            Storage::store(index + 6u, values.hi.z);
+            Storage::store(index + 7u, values.hi.w);
+        }
+
+        for (uint index = tid; index < slice.count; index += uint(WorkgroupSize)) {
+            if (index < vectorized_end) {
+                continue;
             }
-        }
-
-        return partial;
-    }
-
-    public static void store_rows4(
-        RWStructuredBuffer<half> dst,
-        GlobalTensor1D vector,
-        RowBlock4 rows,
-        float4 values,
-        uint tid)
-    {
-        if (tid != 0u) {
-            return;
-        }
-
-        [unroll]
-        for (int row = 0; row < 4; ++row) {
-            const uint global_row = rows.row_base + uint(row);
-            if (global_row < vector.size) {
-                dst[global_row] = half(values[row]);
-            }
+            Storage::store(index, Thread::load_fp16(src, slice.offset(index)));
         }
     }
 
-    public static void load_strided_slice<Storage : IFloatStorage1D, int WorkgroupSize>(
-        StructuredBuffer<half> src,
-        uint base,
-        uint stride,
-        uint count,
-        uint tid)
+    public static float leader_reduce_sum<Storage : IFloatStorage1D, int WorkgroupSize>(float value, uint tid)
     {
-        for (uint index = tid; index < count; index += uint(WorkgroupSize)) {
-            Storage::store(index, float(src[base + index * stride]));
-        }
-    }
+        static_assert(Storage::kExtent >= uint(WorkgroupSize), "Reduction scratch must cover the whole workgroup.");
+        static_assert(Storage::kScope == StorageScope::Workgroup, "Reduction scratch must be workgroup-visible.");
+        static_assert(Storage::kBarrierSafe, "Reduction scratch must survive workgroup barriers.");
 
-    public static VectorSegment4 vector_segment4<int WorkgroupSize>(uint tid)
-    {
-        VectorSegment4 segment;
-        segment.x = tid;
-        segment.y = tid + uint(WorkgroupSize);
-        segment.z = tid + 2u * uint(WorkgroupSize);
-        segment.w = tid + 3u * uint(WorkgroupSize);
-        return segment;
-    }
-
-    public static float tree_reduce_sum<Storage : IFloatStorage1D, int WorkgroupSize>(float wave_sum, uint tid)
-    {
-        const uint lane = WaveGetLaneIndex();
-        const uint wave_size = WaveGetLaneCount();
-        const uint wave_id = tid / wave_size;
-        const uint wave_count = (uint(WorkgroupSize) + wave_size - 1u) / wave_size;
-
-        if (wave_count == 1u) {
-            if (lane == 0u) {
-                return wave_sum;
-            }
-            return 0.0;
-        }
-
-        if (lane == 0u) {
-            Storage::store(wave_id, wave_sum);
-        }
-
+        const float subgroup_sum = Subgroup::reduce_sum(value);
+        Storage::store(tid, Subgroup::is_leader() ? subgroup_sum : 0.0);
         GroupMemoryBarrierWithGroupSync();
 
         if (tid != 0u) {
@@ -188,35 +140,21 @@ public struct Workgroup
         }
 
         float total = 0.0;
-        for (uint wave = 0u; wave < wave_count; ++wave) {
-            total += Storage::load(wave);
+        [unroll]
+        for (uint index = 0u; index < uint(WorkgroupSize); ++index) {
+            total += Storage::load(index);
         }
         return total;
     }
 
-    public static float reduce_sum<Storage : IFloatStorage1D, int WorkgroupSize>(float value, uint tid)
+    public static float leader_reduce_max<Storage : IFloatStorage1D, int WorkgroupSize>(float value, uint tid)
     {
-        return tree_reduce_sum<Storage, WorkgroupSize>(Subgroup::reduce_sum(value), tid);
-    }
+        static_assert(Storage::kExtent >= uint(WorkgroupSize), "Reduction scratch must cover the whole workgroup.");
+        static_assert(Storage::kScope == StorageScope::Workgroup, "Reduction scratch must be workgroup-visible.");
+        static_assert(Storage::kBarrierSafe, "Reduction scratch must survive workgroup barriers.");
 
-    public static float tree_reduce_max<Storage : IFloatStorage1D, int WorkgroupSize>(float wave_max, uint tid)
-    {
-        const uint lane = WaveGetLaneIndex();
-        const uint wave_size = WaveGetLaneCount();
-        const uint wave_id = tid / wave_size;
-        const uint wave_count = (uint(WorkgroupSize) + wave_size - 1u) / wave_size;
-
-        if (wave_count == 1u) {
-            if (lane == 0u) {
-                return wave_max;
-            }
-            return 0.0;
-        }
-
-        if (lane == 0u) {
-            Storage::store(wave_id, wave_max);
-        }
-
+        const float subgroup_max = Subgroup::reduce_max(value);
+        Storage::store(tid, Subgroup::is_leader() ? subgroup_max : -3.402823466e38);
         GroupMemoryBarrierWithGroupSync();
 
         if (tid != 0u) {
@@ -224,19 +162,19 @@ public struct Workgroup
         }
 
         float total = Storage::load(0u);
-        for (uint wave = 1u; wave < wave_count; ++wave) {
-            total = max(total, Storage::load(wave));
+        [unroll]
+        for (uint index = 1u; index < uint(WorkgroupSize); ++index) {
+            total = max(total, Storage::load(index));
         }
         return total;
     }
 
-    public static float reduce_max<Storage : IFloatStorage1D, int WorkgroupSize>(float value, uint tid)
-    {
-        return tree_reduce_max<Storage, WorkgroupSize>(Subgroup::reduce_max(value), tid);
-    }
-
     public static float broadcast_scalar<Storage : IFloatStorage1D>(float value, uint tid)
     {
+        static_assert(Storage::kExtent > 0u, "Broadcast scratch must have at least one lane.");
+        static_assert(Storage::kScope == StorageScope::Workgroup, "Broadcast scratch must be workgroup-visible.");
+        static_assert(Storage::kBarrierSafe, "Broadcast scratch must survive workgroup barriers.");
+
         if (tid == 0u) {
             Storage::store(0u, value);
         }
@@ -245,24 +183,14 @@ public struct Workgroup
         return Storage::load(0u);
     }
 
-    public static float4 tree_reduce_sum<Storage : IFloat4Storage1D, int WorkgroupSize>(float4 wave_sum, uint tid)
+    public static float4 leader_reduce_sum4<Storage : IFloat4Storage1D, int WorkgroupSize>(float4 value, uint tid)
     {
-        const uint lane = WaveGetLaneIndex();
-        const uint wave_size = WaveGetLaneCount();
-        const uint wave_id = tid / wave_size;
-        const uint wave_count = (uint(WorkgroupSize) + wave_size - 1u) / wave_size;
+        static_assert(Storage::kExtent >= uint(WorkgroupSize), "Reduction scratch must cover the whole workgroup.");
+        static_assert(Storage::kScope == StorageScope::Workgroup, "Reduction scratch must be workgroup-visible.");
+        static_assert(Storage::kBarrierSafe, "Reduction scratch must survive workgroup barriers.");
 
-        if (wave_count == 1u) {
-            if (lane == 0u) {
-                return wave_sum;
-            }
-            return float4(0.0);
-        }
-
-        if (lane == 0u) {
-            Storage::store(wave_id, wave_sum);
-        }
-
+        const float4 subgroup_sum = Subgroup::reduce_sum(value);
+        Storage::store(tid, Subgroup::is_leader() ? subgroup_sum : float4(0.0));
         GroupMemoryBarrierWithGroupSync();
 
         if (tid != 0u) {
@@ -270,8 +198,9 @@ public struct Workgroup
         }
 
         float4 total = float4(0.0);
-        for (uint wave = 0u; wave < wave_count; ++wave) {
-            total += Storage::load(wave);
+        [unroll]
+        for (uint index = 0u; index < uint(WorkgroupSize); ++index) {
+            total += Storage::load(index);
         }
         return total;
     }
@@ -284,230 +213,190 @@ public struct Thread
         return dispatch_id.x;
     }
 
-    public static void apply_binary_elementwise<Op : IBinaryPointwiseOp>(
-        StructuredBuffer<half> lhs,
-        StructuredBuffer<half> rhs,
+    public static float load_fp16(ByteAddressBuffer src, uint elem_index)
+    {
+        const uint byte_offset = elem_index * 2u;
+        const uint packed = src.Load(int(byte_offset & ~3u));
+        const uint lane = (byte_offset & 2u) >> 1u;
+        const uint bits = (lane == 0u) ? (packed & 0xffffu) : (packed >> 16);
+        return f16tof32(bits);
+    }
+
+    public static float4 gather_storage4<Storage : IFloatStorage1D>(uint index)
+    {
+        return float4(
+            Storage::load(index + 0u),
+            Storage::load(index + 1u),
+            Storage::load(index + 2u),
+            Storage::load(index + 3u));
+    }
+
+    public static FloatPack8 load_fp16_pack8(ByteAddressBuffer src, uint base_elem)
+    {
+        if ((base_elem & 1u) != 0u) {
+            FloatPack8 values;
+            values.lo = float4(
+                load_fp16(src, base_elem + 0u),
+                load_fp16(src, base_elem + 1u),
+                load_fp16(src, base_elem + 2u),
+                load_fp16(src, base_elem + 3u));
+            values.hi = float4(
+                load_fp16(src, base_elem + 4u),
+                load_fp16(src, base_elem + 5u),
+                load_fp16(src, base_elem + 6u),
+                load_fp16(src, base_elem + 7u));
+            return values;
+        }
+
+        const uint byte_offset = base_elem * 2u;
+        uint4 packed;
+        if ((byte_offset & 15u) == 0u) {
+            packed = src.Load4Aligned(int(byte_offset));
+        } else {
+            packed = src.Load4(int(byte_offset));
+        }
+
+        const uint4 lo_bits = uint4(
+            packed.x & 0xffffu,
+            packed.x >> 16,
+            packed.y & 0xffffu,
+            packed.y >> 16);
+        const uint4 hi_bits = uint4(
+            packed.z & 0xffffu,
+            packed.z >> 16,
+            packed.w & 0xffffu,
+            packed.w >> 16);
+
+        FloatPack8 values;
+        values.lo = float4(
+            f16tof32(lo_bits.x),
+            f16tof32(lo_bits.y),
+            f16tof32(lo_bits.z),
+            f16tof32(lo_bits.w));
+        values.hi = float4(
+            f16tof32(hi_bits.x),
+            f16tof32(hi_bits.y),
+            f16tof32(hi_bits.z),
+            f16tof32(hi_bits.w));
+        return values;
+    }
+
+    public static float4 map_values4<Op : IPointwiseOp>(float4 values)
+    {
+        return float4(
+            Op::apply(values.x),
+            Op::apply(values.y),
+            Op::apply(values.z),
+            Op::apply(values.w));
+    }
+
+    public static float4 zip_values4<Op : IBinaryPointwiseOp>(float4 lhs, float4 rhs)
+    {
+        return float4(
+            Op::apply(lhs.x, rhs.x),
+            Op::apply(lhs.y, rhs.y),
+            Op::apply(lhs.z, rhs.z),
+            Op::apply(lhs.w, rhs.w));
+    }
+
+    public static FloatPack8 zip_values8<Op : IBinaryPointwiseOp>(FloatPack8 lhs, FloatPack8 rhs)
+    {
+        FloatPack8 values;
+        values.lo = zip_values4<Op>(lhs.lo, rhs.lo);
+        values.hi = zip_values4<Op>(lhs.hi, rhs.hi);
+        return values;
+    }
+
+    public static void scatter_values4(
         RWStructuredBuffer<half> dst,
-        GlobalTensor1D tensor,
-        uint index)
-    {
-        if (index >= tensor.size) {
-            return;
-        }
-
-        dst[index] = half(Op::apply(float(lhs[index]), float(rhs[index])));
-    }
-
-    public static float dot_strided_slice<QueryStorage : IFloatStorage1D>(
-        StructuredBuffer<half> src,
-        uint base,
-        uint stride,
-        uint count)
-    {
-        float score = 0.0;
-        for (uint index = 0u; index < count; ++index) {
-            score += QueryStorage::load(index) * float(src[base + index * stride]);
-        }
-        return score;
-    }
-
-    public static float scaled_dot_strided_slice<QueryStorage : IFloatStorage1D>(
-        StructuredBuffer<half> src,
-        uint base,
-        uint stride,
-        uint count,
-        float scale)
-    {
-        return dot_strided_slice<QueryStorage>(src, base, stride, count) * scale;
-    }
-
-    public static float store_exp_of_scaled_dot<QueryStorage : IFloatStorage1D, Storage : IFloatStorage1D>(
-        StructuredBuffer<half> src,
-        uint base,
-        uint stride,
-        uint count,
-        float scale,
-        float shift,
-        uint index)
-    {
-        const float value = exp(scaled_dot_strided_slice<QueryStorage>(src, base, stride, count, scale) - shift);
-        Storage::store(index, value);
-        return value;
-    }
-
-    public static void accumulate_weighted_strided_slices4<WeightStorage : IFloatStorage1D>(
-        inout float4 accum,
-        StructuredBuffer<half> src,
-        uint base,
-        uint slice_stride,
-        uint value_stride,
-        uint slice_count,
-        uint value_count,
-        VectorSegment4 segment)
-    {
-        [loop]
-        for (uint slice = 0u; slice < slice_count; ++slice) {
-            const float weight = WeightStorage::load(slice);
-            const uint slice_base = base + slice * slice_stride;
-            if (segment.x < value_count) {
-                accum.x += weight * float(src[slice_base + segment.x * value_stride]);
-            }
-            if (segment.y < value_count) {
-                accum.y += weight * float(src[slice_base + segment.y * value_stride]);
-            }
-            if (segment.z < value_count) {
-                accum.z += weight * float(src[slice_base + segment.z * value_stride]);
-            }
-            if (segment.w < value_count) {
-                accum.w += weight * float(src[slice_base + segment.w * value_stride]);
-            }
-        }
-    }
-
-    public static void store_strided_values4(
-        RWStructuredBuffer<half> dst,
-        uint base,
-        uint stride,
-        uint count,
-        VectorSegment4 segment,
+        RWFp16Span dst_span,
+        uint base_index,
+        uint index_stride,
         float4 values)
     {
-        if (segment.x < count) {
-            dst[base + segment.x * stride] = half(values.x);
+        const uint index0 = base_index;
+        const uint index1 = base_index + index_stride;
+        const uint index2 = base_index + 2u * index_stride;
+        const uint index3 = base_index + 3u * index_stride;
+
+        if (dst_span.contains(index0)) {
+            dst[dst_span.offset(index0)] = half(values.x);
         }
-        if (segment.y < count) {
-            dst[base + segment.y * stride] = half(values.y);
+        if (dst_span.contains(index1)) {
+            dst[dst_span.offset(index1)] = half(values.y);
         }
-        if (segment.z < count) {
-            dst[base + segment.z * stride] = half(values.z);
+        if (dst_span.contains(index2)) {
+            dst[dst_span.offset(index2)] = half(values.z);
         }
-        if (segment.w < count) {
-            dst[base + segment.w * stride] = half(values.w);
+        if (dst_span.contains(index3)) {
+            dst[dst_span.offset(index3)] = half(values.w);
         }
     }
 
-    public static void apply_interleaved_gate_up<Activation : IPointwiseOp>(
-        StructuredBuffer<half> src,
+    public static void scatter_contiguous_values4(
         RWStructuredBuffer<half> dst,
-        GateUpInterleavedTensor tensor,
-        uint index)
+        uint base_elem,
+        uint count,
+        float4 values)
     {
-        if (index >= GateUpInterleavedLayout::total_elements(tensor)) {
-            return;
+        if (0u < count) {
+            dst[base_elem + 0u] = half(values.x);
         }
+        if (1u < count) {
+            dst[base_elem + 1u] = half(values.y);
+        }
+        if (2u < count) {
+            dst[base_elem + 2u] = half(values.z);
+        }
+        if (3u < count) {
+            dst[base_elem + 3u] = half(values.w);
+        }
+    }
 
-        const uint token = index / tensor.intermediate_size;
-        const uint element = index % tensor.intermediate_size;
-        const float gate = float(src[GateUpInterleavedLayout::gate_offset(tensor, token, element)]);
-        const float up = float(src[GateUpInterleavedLayout::up_offset(tensor, token, element)]);
-        dst[index] = half(Activation::apply(gate) * up);
+    public static void scatter_contiguous_values8(
+        RWStructuredBuffer<half> dst,
+        uint base_elem,
+        uint count,
+        FloatPack8 values)
+    {
+        scatter_contiguous_values4(dst, base_elem, min(count, 4u), values.lo);
+        if (count > 4u) {
+            scatter_contiguous_values4(dst, base_elem + 4u, count - 4u, values.hi);
+        }
     }
 
     public static void copy_span(
         RWStructuredBuffer<half> dst,
-        uint dst_base,
-        StructuredBuffer<half> src,
-        uint src_base,
-        uint count)
+        RWFp16Span dst_span,
+        ByteAddressBuffer src,
+        Fp16Span src_span)
     {
-        for (uint i = 0u; i < count; ++i) {
-            dst[dst_base + i] = src[src_base + i];
-        }
-    }
+        const uint vectorized_end = (dst_span.is_contiguous() && src_span.supports_vectorized_load8())
+            ? (dst_span.count & ~7u)
+            : 0u;
 
-    public static void apply_rope(
-        RWStructuredBuffer<half> q_data,
-        RWStructuredBuffer<half> k_data,
-        StructuredBuffer<float2> rope_cos_sin,
-        BSHDTensor q_tensor,
-        BSHDTensor k_tensor,
-        RopeLookupTensor rope,
-        uint index)
-    {
-        const uint total_heads = q_tensor.heads + k_tensor.heads;
-        const uint total = q_tensor.batch * q_tensor.seq_len * total_heads * rope.half_dim;
-        if (index >= total) {
-            return;
+        uint index = 0u;
+        for (; index < vectorized_end; index += 8u) {
+            scatter_contiguous_values8(
+                dst,
+                dst_span.offset(index),
+                8u,
+                load_fp16_pack8(src, src_span.offset(index)));
         }
 
-        const uint dim_half = index % rope.half_dim;
-        const uint head = (index / rope.half_dim) % total_heads;
-        const uint seq = (index / (rope.half_dim * total_heads)) % q_tensor.seq_len;
-        const uint batch = index / (rope.half_dim * total_heads * q_tensor.seq_len);
-
-        const float2 cs = rope_cos_sin[RopeLookupLayout::offset(rope, rope.position_offset + seq, dim_half)];
-        const float cos_value = cs.x;
-        const float sin_value = cs.y;
-
-        if (head < q_tensor.heads) {
-            const uint base = BSHDLayout::offset(q_tensor, batch, seq, head, 0u);
-            const float x0 = float(q_data[base + dim_half]);
-            const float x1 = float(q_data[base + rope.half_dim + dim_half]);
-            q_data[base + dim_half] = half(x0 * cos_value - x1 * sin_value);
-            q_data[base + rope.half_dim + dim_half] = half(x1 * cos_value + x0 * sin_value);
-            return;
+        for (; index < dst_span.count; ++index) {
+            dst[dst_span.offset(index)] = half(load_fp16(src, src_span.offset(index)));
         }
-
-        const uint kv_head = head - q_tensor.heads;
-        const uint base = BSHDLayout::offset(k_tensor, batch, seq, kv_head, 0u);
-        const float x0 = float(k_data[base + dim_half]);
-        const float x1 = float(k_data[base + rope.half_dim + dim_half]);
-        k_data[base + dim_half] = half(x0 * cos_value - x1 * sin_value);
-        k_data[base + rope.half_dim + dim_half] = half(x1 * cos_value + x0 * sin_value);
-    }
-
-    public static void transpose_bshd_to_bhsd(
-        StructuredBuffer<half> src,
-        RWStructuredBuffer<half> dst,
-        BSHDTensor src_tensor,
-        BHSDTensor dst_tensor,
-        uint task_id)
-    {
-        if (task_id >= BSHDLayout::row_task_count(src_tensor)) {
-            return;
-        }
-
-        const uint seq = task_id % src_tensor.seq_len;
-        const uint head = (task_id / src_tensor.seq_len) % src_tensor.heads;
-        const uint batch = task_id / (src_tensor.seq_len * src_tensor.heads);
-
-        copy_span(
-            dst,
-            BHSDLayout::offset(dst_tensor, batch, head, seq, 0u),
-            src,
-            BSHDLayout::offset(src_tensor, batch, seq, head, 0u),
-            src_tensor.head_dim);
-    }
-
-    public static void copy_kv_cache(
-        StructuredBuffer<half> k_in,
-        StructuredBuffer<half> v_in,
-        RWStructuredBuffer<half> k_cache,
-        RWStructuredBuffer<half> v_cache,
-        BSHDTensor src_tensor,
-        BHSDTensor dst_tensor,
-        uint position_offset,
-        uint task_id)
-    {
-        if (task_id >= BSHDLayout::row_task_count(src_tensor)) {
-            return;
-        }
-
-        const uint head = task_id % src_tensor.heads;
-        const uint seq = (task_id / src_tensor.heads) % src_tensor.seq_len;
-        const uint batch = task_id / (src_tensor.heads * src_tensor.seq_len);
-        const uint cache_seq = position_offset + seq;
-
-        const uint src_base = BSHDLayout::offset(src_tensor, batch, seq, head, 0u);
-        const uint dst_base = BHSDLayout::offset(dst_tensor, batch, head, cache_seq, 0u);
-
-        copy_span(k_cache, dst_base, k_in, src_base, src_tensor.head_dim);
-        copy_span(v_cache, dst_base, v_in, src_base, src_tensor.head_dim);
     }
 }
 
 public struct Subgroup
 {
+    public static bool is_leader()
+    {
+        return WaveGetLaneIndex() == 0u;
+    }
+
     public static float reduce_sum(float value)
     {
         return WaveActiveSum(value);
