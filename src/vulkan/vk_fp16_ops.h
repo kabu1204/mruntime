@@ -22,21 +22,24 @@ class VkFp16Ops {
         const VkDescriptorBufferInfo& a,
         const VkDescriptorBufferInfo& b,
         const VkDescriptorBufferInfo& out,
-        uint32_t n
+        uint32_t n,
+        VkDispatchBatch* batch = nullptr
     ) const;
 
     void mul(
         const VkDescriptorBufferInfo& a,
         const VkDescriptorBufferInfo& b,
         const VkDescriptorBufferInfo& out,
-        uint32_t n
+        uint32_t n,
+        VkDispatchBatch* batch = nullptr
     ) const;
 
     void silu_mul_interleaved(
         const VkDescriptorBufferInfo& gate_up,
         const VkDescriptorBufferInfo& out,
         uint32_t intermediate_size,
-        uint32_t num_tokens
+        uint32_t num_tokens,
+        VkDispatchBatch* batch = nullptr
     ) const;
 
     void rmsnorm(
@@ -45,19 +48,34 @@ class VkFp16Ops {
         const VkDescriptorBufferInfo& output,
         uint32_t hidden_size,
         uint32_t num_tokens,
-        float eps
+        float eps,
+        VkDispatchBatch* batch = nullptr
+    ) const;
+
+    void qkv_bias_split(
+        const VkDescriptorBufferInfo& qkv,
+        const VkDescriptorBufferInfo& bias,
+        const VkDescriptorBufferInfo& q_out,
+        const VkDescriptorBufferInfo& k_out,
+        const VkDescriptorBufferInfo& v_out,
+        uint32_t num_tokens,
+        uint32_t q_dim,
+        uint32_t kv_dim,
+        bool has_bias,
+        VkDispatchBatch* batch = nullptr
     ) const;
 
     void rope(
         const VkDescriptorBufferInfo& q,
         const VkDescriptorBufferInfo& k,
         const VkDescriptorBufferInfo& rope_cos_sin,
-        uint32_t batch,
+        uint32_t batch_size,
         uint32_t seq_len,
         uint32_t num_q_heads,
         uint32_t num_kv_heads,
         uint32_t head_dim,
-        uint32_t position_offset
+        uint32_t position_offset,
+        VkDispatchBatch* batch = nullptr
     ) const;
 
     void transpose_bshd_to_bhsd(
@@ -66,7 +84,8 @@ class VkFp16Ops {
         uint32_t B,
         uint32_t S,
         uint32_t H,
-        uint32_t D
+        uint32_t D,
+        VkDispatchBatch* batch = nullptr
     ) const;
 
     void kv_cache_copy(
@@ -74,12 +93,13 @@ class VkFp16Ops {
         const VkDescriptorBufferInfo& v_in,
         const VkDescriptorBufferInfo& k_cache,
         const VkDescriptorBufferInfo& v_cache,
-        uint32_t batch,
+        uint32_t batch_size,
         uint32_t seq_len,
         uint32_t num_kv_heads,
         uint32_t head_dim,
         uint32_t max_seq_len,
-        uint32_t position_offset
+        uint32_t position_offset,
+        VkDispatchBatch* batch = nullptr
     ) const;
 
     // Decode-only grouped-query attention.
@@ -94,7 +114,8 @@ class VkFp16Ops {
         uint32_t kv_len,
         uint32_t kv_stride,
         uint32_t head_dim,
-        float scale
+        float scale,
+        VkDispatchBatch* batch = nullptr
     ) const;
 
     // Causal grouped-query prefill attention. Q covers the last q_len positions of the KV stream.
@@ -110,7 +131,8 @@ class VkFp16Ops {
         uint32_t kv_len,
         uint32_t kv_stride,
         uint32_t head_dim,
-        float scale
+        float scale,
+        VkDispatchBatch* batch = nullptr
     ) const;
 
     // C = A @ B^T.  A:[M,K], B:[N,K], C:[M,N] — all row-major FP16.
@@ -121,7 +143,8 @@ class VkFp16Ops {
         uint32_t M,
         uint32_t N,
         uint32_t K,
-        VkQueryPool query_pool = VK_NULL_HANDLE
+        VkQueryPool query_pool = VK_NULL_HANDLE,
+        VkDispatchBatch* batch = nullptr
     ) const;
 
     // y = W @ x. x:[K], W:[N,K], y:[N] — all row-major FP16.
@@ -131,7 +154,8 @@ class VkFp16Ops {
         const VkDescriptorBufferInfo& y,
         uint32_t N,
         uint32_t K,
-        VkQueryPool query_pool = VK_NULL_HANDLE
+        VkQueryPool query_pool = VK_NULL_HANDLE,
+        VkDispatchBatch* batch = nullptr
     ) const;
 
   private:
@@ -145,6 +169,7 @@ class VkFp16Ops {
     VkKernel mul_kernel_ = {};
     VkKernel silu_mul_interleaved_kernel_ = {};
     VkKernel rmsnorm_kernel_ = {};
+    VkKernel qkv_bias_split_kernel_ = {};
     VkKernel rope_kernel_ = {};
     VkKernel transpose_kernel_ = {};
     VkKernel kv_cache_copy_kernel_ = {};

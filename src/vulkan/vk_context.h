@@ -43,6 +43,7 @@ class VkContext {
     VkFence fence() const noexcept { return fence_; }
 
     VkQueryPool timestamp_query_pool() const noexcept { return timestamp_query_pool_; }
+    uint32_t timestamp_query_count() const noexcept { return timestamp_query_count_; }
     float timestamp_period_ns() const noexcept { return timestamp_period_ns_; }
     uint32_t timestamp_valid_bits() const noexcept { return timestamp_valid_bits_; }
 
@@ -73,6 +74,7 @@ class VkContext {
     VkCommandBuffer command_buffer_ = VK_NULL_HANDLE;
     VkFence fence_ = VK_NULL_HANDLE;
     VkQueryPool timestamp_query_pool_ = VK_NULL_HANDLE;
+    uint32_t timestamp_query_count_ = 0;
     VkDeviceSize min_storage_buffer_offset_alignment_ = 0;
 
     float timestamp_period_ns_ = 0.0f;

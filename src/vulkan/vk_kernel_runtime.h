@@ -14,6 +14,47 @@
 
 namespace mruntime::vulkan {
 
+class VkKernelRuntime;
+
+struct VkDispatchBatchHostBarrier {
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceSize offset = 0;
+    VkDeviceSize size = 0;
+};
+
+class VkDispatchBatch {
+  public:
+    VkDispatchBatch() = default;
+
+    VkDispatchBatch(const VkDispatchBatch&) = delete;
+    VkDispatchBatch& operator=(const VkDispatchBatch&) = delete;
+
+    VkDispatchBatch(VkDispatchBatch&&) noexcept = default;
+    VkDispatchBatch& operator=(VkDispatchBatch&&) noexcept = default;
+
+    bool recording() const noexcept { return recording_; }
+
+  private:
+    friend class VkKernelRuntime;
+
+    struct TraceRecord {
+        uint32_t query_index = 0;
+        uint32_t group_count_x = 0;
+        uint32_t group_count_y = 0;
+        uint32_t group_count_z = 0;
+    };
+
+    const VkKernelRuntime* runtime_ = nullptr;
+    bool recording_ = false;
+    bool enable_trace_ = false;
+    VkQueryPool query_pool_ = VK_NULL_HANDLE;
+    uint32_t next_query_index_ = 0;
+    VkDispatchTraceInfo trace_info_ = {};
+    int64_t record_begin_us_ = 0;
+    std::vector<TraceRecord> trace_records_;
+    std::unordered_map<const VkComputePipeline*, uint32_t> descriptor_set_use_counts_;
+};
+
 struct KernelCreateInfo {
     const uint8_t* spirv = nullptr;
     size_t spirv_size = 0;
@@ -51,6 +92,13 @@ class VkKernelRuntime {
     void set_timing_enabled(bool enabled) noexcept { timing_enabled_ = enabled; }
     bool timing_enabled() const noexcept { return timing_enabled_; }
 
+    VkDispatchBatch begin_batch() const;
+    void finish_batch(
+        VkDispatchBatch* batch,
+        const VkDispatchBatchHostBarrier* host_barriers,
+        uint32_t host_barrier_count
+    ) const;
+
     void dispatch_1d(
         VkKernel kernel,
         const VkDescriptorBufferInfo* buffers,
@@ -60,7 +108,8 @@ class VkKernelRuntime {
         const void* push_constants,
         uint32_t push_constants_size,
         int32_t host_read_buffer_index = -1,
-        VkQueryPool query_pool = VK_NULL_HANDLE
+        VkQueryPool query_pool = VK_NULL_HANDLE,
+        VkDispatchBatch* batch = nullptr
     ) const;
 
     void dispatch_2d(
@@ -74,7 +123,8 @@ class VkKernelRuntime {
         const void* push_constants,
         uint32_t push_constants_size,
         int32_t host_read_buffer_index = -1,
-        VkQueryPool query_pool = VK_NULL_HANDLE
+        VkQueryPool query_pool = VK_NULL_HANDLE,
+        VkDispatchBatch* batch = nullptr
     ) const;
 
   private:

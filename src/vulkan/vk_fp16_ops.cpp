@@ -5,10 +5,11 @@
 #include "fp16_add_spv.h"
 #include "fp16_attention_decode_gqa_spv.h"
 #include "fp16_attention_prefill_gqa_spv.h"
-#include "fp16_gemv_rows4_vec4_spv.h"
 #include "fp16_gemm_spv.h"
+#include "fp16_gemv_rows4_vec4_spv.h"
 #include "fp16_kv_cache_copy_spv.h"
 #include "fp16_mul_spv.h"
+#include "fp16_qkv_bias_split_spv.h"
 #include "fp16_rmsnorm_spv.h"
 #include "fp16_rope_spv.h"
 #include "fp16_silu_mul_interleaved_spv.h"
@@ -19,8 +20,11 @@ namespace mruntime::vulkan {
 namespace {
 
 KernelCreateInfo make_kernel_create_info(
-    const uint8_t* spirv, size_t spirv_size,
-    uint32_t storage_buffer_count, uint32_t push_constant_size) {
+    const uint8_t* spirv,
+    size_t spirv_size,
+    uint32_t storage_buffer_count,
+    uint32_t push_constant_size
+) {
     KernelCreateInfo info;
     info.spirv = spirv;
     info.spirv_size = spirv_size;
@@ -45,62 +49,58 @@ VkFp16Ops VkFp16Ops::Create(VkKernelRuntime* runtime) {
     VkFp16Ops ops;
     ops.runtime_ = runtime;
 
-    // add / mul: 3 buffers, 1 uint push constant
     ops.add_kernel_ = runtime->get_or_create_kernel(
         make_kernel_create_info(shaders::kFp16AddSpv, shaders::kFp16AddSpvSize, 3, sizeof(uint32_t)));
     ops.mul_kernel_ = runtime->get_or_create_kernel(
         make_kernel_create_info(shaders::kFp16MulSpv, shaders::kFp16MulSpvSize, 3, sizeof(uint32_t)));
-
-    // silu_mul_interleaved: 2 buffers (gate_up, out), 2 uint push constants
     ops.silu_mul_interleaved_kernel_ = runtime->get_or_create_kernel(
-        make_kernel_create_info(shaders::kFp16SiluMulInterleavedSpv, shaders::kFp16SiluMulInterleavedSpvSize,
-                                2, 2 * sizeof(uint32_t)));
-
-    // rmsnorm: 3 buffers (input, weight, out), push = {uint, uint, float}
+        make_kernel_create_info(
+            shaders::kFp16SiluMulInterleavedSpv,
+            shaders::kFp16SiluMulInterleavedSpvSize,
+            2,
+            2 * sizeof(uint32_t)));
     ops.rmsnorm_kernel_ = runtime->get_or_create_kernel(
-        make_kernel_create_info(shaders::kFp16RmsnormSpv, shaders::kFp16RmsnormSpvSize,
-                                3, 2 * sizeof(uint32_t) + sizeof(float)));
-
-    // rope: 3 buffers (q RW, k RW, cos_sin RO), push = 6 uint
+        make_kernel_create_info(
+            shaders::kFp16RmsnormSpv,
+            shaders::kFp16RmsnormSpvSize,
+            3,
+            2 * sizeof(uint32_t) + sizeof(float)));
+    ops.qkv_bias_split_kernel_ = runtime->get_or_create_kernel(
+        make_kernel_create_info(
+            shaders::kFp16QkvBiasSplitSpv,
+            shaders::kFp16QkvBiasSplitSpvSize,
+            5,
+            4 * sizeof(uint32_t)));
     ops.rope_kernel_ = runtime->get_or_create_kernel(
-        make_kernel_create_info(shaders::kFp16RopeSpv, shaders::kFp16RopeSpvSize,
-                                3, 6 * sizeof(uint32_t)));
-
-    // transpose: 2 buffers (input, out), push = 4 uint
+        make_kernel_create_info(shaders::kFp16RopeSpv, shaders::kFp16RopeSpvSize, 3, 6 * sizeof(uint32_t)));
     ops.transpose_kernel_ = runtime->get_or_create_kernel(
-        make_kernel_create_info(shaders::kFp16TransposeSpv, shaders::kFp16TransposeSpvSize,
-                                2, 4 * sizeof(uint32_t)));
-
-    // kv_cache_copy: 4 buffers (k_in, v_in, k_cache, v_cache), push = 6 uint
+        make_kernel_create_info(shaders::kFp16TransposeSpv, shaders::kFp16TransposeSpvSize, 2, 4 * sizeof(uint32_t)));
     ops.kv_cache_copy_kernel_ = runtime->get_or_create_kernel(
-        make_kernel_create_info(shaders::kFp16KvCacheCopySpv, shaders::kFp16KvCacheCopySpvSize,
-                                4, 6 * sizeof(uint32_t)));
-
-    // decode GQA attention: 4 buffers (Q, K, V, O), push = 5 uint + 1 float
+        make_kernel_create_info(
+            shaders::kFp16KvCacheCopySpv,
+            shaders::kFp16KvCacheCopySpvSize,
+            4,
+            6 * sizeof(uint32_t)));
     ops.attention_decode_gqa_kernel_ = runtime->get_or_create_kernel(
         make_kernel_create_info(
             shaders::kFp16AttentionDecodeGqaSpv,
             shaders::kFp16AttentionDecodeGqaSpvSize,
             4,
             5 * sizeof(uint32_t) + sizeof(float)));
-
-    // prefill GQA attention: 4 buffers (Q, K, V, O), push = 6 uint + 1 float
     ops.attention_prefill_gqa_kernel_ = runtime->get_or_create_kernel(
         make_kernel_create_info(
             shaders::kFp16AttentionPrefillGqaSpv,
             shaders::kFp16AttentionPrefillGqaSpvSize,
             4,
             6 * sizeof(uint32_t) + sizeof(float)));
-
-    // gemv (rows4 + vec4): 3 buffers (x, W, y), push = {uint N, uint K}
     ops.gemv_rows4_vec4_kernel_ = runtime->get_or_create_kernel(
-        make_kernel_create_info(shaders::kFp16GemvRows4Vec4Spv, shaders::kFp16GemvRows4Vec4SpvSize,
-                                3, 2 * sizeof(uint32_t)));
-
-    // gemm: 3 buffers (A, B, C), push = {uint M, uint N, uint K}
+        make_kernel_create_info(
+            shaders::kFp16GemvRows4Vec4Spv,
+            shaders::kFp16GemvRows4Vec4SpvSize,
+            3,
+            2 * sizeof(uint32_t)));
     ops.gemm_kernel_ = runtime->get_or_create_kernel(
-        make_kernel_create_info(shaders::kFp16GemmSpv, shaders::kFp16GemmSpvSize,
-                                3, 3 * sizeof(uint32_t)));
+        make_kernel_create_info(shaders::kFp16GemmSpv, shaders::kFp16GemmSpvSize, 3, 3 * sizeof(uint32_t)));
 
     return ops;
 }
@@ -109,7 +109,8 @@ void VkFp16Ops::add(
     const VkDescriptorBufferInfo& a,
     const VkDescriptorBufferInfo& b,
     const VkDescriptorBufferInfo& out,
-    uint32_t n
+    uint32_t n,
+    VkDispatchBatch* batch
 ) const {
     if (runtime_ == nullptr) {
         throw std::runtime_error("VkFp16Ops::add: runtime is null");
@@ -119,9 +120,7 @@ void VkFp16Ops::add(
     }
 
     const VkDescriptorBufferInfo buffers[3] = {a, b, out};
-
     const uint32_t push_constants = n;
-
     runtime_->dispatch_1d(
         add_kernel_,
         buffers,
@@ -130,7 +129,9 @@ void VkFp16Ops::add(
         kLocalSizeX,
         &push_constants,
         sizeof(push_constants),
-        2
+        2,
+        VK_NULL_HANDLE,
+        batch
     );
 }
 
@@ -138,7 +139,8 @@ void VkFp16Ops::mul(
     const VkDescriptorBufferInfo& a,
     const VkDescriptorBufferInfo& b,
     const VkDescriptorBufferInfo& out,
-    uint32_t n
+    uint32_t n,
+    VkDispatchBatch* batch
 ) const {
     if (runtime_ == nullptr) {
         throw std::runtime_error("VkFp16Ops::mul: runtime is null");
@@ -148,9 +150,7 @@ void VkFp16Ops::mul(
     }
 
     const VkDescriptorBufferInfo buffers[3] = {a, b, out};
-
     const uint32_t push_constants = n;
-
     runtime_->dispatch_1d(
         mul_kernel_,
         buffers,
@@ -159,7 +159,9 @@ void VkFp16Ops::mul(
         kLocalSizeX,
         &push_constants,
         sizeof(push_constants),
-        2
+        2,
+        VK_NULL_HANDLE,
+        batch
     );
 }
 
@@ -167,7 +169,8 @@ void VkFp16Ops::silu_mul_interleaved(
     const VkDescriptorBufferInfo& gate_up,
     const VkDescriptorBufferInfo& out,
     uint32_t intermediate_size,
-    uint32_t num_tokens
+    uint32_t num_tokens,
+    VkDispatchBatch* batch
 ) const {
     if (runtime_ == nullptr) {
         throw std::runtime_error("VkFp16Ops::silu_mul_interleaved: runtime is null");
@@ -177,7 +180,6 @@ void VkFp16Ops::silu_mul_interleaved(
     }
 
     const VkDescriptorBufferInfo buffers[2] = {gate_up, out};
-
     struct {
         uint32_t intermediate_size;
         uint32_t num_tokens;
@@ -192,7 +194,9 @@ void VkFp16Ops::silu_mul_interleaved(
         kLocalSizeX,
         &push_constants,
         sizeof(push_constants),
-        1
+        1,
+        VK_NULL_HANDLE,
+        batch
     );
 }
 
@@ -202,7 +206,8 @@ void VkFp16Ops::rmsnorm(
     const VkDescriptorBufferInfo& output,
     uint32_t hidden_size,
     uint32_t num_tokens,
-    float eps
+    float eps,
+    VkDispatchBatch* batch
 ) const {
     if (runtime_ == nullptr) {
         throw std::runtime_error("VkFp16Ops::rmsnorm: runtime is null");
@@ -212,16 +217,12 @@ void VkFp16Ops::rmsnorm(
     }
 
     const VkDescriptorBufferInfo buffers[3] = {input, weight, output};
-
     struct {
         uint32_t hidden_size;
         uint32_t num_tokens;
         float eps;
     } push_constants = {hidden_size, num_tokens, eps};
 
-    // Dispatch exactly num_tokens workgroups (one per token).
-    // Pass element_count = num_tokens * kLocalSizeX so dispatch_1d computes
-    // ceil(num_tokens * 256 / 256) = num_tokens workgroups.
     runtime_->dispatch_1d(
         rmsnorm_kernel_,
         buffers,
@@ -230,7 +231,51 @@ void VkFp16Ops::rmsnorm(
         kLocalSizeX,
         &push_constants,
         sizeof(push_constants),
-        2
+        2,
+        VK_NULL_HANDLE,
+        batch
+    );
+}
+
+void VkFp16Ops::qkv_bias_split(
+    const VkDescriptorBufferInfo& qkv,
+    const VkDescriptorBufferInfo& bias,
+    const VkDescriptorBufferInfo& q_out,
+    const VkDescriptorBufferInfo& k_out,
+    const VkDescriptorBufferInfo& v_out,
+    uint32_t num_tokens,
+    uint32_t q_dim,
+    uint32_t kv_dim,
+    bool has_bias,
+    VkDispatchBatch* batch
+) const {
+    if (runtime_ == nullptr) {
+        throw std::runtime_error("VkFp16Ops::qkv_bias_split: runtime is null");
+    }
+    if (num_tokens == 0 || q_dim == 0 || kv_dim == 0) {
+        return;
+    }
+
+    const VkDescriptorBufferInfo buffers[5] = {qkv, bias, q_out, k_out, v_out};
+    struct {
+        uint32_t num_tokens;
+        uint32_t q_dim;
+        uint32_t kv_dim;
+        uint32_t has_bias;
+    } push_constants = {num_tokens, q_dim, kv_dim, has_bias ? 1u : 0u};
+
+    const uint32_t qkv_dim = q_dim + 2u * kv_dim;
+    runtime_->dispatch_1d(
+        qkv_bias_split_kernel_,
+        buffers,
+        5,
+        (num_tokens * qkv_dim + kPointwiseChunkWidth - 1u) / kPointwiseChunkWidth,
+        kLocalSizeX,
+        &push_constants,
+        sizeof(push_constants),
+        -1,
+        VK_NULL_HANDLE,
+        batch
     );
 }
 
@@ -238,22 +283,22 @@ void VkFp16Ops::rope(
     const VkDescriptorBufferInfo& q,
     const VkDescriptorBufferInfo& k,
     const VkDescriptorBufferInfo& rope_cos_sin,
-    uint32_t batch,
+    uint32_t batch_size,
     uint32_t seq_len,
     uint32_t num_q_heads,
     uint32_t num_kv_heads,
     uint32_t head_dim,
-    uint32_t position_offset
+    uint32_t position_offset,
+    VkDispatchBatch* batch
 ) const {
     if (runtime_ == nullptr) {
         throw std::runtime_error("VkFp16Ops::rope: runtime is null");
     }
-    if (batch == 0 || seq_len == 0 || head_dim == 0) {
+    if (batch_size == 0 || seq_len == 0 || head_dim == 0) {
         return;
     }
 
     const VkDescriptorBufferInfo buffers[3] = {q, k, rope_cos_sin};
-
     struct {
         uint32_t batch;
         uint32_t seq_len;
@@ -261,11 +306,10 @@ void VkFp16Ops::rope(
         uint32_t num_kv_heads;
         uint32_t head_dim;
         uint32_t position_offset;
-    } push_constants = {batch, seq_len, num_q_heads, num_kv_heads, head_dim, position_offset};
+    } push_constants = {batch_size, seq_len, num_q_heads, num_kv_heads, head_dim, position_offset};
 
     const uint32_t half_dim = head_dim / 2;
-    const uint32_t total = batch * seq_len * (num_q_heads + num_kv_heads) * half_dim;
-
+    const uint32_t total = batch_size * seq_len * (num_q_heads + num_kv_heads) * half_dim;
     runtime_->dispatch_1d(
         rope_kernel_,
         buffers,
@@ -274,7 +318,9 @@ void VkFp16Ops::rope(
         kLocalSizeX,
         &push_constants,
         sizeof(push_constants),
-        -1
+        -1,
+        VK_NULL_HANDLE,
+        batch
     );
 }
 
@@ -284,7 +330,8 @@ void VkFp16Ops::transpose_bshd_to_bhsd(
     uint32_t B,
     uint32_t S,
     uint32_t H,
-    uint32_t D
+    uint32_t D,
+    VkDispatchBatch* batch
 ) const {
     if (runtime_ == nullptr) {
         throw std::runtime_error("VkFp16Ops::transpose_bshd_to_bhsd: runtime is null");
@@ -294,7 +341,6 @@ void VkFp16Ops::transpose_bshd_to_bhsd(
     }
 
     const VkDescriptorBufferInfo buffers[2] = {input, output};
-
     struct {
         uint32_t B;
         uint32_t S;
@@ -302,18 +348,17 @@ void VkFp16Ops::transpose_bshd_to_bhsd(
         uint32_t D;
     } push_constants = {B, S, H, D};
 
-    // One invocation per (b, h, s) triple.
-    const uint32_t total_tasks = B * H * S;
-
     runtime_->dispatch_1d(
         transpose_kernel_,
         buffers,
         2,
-        total_tasks,
+        B * H * S,
         kLocalSizeX,
         &push_constants,
         sizeof(push_constants),
-        1
+        1,
+        VK_NULL_HANDLE,
+        batch
     );
 }
 
@@ -322,25 +367,22 @@ void VkFp16Ops::kv_cache_copy(
     const VkDescriptorBufferInfo& v_in,
     const VkDescriptorBufferInfo& k_cache,
     const VkDescriptorBufferInfo& v_cache,
-    uint32_t batch,
+    uint32_t batch_size,
     uint32_t seq_len,
     uint32_t num_kv_heads,
     uint32_t head_dim,
     uint32_t max_seq_len,
-    uint32_t position_offset
+    uint32_t position_offset,
+    VkDispatchBatch* batch
 ) const {
     if (runtime_ == nullptr) {
         throw std::runtime_error("VkFp16Ops::kv_cache_copy: runtime is null");
     }
-    if (batch == 0 || seq_len == 0 || num_kv_heads == 0 || head_dim == 0) {
+    if (batch_size == 0 || seq_len == 0 || num_kv_heads == 0 || head_dim == 0) {
         return;
     }
 
     VkDescriptorBufferInfo buffers[4] = {k_in, v_in, k_cache, v_cache};
-    // Host reads often follow (e.g. CPU attention over the KV cache). Ensure we emit a host-read
-    // barrier that covers both K and V cache ranges when they are suballocated from the same
-    // VkBufferArena (V is typically allocated after K). We do this by making K's descriptor range
-    // VK_WHOLE_SIZE for the barrier selection below.
     buffers[2].range = 0;
 
     struct {
@@ -350,19 +392,19 @@ void VkFp16Ops::kv_cache_copy(
         uint32_t head_dim;
         uint32_t max_seq_len;
         uint32_t position_offset;
-    } push_constants = {batch, seq_len, num_kv_heads, head_dim, max_seq_len, position_offset};
-
-    const uint32_t total = batch * seq_len * num_kv_heads;
+    } push_constants = {batch_size, seq_len, num_kv_heads, head_dim, max_seq_len, position_offset};
 
     runtime_->dispatch_1d(
         kv_cache_copy_kernel_,
         buffers,
         4,
-        total,
+        batch_size * seq_len * num_kv_heads,
         kLocalSizeX,
         &push_constants,
         sizeof(push_constants),
-        2
+        2,
+        VK_NULL_HANDLE,
+        batch
     );
 }
 
@@ -376,7 +418,8 @@ void VkFp16Ops::attention_decode_gqa(
     uint32_t kv_len,
     uint32_t kv_stride,
     uint32_t head_dim,
-    float scale
+    float scale,
+    VkDispatchBatch* batch
 ) const {
     if (runtime_ == nullptr) {
         throw std::runtime_error("VkFp16Ops::attention_decode_gqa: runtime is null");
@@ -395,7 +438,6 @@ void VkFp16Ops::attention_decode_gqa(
     }
 
     const VkDescriptorBufferInfo buffers[4] = {q, k, v, out};
-
     struct {
         uint32_t num_q_heads;
         uint32_t num_kv_heads;
@@ -413,7 +455,9 @@ void VkFp16Ops::attention_decode_gqa(
         kAttentionGqaLocalSizeX,
         &push_constants,
         sizeof(push_constants),
-        -1
+        -1,
+        VK_NULL_HANDLE,
+        batch
     );
 }
 
@@ -428,7 +472,8 @@ void VkFp16Ops::attention_prefill_gqa(
     uint32_t kv_len,
     uint32_t kv_stride,
     uint32_t head_dim,
-    float scale
+    float scale,
+    VkDispatchBatch* batch
 ) const {
     if (runtime_ == nullptr) {
         throw std::runtime_error("VkFp16Ops::attention_prefill_gqa: runtime is null");
@@ -450,7 +495,6 @@ void VkFp16Ops::attention_prefill_gqa(
     }
 
     const VkDescriptorBufferInfo buffers[4] = {q, k, v, out};
-
     struct {
         uint32_t num_q_heads;
         uint32_t num_kv_heads;
@@ -471,7 +515,9 @@ void VkFp16Ops::attention_prefill_gqa(
         1,
         &push_constants,
         sizeof(push_constants),
-        -1
+        -1,
+        VK_NULL_HANDLE,
+        batch
     );
 }
 
@@ -482,7 +528,8 @@ void VkFp16Ops::gemm(
     uint32_t M,
     uint32_t N,
     uint32_t K,
-    VkQueryPool query_pool
+    VkQueryPool query_pool,
+    VkDispatchBatch* batch
 ) const {
     if (runtime_ == nullptr) {
         throw std::runtime_error("VkFp16Ops::gemm: runtime is null");
@@ -492,7 +539,6 @@ void VkFp16Ops::gemm(
     }
 
     const VkDescriptorBufferInfo buffers[3] = {a, b, c};
-
     struct {
         uint32_t M;
         uint32_t N;
@@ -501,19 +547,19 @@ void VkFp16Ops::gemm(
 
     constexpr uint32_t tile_M = 64;
     constexpr uint32_t tile_N = 64;
-
     runtime_->dispatch_2d(
         gemm_kernel_,
         buffers,
         3,
-        N,  // width  = columns
-        M,  // height = rows
+        N,
+        M,
         tile_N,
         tile_M,
         &push_constants,
         sizeof(push_constants),
-        2,  // host-read buffer index = C
-        query_pool
+        2,
+        query_pool,
+        batch
     );
 }
 
@@ -523,7 +569,8 @@ void VkFp16Ops::gemv(
     const VkDescriptorBufferInfo& y,
     uint32_t N,
     uint32_t K,
-    VkQueryPool query_pool
+    VkQueryPool query_pool,
+    VkDispatchBatch* batch
 ) const {
     if (runtime_ == nullptr) {
         throw std::runtime_error("VkFp16Ops::gemv: runtime is null");
@@ -531,17 +578,15 @@ void VkFp16Ops::gemv(
     if (N == 0 || K == 0) {
         return;
     }
+    if ((K & 3u) != 0u) {
+        throw std::runtime_error("VkFp16Ops::gemv: K must be divisible by 4");
+    }
 
     const VkDescriptorBufferInfo buffers[3] = {x, w, y};
-
     struct {
         uint32_t N;
         uint32_t K;
     } push_constants = {N, K};
-
-    if ((K & 3u) != 0u) {
-        throw std::runtime_error("VkFp16Ops::gemv: K must be divisible by 4");
-    }
 
     const uint64_t group_count_x =
         (static_cast<uint64_t>(N) + kGemvRows4Vec4RowsPerWg - 1) / kGemvRows4Vec4RowsPerWg;
@@ -558,8 +603,9 @@ void VkFp16Ops::gemv(
         kGemvRows4Vec4LocalSizeX,
         &push_constants,
         sizeof(push_constants),
-        2,  // host-read buffer index = y
-        query_pool
+        2,
+        query_pool,
+        batch
     );
 }
 

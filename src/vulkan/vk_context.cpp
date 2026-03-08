@@ -12,6 +12,8 @@ namespace mruntime::vulkan {
 
 namespace {
 
+constexpr uint32_t kTimestampQueryCount = 4096;
+
 constexpr const char* kKhrPortabilitySubsetExtensionName = "VK_KHR_portability_subset";
 
 void require_fp16_features(VkPhysicalDevice physical_device) {
@@ -274,9 +276,11 @@ VkContext VkContext::Create(const VkContextCreateInfo& info) {
         VkQueryPoolCreateInfo qp_ci = {};
         qp_ci.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
         qp_ci.queryType = VK_QUERY_TYPE_TIMESTAMP;
-        qp_ci.queryCount = 2;
+        qp_ci.queryCount = kTimestampQueryCount;
         if (vkCreateQueryPool(ctx.device_, &qp_ci, nullptr, &ctx.timestamp_query_pool_) != VK_SUCCESS) {
             ctx.timestamp_query_pool_ = VK_NULL_HANDLE;
+        } else {
+            ctx.timestamp_query_count_ = kTimestampQueryCount;
         }
     }
 
@@ -374,6 +378,7 @@ VkContext& VkContext::operator=(VkContext&& other) noexcept {
     command_buffer_ = std::exchange(other.command_buffer_, VK_NULL_HANDLE);
     fence_ = std::exchange(other.fence_, VK_NULL_HANDLE);
     timestamp_query_pool_ = std::exchange(other.timestamp_query_pool_, VK_NULL_HANDLE);
+    timestamp_query_count_ = std::exchange(other.timestamp_query_count_, 0u);
     min_storage_buffer_offset_alignment_ = std::exchange(other.min_storage_buffer_offset_alignment_, VkDeviceSize{0});
     timestamp_period_ns_ = std::exchange(other.timestamp_period_ns_, 0.0f);
     timestamp_valid_bits_ = std::exchange(other.timestamp_valid_bits_, 0u);
@@ -415,6 +420,7 @@ void VkContext::reset() noexcept {
     queue_ = VK_NULL_HANDLE;
     queue_family_index_ = UINT32_MAX;
     physical_device_ = VK_NULL_HANDLE;
+    timestamp_query_count_ = 0u;
     timestamp_period_ns_ = 0.0f;
     timestamp_valid_bits_ = 0u;
 

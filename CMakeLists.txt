@@ -250,6 +250,12 @@ if(MRUNTIME_ENABLE_VULKAN)
         kFp16RmsnormSpv
     )
     mruntime_add_vulkan_shader_variant(
+        fp16_qkv_bias_split
+        "${CMAKE_SOURCE_DIR}/src/vulkan/glsl/fp16_qkv_bias_split.comp"
+        "${CMAKE_SOURCE_DIR}/src/vulkan/slang/fp16_qkv_bias_split.slang"
+        kFp16QkvBiasSplitSpv
+    )
+    mruntime_add_vulkan_shader_variant(
         fp16_rope
         "${CMAKE_SOURCE_DIR}/src/vulkan/glsl/fp16_rope.comp"
         "${CMAKE_SOURCE_DIR}/src/vulkan/slang/fp16_rope.slang"

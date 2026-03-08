@@ -80,6 +80,22 @@ void submit_and_wait_with_fence(VkDevice device, VkQueue queue, VkCommandBuffer 
     vk_check(vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX), "vkWaitForFences");
 }
 
+void cmd_buffer_barrier_compute_to_compute(VkCommandBuffer command_buffer) {
+    VkMemoryBarrier2 barrier = {};
+    barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+    barrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    barrier.srcAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT;
+    barrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    barrier.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT;
+
+    VkDependencyInfo dep = {};
+    dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    dep.memoryBarrierCount = 1;
+    dep.pMemoryBarriers = &barrier;
+
+    vkCmdPipelineBarrier2(command_buffer, &dep);
+}
+
 void cmd_buffer_barrier_to_host_read(
     VkCommandBuffer command_buffer,
     VkBuffer buffer,

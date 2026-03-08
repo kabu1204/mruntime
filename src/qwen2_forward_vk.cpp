@@ -59,23 +59,41 @@ VkDescriptorBufferInfo descriptor_for_ptr(
     return info;
 }
 
-void add_bias_fp16(
-    uint16_t* output,
-    const uint16_t* bias,
-    size_t num_tokens,
-    size_t out_features
+vulkan::VkDispatchBatchHostBarrier host_barrier_for_desc(const VkDescriptorBufferInfo& desc) {
+    vulkan::VkDispatchBatchHostBarrier barrier;
+    barrier.buffer = desc.buffer;
+    barrier.offset = desc.offset;
+    barrier.size = (desc.range == 0) ? VK_WHOLE_SIZE : desc.range;
+    return barrier;
+}
+
+void project_fp16_row_major_vk(
+    Qwen2VkState& state,
+    const char* trace_name,
+    const VkDescriptorBufferInfo& input,
+    const VkDescriptorBufferInfo& weight,
+    const VkDescriptorBufferInfo& output,
+    uint32_t M,
+    uint32_t N,
+    uint32_t K,
+    vulkan::VkDispatchBatch* batch
 ) {
-    if (bias == nullptr) {
+    const bool use_gemv = (M == 1u) && ((K & 3u) == 0u);
+    TRACE_SCOPE_ARGS_CAT(
+        trace_name,
+        "gemm_or_gemv",
+        ::mruntime::trace_arg("m", static_cast<int64_t>(M)),
+        ::mruntime::trace_arg("n", static_cast<int64_t>(N)),
+        ::mruntime::trace_arg("k", static_cast<int64_t>(K)),
+        ::mruntime::trace_arg("gemv", use_gemv ? 1 : 0)
+    );
+
+    if (use_gemv) {
+        state.fp16_ops.gemv(input, weight, output, N, K, VK_NULL_HANDLE, batch);
         return;
     }
 
-    for (size_t t = 0; t < num_tokens; ++t) {
-        for (size_t i = 0; i < out_features; ++i) {
-            float v = fp16_bits_to_float(output[t * out_features + i]);
-            v += fp16_bits_to_float(bias[i]);
-            output[t * out_features + i] = float_to_fp16_bits(v);
-        }
-    }
+    state.fp16_ops.gemm(input, weight, output, M, N, K, VK_NULL_HANDLE, batch);
 }
 
 void init_rope_cache_into_kv_arena(
@@ -130,7 +148,8 @@ void qwen2_mlp_vk(
     const uint16_t* normed_input,
     uint16_t* mlp_output,
     Qwen2Scratch& scratch,
-    size_t num_tokens
+    size_t num_tokens,
+    vulkan::VkDispatchBatch* batch
 ) {
     TRACE_SCOPE_CAT("mlp_vk", "layer");
 
@@ -139,8 +158,9 @@ void qwen2_mlp_vk(
 
     // gate+up projection: [num_tokens, hidden] @ [2*intermediate, hidden]^T -> [num_tokens, 2*intermediate]
     {
-        TRACE_SCOPE_CAT("gate_up_proj_vk", "gemm");
-        state.fp16_ops.gemm(
+        project_fp16_row_major_vk(
+            state,
+            "gate_up_proj_vk",
             descriptor_for_ptr(state.scratch_arena, normed_input, num_tokens * hidden_size * sizeof(uint16_t)),
             descriptor_for_ptr(state.weights_arena, layer.gate_up_proj,
                                2 * intermediate_size * hidden_size * sizeof(uint16_t)),
@@ -148,7 +168,8 @@ void qwen2_mlp_vk(
                                num_tokens * intermediate_size * 2 * sizeof(uint16_t)),
             static_cast<uint32_t>(num_tokens),
             static_cast<uint32_t>(intermediate_size * 2),
-            static_cast<uint32_t>(hidden_size)
+            static_cast<uint32_t>(hidden_size),
+            batch
         );
     }
 
@@ -160,20 +181,23 @@ void qwen2_mlp_vk(
                                num_tokens * intermediate_size * 2 * sizeof(uint16_t)),
             descriptor_for_ptr(state.scratch_arena, scratch.gate, num_tokens * intermediate_size * sizeof(uint16_t)),
             static_cast<uint32_t>(intermediate_size),
-            static_cast<uint32_t>(num_tokens)
+            static_cast<uint32_t>(num_tokens),
+            batch
         );
     }
 
     // down projection: [num_tokens, intermediate] @ [hidden, intermediate]^T -> [num_tokens, hidden]
     {
-        TRACE_SCOPE_CAT("down_proj_vk", "gemm");
-        state.fp16_ops.gemm(
+        project_fp16_row_major_vk(
+            state,
+            "down_proj_vk",
             descriptor_for_ptr(state.scratch_arena, scratch.gate, num_tokens * intermediate_size * sizeof(uint16_t)),
             descriptor_for_ptr(state.weights_arena, layer.down_proj, hidden_size * intermediate_size * sizeof(uint16_t)),
             descriptor_for_ptr(state.scratch_arena, mlp_output, num_tokens * hidden_size * sizeof(uint16_t)),
             static_cast<uint32_t>(num_tokens),
             static_cast<uint32_t>(hidden_size),
-            static_cast<uint32_t>(intermediate_size)
+            static_cast<uint32_t>(intermediate_size),
+            batch
         );
     }
 }
@@ -190,7 +214,8 @@ void qwen2_attention_vk(
     uint16_t* attn_output,
     Qwen2Scratch& scratch,
     size_t num_tokens,
-    PThreadPool* pool
+    PThreadPool* pool,
+    vulkan::VkDispatchBatch* batch
 ) {
     TRACE_SCOPE_CAT("attention_vk", "layer");
 
@@ -203,6 +228,20 @@ void qwen2_attention_vk(
     const size_t kv_dim = num_kv_heads * head_dim;
     const size_t qkv_dim = q_dim + 2 * kv_dim;
     const size_t position_offset = kv_seq_len;
+    const size_t total_seq_len = position_offset + num_tokens;
+    const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+    const bool can_use_vk_attention =
+        num_kv_heads != 0 &&
+        (num_heads % num_kv_heads) == 0 &&
+        total_seq_len <= max_seq_len &&
+        head_dim <= 512;
+    const bool can_use_vk_decode_attention = can_use_vk_attention && num_tokens == 1;
+    const bool can_use_vk_prefill_attention = can_use_vk_attention && num_tokens > 1;
+    const bool is_single_token_decode = (num_tokens == 1);
+
+    if (!can_use_vk_attention && batch != nullptr && batch->recording()) {
+        state.runtime.finish_batch(batch, nullptr, 0);
+    }
 
     if (position_offset > max_seq_len || num_tokens > (max_seq_len - position_offset)) {
         throw std::runtime_error("qwen2_attention_vk: KV cache overflow (kv_seq_len + num_tokens > max_seq_len)");
@@ -210,27 +249,38 @@ void qwen2_attention_vk(
 
     // QKV projection: [num_tokens, hidden] @ [qkv_dim, hidden]^T -> [num_tokens, qkv_dim]
     {
-        TRACE_SCOPE_CAT("qkv_proj_vk", "gemm");
-        state.fp16_ops.gemm(
+        project_fp16_row_major_vk(
+            state,
+            "qkv_proj_vk",
             descriptor_for_ptr(state.scratch_arena, normed_input, num_tokens * hidden_size * sizeof(uint16_t)),
             descriptor_for_ptr(state.weights_arena, layer.qkv_proj, qkv_dim * hidden_size * sizeof(uint16_t)),
             descriptor_for_ptr(state.scratch_arena, scratch.qkv_out, num_tokens * qkv_dim * sizeof(uint16_t)),
             static_cast<uint32_t>(num_tokens),
             static_cast<uint32_t>(qkv_dim),
-            static_cast<uint32_t>(hidden_size)
+            static_cast<uint32_t>(hidden_size),
+            batch
         );
-        add_bias_fp16(scratch.qkv_out, layer.qkv_bias, num_tokens, qkv_dim);
     }
 
-    // Split fused QKV output into separate Q, K, V buffers.
+    // Split fused QKV output into separate Q, K, V buffers and optionally add bias.
     {
         TRACE_SCOPE_CAT("qkv_split_vk", "elementwise");
-        for (size_t t = 0; t < num_tokens; ++t) {
-            const uint16_t* src = scratch.qkv_out + t * qkv_dim;
-            std::memcpy(scratch.q_proj + t * q_dim, src, q_dim * sizeof(uint16_t));
-            std::memcpy(scratch.k_proj + t * kv_dim, src + q_dim, kv_dim * sizeof(uint16_t));
-            std::memcpy(scratch.v_proj + t * kv_dim, src + q_dim + kv_dim, kv_dim * sizeof(uint16_t));
-        }
+        const VkDescriptorBufferInfo qkv_desc =
+            descriptor_for_ptr(state.scratch_arena, scratch.qkv_out, num_tokens * qkv_dim * sizeof(uint16_t));
+        state.fp16_ops.qkv_bias_split(
+            qkv_desc,
+            layer.qkv_bias != nullptr
+                ? descriptor_for_ptr(state.weights_arena, layer.qkv_bias, qkv_dim * sizeof(uint16_t))
+                : qkv_desc,
+            descriptor_for_ptr(state.scratch_arena, scratch.q_proj, num_tokens * q_dim * sizeof(uint16_t)),
+            descriptor_for_ptr(state.scratch_arena, scratch.k_proj, num_tokens * kv_dim * sizeof(uint16_t)),
+            descriptor_for_ptr(state.scratch_arena, scratch.v_proj, num_tokens * kv_dim * sizeof(uint16_t)),
+            static_cast<uint32_t>(num_tokens),
+            static_cast<uint32_t>(q_dim),
+            static_cast<uint32_t>(kv_dim),
+            layer.qkv_bias != nullptr,
+            batch
+        );
     }
 
     // RoPE in-place on Q and K.
@@ -247,7 +297,8 @@ void qwen2_attention_vk(
             static_cast<uint32_t>(num_heads),
             static_cast<uint32_t>(num_kv_heads),
             static_cast<uint32_t>(head_dim),
-            static_cast<uint32_t>(position_offset)
+            static_cast<uint32_t>(position_offset),
+            batch
         );
     }
 
@@ -271,38 +322,41 @@ void qwen2_attention_vk(
             static_cast<uint32_t>(num_kv_heads),
             static_cast<uint32_t>(head_dim),
             static_cast<uint32_t>(max_seq_len),
-            static_cast<uint32_t>(position_offset)
+            static_cast<uint32_t>(position_offset),
+            batch
         );
     }
 
-    const size_t total_seq_len = position_offset + num_tokens;
+    const VkDescriptorBufferInfo q_proj_desc =
+        descriptor_for_ptr(state.scratch_arena, scratch.q_proj, num_tokens * q_dim * sizeof(uint16_t));
+    const VkDescriptorBufferInfo q_transposed_desc =
+        descriptor_for_ptr(state.scratch_arena, scratch.q_transposed, num_tokens * q_dim * sizeof(uint16_t));
+    const VkDescriptorBufferInfo attn_out_desc =
+        descriptor_for_ptr(state.scratch_arena, scratch.attn_out, num_tokens * q_dim * sizeof(uint16_t));
 
-    // Transpose Q from BSHD -> BHSD for flash attention.
-    {
+    const bool attention_uses_q_proj_layout = is_single_token_decode;
+    const VkDescriptorBufferInfo attention_q_desc = [&]() {
+        if (attention_uses_q_proj_layout) {
+            return q_proj_desc;
+        }
+
         TRACE_SCOPE_CAT("q_transpose_vk", "attention");
         state.fp16_ops.transpose_bshd_to_bhsd(
-            descriptor_for_ptr(state.scratch_arena, scratch.q_proj, num_tokens * q_dim * sizeof(uint16_t)),
-            descriptor_for_ptr(state.scratch_arena, scratch.q_transposed, num_tokens * q_dim * sizeof(uint16_t)),
+            q_proj_desc,
+            q_transposed_desc,
             1,
             static_cast<uint32_t>(num_tokens),
             static_cast<uint32_t>(num_heads),
-            static_cast<uint32_t>(head_dim)
+            static_cast<uint32_t>(head_dim),
+            batch
         );
-    }
-
-    const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
-    const bool can_use_vk_attention =
-        num_kv_heads != 0 &&
-        (num_heads % num_kv_heads) == 0 &&
-        total_seq_len <= max_seq_len &&
-        head_dim <= 512;
-    const bool can_use_vk_decode_attention = can_use_vk_attention && num_tokens == 1;
-    const bool can_use_vk_prefill_attention = can_use_vk_attention && num_tokens > 1;
+        return q_transposed_desc;
+    }();
 
     if (can_use_vk_decode_attention) {
         TRACE_SCOPE_CAT("flash_attention_decode_vk", "attention");
         state.fp16_ops.attention_decode_gqa(
-            descriptor_for_ptr(state.scratch_arena, scratch.q_transposed, num_tokens * q_dim * sizeof(uint16_t)),
+            attention_q_desc,
             descriptor_for_ptr(
                 state.kv_arena,
                 k_cache,
@@ -311,18 +365,19 @@ void qwen2_attention_vk(
                 state.kv_arena,
                 v_cache,
                 static_cast<VkDeviceSize>(num_kv_heads) * max_seq_len * head_dim * sizeof(uint16_t)),
-            descriptor_for_ptr(state.scratch_arena, scratch.attn_out, num_tokens * q_dim * sizeof(uint16_t)),
+            attn_out_desc,
             static_cast<uint32_t>(num_heads),
             static_cast<uint32_t>(num_kv_heads),
             static_cast<uint32_t>(total_seq_len),
             static_cast<uint32_t>(max_seq_len),
             static_cast<uint32_t>(head_dim),
-            scale
+            scale,
+            batch
         );
     } else if (can_use_vk_prefill_attention) {
         TRACE_SCOPE_CAT("flash_attention_prefill_vk", "attention");
         state.fp16_ops.attention_prefill_gqa(
-            descriptor_for_ptr(state.scratch_arena, scratch.q_transposed, num_tokens * q_dim * sizeof(uint16_t)),
+            attention_q_desc,
             descriptor_for_ptr(
                 state.kv_arena,
                 k_cache,
@@ -331,22 +386,23 @@ void qwen2_attention_vk(
                 state.kv_arena,
                 v_cache,
                 static_cast<VkDeviceSize>(num_kv_heads) * max_seq_len * head_dim * sizeof(uint16_t)),
-            descriptor_for_ptr(state.scratch_arena, scratch.attn_out, num_tokens * q_dim * sizeof(uint16_t)),
+            attn_out_desc,
             static_cast<uint32_t>(num_heads),
             static_cast<uint32_t>(num_kv_heads),
             static_cast<uint32_t>(num_tokens),
             static_cast<uint32_t>(total_seq_len),
             static_cast<uint32_t>(max_seq_len),
             static_cast<uint32_t>(head_dim),
-            scale
+            scale,
+            batch
         );
     } else {
         TRACE_SCOPE_CAT("flash_attention_cpu", "attention");
         qwen2_flash_attention_gqa_fp16(
-            scratch.q_transposed,  // Q: [1, num_heads, q_len, head_dim]
-            k_cache,               // K: [1, num_kv_heads, max_seq_len, head_dim]
-            v_cache,               // V: [1, num_kv_heads, max_seq_len, head_dim]
-            scratch.attn_out,      // O: [1, num_heads, q_len, head_dim]
+            attention_uses_q_proj_layout ? scratch.q_proj : scratch.q_transposed,
+            k_cache,
+            v_cache,
+            scratch.attn_out,
             1,
             num_heads,
             num_kv_heads,
@@ -360,30 +416,36 @@ void qwen2_attention_vk(
         );
     }
 
-    // Convert attention output from BHSD -> BSHD using the existing BSHD->BHSD transpose shader
-    // with swapped S/H dimensions.
-    {
+    const VkDescriptorBufferInfo o_proj_input_desc = [&]() {
+        if (is_single_token_decode) {
+            return attn_out_desc;
+        }
+
         TRACE_SCOPE_CAT("attn_transpose_vk", "attention");
         state.fp16_ops.transpose_bshd_to_bhsd(
-            descriptor_for_ptr(state.scratch_arena, scratch.attn_out, num_tokens * q_dim * sizeof(uint16_t)),
-            descriptor_for_ptr(state.scratch_arena, scratch.q_proj, num_tokens * q_dim * sizeof(uint16_t)),
+            attn_out_desc,
+            q_proj_desc,
             1,
-            static_cast<uint32_t>(num_heads),   // S := H_original
-            static_cast<uint32_t>(num_tokens),  // H := S_original
-            static_cast<uint32_t>(head_dim)
+            static_cast<uint32_t>(num_heads),
+            static_cast<uint32_t>(num_tokens),
+            static_cast<uint32_t>(head_dim),
+            batch
         );
-    }
+        return q_proj_desc;
+    }();
 
     // Output projection: [num_tokens, q_dim] @ [hidden, q_dim]^T -> [num_tokens, hidden]
     {
-        TRACE_SCOPE_CAT("o_proj_vk", "gemm");
-        state.fp16_ops.gemm(
-            descriptor_for_ptr(state.scratch_arena, scratch.q_proj, num_tokens * q_dim * sizeof(uint16_t)),
+        project_fp16_row_major_vk(
+            state,
+            "o_proj_vk",
+            o_proj_input_desc,
             descriptor_for_ptr(state.weights_arena, layer.o_proj, hidden_size * q_dim * sizeof(uint16_t)),
             descriptor_for_ptr(state.scratch_arena, attn_output, num_tokens * hidden_size * sizeof(uint16_t)),
             static_cast<uint32_t>(num_tokens),
             static_cast<uint32_t>(hidden_size),
-            static_cast<uint32_t>(q_dim)
+            static_cast<uint32_t>(q_dim),
+            batch
         );
     }
 }
@@ -392,7 +454,8 @@ uint16_t* qwen2_forward_hidden_vk(
     Qwen2VkState& state,
     const int32_t* token_ids,
     size_t num_tokens,
-    PThreadPool* pool
+    PThreadPool* pool,
+    vulkan::VkDispatchBatch* batch
 ) {
     const QwenConfig& cfg = state.cfg;
     Qwen2Scratch& scratch = state.scratch;
@@ -436,7 +499,8 @@ uint16_t* qwen2_forward_hidden_vk(
                 descriptor_for_ptr(state.scratch_arena, scratch.normed, num_tokens * hidden_size * sizeof(uint16_t)),
                 static_cast<uint32_t>(hidden_size),
                 static_cast<uint32_t>(num_tokens),
-                cfg.rms_norm_eps
+                cfg.rms_norm_eps,
+                batch
             );
         }
 
@@ -452,7 +516,8 @@ uint16_t* qwen2_forward_hidden_vk(
             scratch.attn_out,
             scratch,
             num_tokens,
-            pool
+            pool,
+            batch
         );
 
         // First residual: next_hidden = current_hidden + attn_out
@@ -462,7 +527,8 @@ uint16_t* qwen2_forward_hidden_vk(
                 descriptor_for_ptr(state.scratch_arena, current_hidden, num_tokens * hidden_size * sizeof(uint16_t)),
                 descriptor_for_ptr(state.scratch_arena, scratch.attn_out, num_tokens * hidden_size * sizeof(uint16_t)),
                 descriptor_for_ptr(state.scratch_arena, next_hidden, num_tokens * hidden_size * sizeof(uint16_t)),
-                static_cast<uint32_t>(num_tokens * hidden_size)
+                static_cast<uint32_t>(num_tokens * hidden_size),
+                batch
             );
         }
 
@@ -475,7 +541,8 @@ uint16_t* qwen2_forward_hidden_vk(
                 descriptor_for_ptr(state.scratch_arena, scratch.normed, num_tokens * hidden_size * sizeof(uint16_t)),
                 static_cast<uint32_t>(hidden_size),
                 static_cast<uint32_t>(num_tokens),
-                cfg.rms_norm_eps
+                cfg.rms_norm_eps,
+                batch
             );
         }
 
@@ -485,7 +552,8 @@ uint16_t* qwen2_forward_hidden_vk(
             scratch.normed,
             scratch.mlp_out,
             scratch,
-            num_tokens
+            num_tokens,
+            batch
         );
 
         // Second residual: current_hidden = next_hidden + mlp_out
@@ -495,7 +563,8 @@ uint16_t* qwen2_forward_hidden_vk(
                 descriptor_for_ptr(state.scratch_arena, next_hidden, num_tokens * hidden_size * sizeof(uint16_t)),
                 descriptor_for_ptr(state.scratch_arena, scratch.mlp_out, num_tokens * hidden_size * sizeof(uint16_t)),
                 descriptor_for_ptr(state.scratch_arena, current_hidden, num_tokens * hidden_size * sizeof(uint16_t)),
-                static_cast<uint32_t>(num_tokens * hidden_size)
+                static_cast<uint32_t>(num_tokens * hidden_size),
+                batch
             );
         }
     }
@@ -520,8 +589,10 @@ uint16_t* forward_chunk_last_logits_vk(
         );
     }
 
+    vulkan::VkDispatchBatch batch = state.runtime.begin_batch();
+
     const size_t hidden_size = state.cfg.hidden_size;
-    const uint16_t* current_hidden = qwen2_forward_hidden_vk(state, token_ids, num_tokens, pool);
+    const uint16_t* current_hidden = qwen2_forward_hidden_vk(state, token_ids, num_tokens, pool, &batch);
     const uint16_t* last_hidden = current_hidden + (num_tokens - 1) * hidden_size;
 
     // Final LayerNorm (last token only).
@@ -533,7 +604,8 @@ uint16_t* forward_chunk_last_logits_vk(
             descriptor_for_ptr(state.scratch_arena, state.scratch.normed, hidden_size * sizeof(uint16_t)),
             static_cast<uint32_t>(hidden_size),
             1,
-            state.cfg.rms_norm_eps
+            state.cfg.rms_norm_eps,
+            &batch
         );
     }
 
@@ -555,7 +627,9 @@ uint16_t* forward_chunk_last_logits_vk(
                 descriptor_for_ptr(state.scratch_arena, state.scratch.logits,
                                    state.cfg.vocab_size * sizeof(uint16_t)),
                 static_cast<uint32_t>(state.cfg.vocab_size),
-                static_cast<uint32_t>(hidden_size)
+                static_cast<uint32_t>(hidden_size),
+                VK_NULL_HANDLE,
+                &batch
             );
         } else {
             state.fp16_ops.gemm(
@@ -566,10 +640,16 @@ uint16_t* forward_chunk_last_logits_vk(
                                    state.cfg.vocab_size * sizeof(uint16_t)),
                 1,
                 static_cast<uint32_t>(state.cfg.vocab_size),
-                static_cast<uint32_t>(hidden_size)
+                static_cast<uint32_t>(hidden_size),
+                VK_NULL_HANDLE,
+                &batch
             );
         }
     }
+
+    const vulkan::VkDispatchBatchHostBarrier host_barrier = host_barrier_for_desc(
+        descriptor_for_ptr(state.scratch_arena, state.scratch.logits, state.cfg.vocab_size * sizeof(uint16_t)));
+    state.runtime.finish_batch(&batch, &host_barrier, 1);
 
     return state.scratch.logits;
 }
@@ -590,7 +670,9 @@ void forward_chunk_no_logits_vk(
         );
     }
 
-    (void)qwen2_forward_hidden_vk(state, token_ids, num_tokens, pool);
+    vulkan::VkDispatchBatch batch = state.runtime.begin_batch();
+    (void)qwen2_forward_hidden_vk(state, token_ids, num_tokens, pool, &batch);
+    state.runtime.finish_batch(&batch, nullptr, 0);
 }
 
 size_t weights_bytes_needed_for_vk(
@@ -871,8 +953,10 @@ uint16_t* qwen2_forward_vk(
         throw std::runtime_error("qwen2_forward_vk: num_tokens exceeds scratch.max_tokens; increase max_batch_tokens");
     }
 
+    vulkan::VkDispatchBatch batch = state.runtime.begin_batch();
+
     const size_t hidden_size = state.cfg.hidden_size;
-    const uint16_t* current_hidden = qwen2_forward_hidden_vk(state, token_ids, num_tokens, pool);
+    const uint16_t* current_hidden = qwen2_forward_hidden_vk(state, token_ids, num_tokens, pool, &batch);
 
     // Final LayerNorm.
     {
@@ -883,7 +967,8 @@ uint16_t* qwen2_forward_vk(
             descriptor_for_ptr(state.scratch_arena, state.scratch.normed, num_tokens * hidden_size * sizeof(uint16_t)),
             static_cast<uint32_t>(hidden_size),
             static_cast<uint32_t>(num_tokens),
-            state.cfg.rms_norm_eps
+            state.cfg.rms_norm_eps,
+            &batch
         );
     }
 
@@ -904,9 +989,18 @@ uint16_t* qwen2_forward_vk(
                                num_tokens * state.cfg.vocab_size * sizeof(uint16_t)),
             static_cast<uint32_t>(num_tokens),
             static_cast<uint32_t>(state.cfg.vocab_size),
-            static_cast<uint32_t>(hidden_size)
+            static_cast<uint32_t>(hidden_size),
+            VK_NULL_HANDLE,
+            &batch
         );
     }
+
+    const vulkan::VkDispatchBatchHostBarrier host_barrier = host_barrier_for_desc(
+        descriptor_for_ptr(
+            state.scratch_arena,
+            state.scratch.logits,
+            num_tokens * state.cfg.vocab_size * sizeof(uint16_t)));
+    state.runtime.finish_batch(&batch, &host_barrier, 1);
 
     return state.scratch.logits;
 }
@@ -961,7 +1055,7 @@ uint16_t* qwen2_decode_vk(
 ) {
     TRACE_SCOPE_CAT("qwen2_decode_vk", "forward");
 
-    return qwen2_forward_vk(
+    return forward_chunk_last_logits_vk(
         state,
         &input_token,
         1,

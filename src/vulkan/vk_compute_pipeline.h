@@ -4,6 +4,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <vector>
 
 #include "vk_context.h"
 
@@ -31,6 +32,8 @@ struct VkDispatchTraceInfo {
 
 class VkComputePipeline {
   public:
+    static constexpr uint32_t kBatchDescriptorSetCapacity = 2048;
+
     VkComputePipeline() = default;
     static VkComputePipeline Create(VkDevice device, const ComputePipelineCreateInfo& info);
 
@@ -45,6 +48,9 @@ class VkComputePipeline {
     VkPipeline pipeline() const noexcept { return pipeline_; }
     VkPipelineLayout pipeline_layout() const noexcept { return pipeline_layout_; }
     VkDescriptorSetLayout descriptor_set_layout() const noexcept { return descriptor_set_layout_; }
+    uint32_t batch_descriptor_set_capacity() const noexcept {
+        return static_cast<uint32_t>(descriptor_sets_.size());
+    }
 
     void dispatch_and_wait(
         const VkContext& ctx,
@@ -62,6 +68,21 @@ class VkComputePipeline {
         const VkDispatchTraceInfo* trace = nullptr
     ) const;
 
+    void record_dispatch(
+        const VkContext& ctx,
+        VkCommandBuffer command_buffer,
+        uint32_t descriptor_set_index,
+        const VkDescriptorBufferInfo* buffers,
+        uint32_t buffer_count,
+        uint32_t group_count_x,
+        uint32_t group_count_y,
+        uint32_t group_count_z,
+        const void* push_constants,
+        uint32_t push_constants_size,
+        VkQueryPool query_pool = VK_NULL_HANDLE,
+        uint32_t query_index = UINT32_MAX
+    ) const;
+
   private:
     void destroy() noexcept;
 
@@ -74,7 +95,7 @@ class VkComputePipeline {
     VkPipeline pipeline_ = VK_NULL_HANDLE;
 
     VkDescriptorPool descriptor_pool_ = VK_NULL_HANDLE;
-    VkDescriptorSet descriptor_set_ = VK_NULL_HANDLE;
+    std::vector<VkDescriptorSet> descriptor_sets_;
     VkDescriptorUpdateTemplate descriptor_update_template_ = VK_NULL_HANDLE;
 };
 

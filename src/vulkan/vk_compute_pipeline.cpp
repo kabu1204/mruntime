@@ -96,24 +96,27 @@ VkComputePipeline VkComputePipeline::Create(VkDevice device, const ComputePipeli
     vk_check(vkCreateComputePipelines(device, info.pipeline_cache, 1, &vk_ci, nullptr, &out.pipeline_),
         "vkCreateComputePipelines");
 
-    // Descriptor pool & one reusable descriptor set.
+    // Descriptor pool & reusable descriptor sets.
     VkDescriptorPoolSize pool_sizes[1] = {};
     pool_sizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    pool_sizes[0].descriptorCount = info.storage_buffer_count;
+    pool_sizes[0].descriptorCount = info.storage_buffer_count * VkComputePipeline::kBatchDescriptorSetCapacity;
 
     VkDescriptorPoolCreateInfo dp_ci = {};
     dp_ci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    dp_ci.maxSets = 1;
+    dp_ci.maxSets = VkComputePipeline::kBatchDescriptorSetCapacity;
     dp_ci.poolSizeCount = 1;
     dp_ci.pPoolSizes = pool_sizes;
     vk_check(vkCreateDescriptorPool(device, &dp_ci, nullptr, &out.descriptor_pool_), "vkCreateDescriptorPool");
 
+    out.descriptor_sets_.resize(VkComputePipeline::kBatchDescriptorSetCapacity, VK_NULL_HANDLE);
+    std::vector<VkDescriptorSetLayout> set_layouts(VkComputePipeline::kBatchDescriptorSetCapacity, out.descriptor_set_layout_);
+
     VkDescriptorSetAllocateInfo ds_ai = {};
     ds_ai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
     ds_ai.descriptorPool = out.descriptor_pool_;
-    ds_ai.descriptorSetCount = 1;
-    ds_ai.pSetLayouts = &out.descriptor_set_layout_;
-    vk_check(vkAllocateDescriptorSets(device, &ds_ai, &out.descriptor_set_), "vkAllocateDescriptorSets");
+    ds_ai.descriptorSetCount = static_cast<uint32_t>(set_layouts.size());
+    ds_ai.pSetLayouts = set_layouts.data();
+    vk_check(vkAllocateDescriptorSets(device, &ds_ai, out.descriptor_sets_.data()), "vkAllocateDescriptorSets");
 
     std::vector<VkDescriptorUpdateTemplateEntry> update_entries(info.storage_buffer_count);
     for (uint32_t i = 0; i < info.storage_buffer_count; ++i) {
@@ -158,7 +161,7 @@ VkComputePipeline& VkComputePipeline::operator=(VkComputePipeline&& other) noexc
     pipeline_layout_ = std::exchange(other.pipeline_layout_, VK_NULL_HANDLE);
     pipeline_ = std::exchange(other.pipeline_, VK_NULL_HANDLE);
     descriptor_pool_ = std::exchange(other.descriptor_pool_, VK_NULL_HANDLE);
-    descriptor_set_ = std::exchange(other.descriptor_set_, VK_NULL_HANDLE);
+    descriptor_sets_ = std::move(other.descriptor_sets_);
     descriptor_update_template_ = std::exchange(other.descriptor_update_template_, VK_NULL_HANDLE);
 
     return *this;
@@ -210,43 +213,28 @@ void VkComputePipeline::dispatch_and_wait(
         {
             ::mruntime::ScopedTrace launch_scope("vk.launch", "vulkan.cpu");
 
-            vkUpdateDescriptorSetWithTemplate(device_, descriptor_set_, descriptor_update_template_, buffers);
-
             VkCommandBuffer cb = ctx.command_buffer();
             vk_check(vkResetCommandBuffer(cb, 0), "vkResetCommandBuffer");
 
             begin_command_buffer(cb);
 
-            vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_);
-            vkCmdBindDescriptorSets(
-                cb,
-                VK_PIPELINE_BIND_POINT_COMPUTE,
-                pipeline_layout_,
-                0,
-                1,
-                &descriptor_set_,
-                0,
-                nullptr
-            );
-            if (push_constant_size_ > 0) {
-                vkCmdPushConstants(
-                    cb,
-                    pipeline_layout_,
-                    VK_SHADER_STAGE_COMPUTE_BIT,
-                    0,
-                    push_constant_size_,
-                    push_constants
-                );
-            }
-
             if (query_pool != VK_NULL_HANDLE) {
                 vkCmdResetQueryPool(cb, query_pool, 0, 2);
-                vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, query_pool, 0);
             }
-            vkCmdDispatch(cb, group_count_x, group_count_y, group_count_z);
-            if (query_pool != VK_NULL_HANDLE) {
-                vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, query_pool, 1);
-            }
+            record_dispatch(
+                ctx,
+                cb,
+                0,
+                buffers,
+                buffer_count,
+                group_count_x,
+                group_count_y,
+                group_count_z,
+                push_constants,
+                push_constants_size,
+                query_pool,
+                query_pool != VK_NULL_HANDLE ? 0u : UINT32_MAX
+            );
 
             if (host_read_buffer != VK_NULL_HANDLE && host_read_size > 0) {
                 cmd_buffer_barrier_to_host_read(cb, host_read_buffer, host_read_offset, host_read_size);
@@ -355,36 +343,28 @@ void VkComputePipeline::dispatch_and_wait(
             }
         }
     } else {
-        vkUpdateDescriptorSetWithTemplate(device_, descriptor_set_, descriptor_update_template_, buffers);
-
         VkCommandBuffer cb = ctx.command_buffer();
         vk_check(vkResetCommandBuffer(cb, 0), "vkResetCommandBuffer");
 
         begin_command_buffer(cb);
 
-        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_);
-        vkCmdBindDescriptorSets(
-            cb,
-            VK_PIPELINE_BIND_POINT_COMPUTE,
-            pipeline_layout_,
-            0,
-            1,
-            &descriptor_set_,
-            0,
-            nullptr
-        );
-        if (push_constant_size_ > 0) {
-            vkCmdPushConstants(cb, pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, push_constant_size_, push_constants);
-        }
-
         if (query_pool != VK_NULL_HANDLE) {
             vkCmdResetQueryPool(cb, query_pool, 0, 2);
-            vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, query_pool, 0);
         }
-        vkCmdDispatch(cb, group_count_x, group_count_y, group_count_z);
-        if (query_pool != VK_NULL_HANDLE) {
-            vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, query_pool, 1);
-        }
+        record_dispatch(
+            ctx,
+            cb,
+            0,
+            buffers,
+            buffer_count,
+            group_count_x,
+            group_count_y,
+            group_count_z,
+            push_constants,
+            push_constants_size,
+            query_pool,
+            query_pool != VK_NULL_HANDLE ? 0u : UINT32_MAX
+        );
 
         if (host_read_buffer != VK_NULL_HANDLE && host_read_size > 0) {
             cmd_buffer_barrier_to_host_read(cb, host_read_buffer, host_read_offset, host_read_size);
@@ -408,7 +388,7 @@ void VkComputePipeline::destroy() noexcept {
         vkDestroyDescriptorPool(device_, descriptor_pool_, nullptr);
         descriptor_pool_ = VK_NULL_HANDLE;
     }
-    descriptor_set_ = VK_NULL_HANDLE;
+    descriptor_sets_.clear();
 
     if (pipeline_ != VK_NULL_HANDLE) {
         vkDestroyPipeline(device_, pipeline_, nullptr);
@@ -426,6 +406,72 @@ void VkComputePipeline::destroy() noexcept {
     device_ = VK_NULL_HANDLE;
     storage_buffer_count_ = 0;
     push_constant_size_ = 0;
+}
+
+void VkComputePipeline::record_dispatch(
+    const VkContext& ctx,
+    VkCommandBuffer command_buffer,
+    uint32_t descriptor_set_index,
+    const VkDescriptorBufferInfo* buffers,
+    uint32_t buffer_count,
+    uint32_t group_count_x,
+    uint32_t group_count_y,
+    uint32_t group_count_z,
+    const void* push_constants,
+    uint32_t push_constants_size,
+    VkQueryPool query_pool,
+    uint32_t query_index
+) const {
+    if (device_ == VK_NULL_HANDLE || ctx.device() != device_) {
+        throw std::runtime_error("VkComputePipeline::record_dispatch: invalid device/context");
+    }
+    if (command_buffer == VK_NULL_HANDLE) {
+        throw std::runtime_error("VkComputePipeline::record_dispatch: command_buffer is null");
+    }
+    if (buffers == nullptr || buffer_count != storage_buffer_count_) {
+        throw std::runtime_error("VkComputePipeline::record_dispatch: buffer_count mismatch");
+    }
+    if (push_constants_size != push_constant_size_) {
+        throw std::runtime_error("VkComputePipeline::record_dispatch: push_constants_size mismatch");
+    }
+    if (push_constant_size_ > 0 && push_constants == nullptr) {
+        throw std::runtime_error("VkComputePipeline::record_dispatch: push_constants is null");
+    }
+    if (descriptor_set_index >= descriptor_sets_.size()) {
+        throw std::runtime_error("VkComputePipeline::record_dispatch: descriptor_set_index out of range");
+    }
+
+    VkDescriptorSet descriptor_set = descriptor_sets_[descriptor_set_index];
+    vkUpdateDescriptorSetWithTemplate(device_, descriptor_set, descriptor_update_template_, buffers);
+
+    vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_);
+    vkCmdBindDescriptorSets(
+        command_buffer,
+        VK_PIPELINE_BIND_POINT_COMPUTE,
+        pipeline_layout_,
+        0,
+        1,
+        &descriptor_set,
+        0,
+        nullptr
+    );
+    if (push_constant_size_ > 0) {
+        vkCmdPushConstants(
+            command_buffer,
+            pipeline_layout_,
+            VK_SHADER_STAGE_COMPUTE_BIT,
+            0,
+            push_constant_size_,
+            push_constants
+        );
+    }
+    if (query_pool != VK_NULL_HANDLE && query_index != UINT32_MAX) {
+        vkCmdWriteTimestamp2(command_buffer, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, query_pool, query_index);
+    }
+    vkCmdDispatch(command_buffer, group_count_x, group_count_y, group_count_z);
+    if (query_pool != VK_NULL_HANDLE && query_index != UINT32_MAX) {
+        vkCmdWriteTimestamp2(command_buffer, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, query_pool, query_index + 1);
+    }
 }
 
 }  // namespace mruntime::vulkan
