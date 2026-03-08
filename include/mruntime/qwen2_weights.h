@@ -107,7 +107,8 @@ struct Qwen2MemorySizes {
 Qwen2MemorySizes qwen2_memory_sizes(
     const QwenConfig& cfg,
     size_t max_seq_len,
-    size_t max_batch_tokens = 32  // Max tokens per forward call
+    size_t max_batch_tokens = 32,  // Max tokens per forward call
+    bool has_separate_lm_head = true
 );
 
 // ============================================================================

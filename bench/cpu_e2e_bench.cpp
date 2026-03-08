@@ -85,8 +85,17 @@ int main(int argc, char** argv) {
         gen_cfg.eos_token_id = args.eos_token_id;
         gen_cfg.seed = args.seed;
 
-        const mruntime::Qwen2MemorySizes sizes =
-            mruntime::qwen2_memory_sizes(cfg, args.max_seq_len, args.max_batch_tokens);
+        auto st = mruntime::SafeTensorsFile::open(mruntime::bench::join_path(model_dir, "model.safetensors"));
+        if (!st) {
+            throw std::runtime_error("Failed to open model.safetensors");
+        }
+
+        const mruntime::Qwen2MemorySizes sizes = mruntime::qwen2_memory_sizes(
+            cfg,
+            args.max_seq_len,
+            args.max_batch_tokens,
+            st->has_tensor("lm_head.weight")
+        );
 
         mruntime::Qwen2Arenas arenas = mruntime::create_qwen2_arenas(
             sizes.weights_bytes + sizes.packed_weights_bytes,
@@ -94,10 +103,6 @@ int main(int argc, char** argv) {
             sizes.scratch_bytes
         );
 
-        auto st = mruntime::SafeTensorsFile::open(mruntime::bench::join_path(model_dir, "model.safetensors"));
-        if (!st) {
-            throw std::runtime_error("Failed to open model.safetensors");
-        }
         mruntime::Qwen2Weights weights =
             mruntime::qwen2_load_weights(cfg, *st, arenas.weights, /*pack_for_kai=*/true);
 

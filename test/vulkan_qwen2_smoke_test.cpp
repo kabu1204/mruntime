@@ -115,7 +115,7 @@ void run_smoke() {
     const size_t max_batch_tokens = 8;
 
     const mruntime::Qwen2MemorySizes sizes =
-        mruntime::qwen2_memory_sizes(cfg, max_seq_len, max_batch_tokens);
+        mruntime::qwen2_memory_sizes(cfg, max_seq_len, max_batch_tokens, true);
 
     mruntime::Qwen2Arenas arenas = mruntime::create_qwen2_arenas(
         sizes.weights_bytes,
@@ -126,8 +126,6 @@ void run_smoke() {
     mruntime::Qwen2Weights weights = make_tiny_weights(cfg, arenas.weights);
     mruntime::Qwen2KVCache kv_cpu = mruntime::qwen2_init_kv_cache(cfg, arenas.kv_cache, max_seq_len);
     mruntime::Qwen2Scratch scratch_cpu = mruntime::qwen2_init_scratch(cfg, arenas.scratch, max_batch_tokens);
-
-    auto vk_state = mruntime::qwen2_vk_create(cfg, weights, max_seq_len, max_batch_tokens);
 
     const std::vector<int32_t> prompt = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12};
 
@@ -140,15 +138,7 @@ void run_smoke() {
         prompt.size(),
         nullptr
     );
-
-    const uint16_t* vk_last = mruntime::qwen2_prefill_vk(
-        *vk_state,
-        prompt.data(),
-        prompt.size(),
-        nullptr
-    );
-
-    check_close_fp16("prefill_logits", vk_last, cpu_last, static_cast<uint32_t>(cfg.vocab_size), 5e-2f);
+    std::vector<uint16_t> cpu_last_copy(cpu_last, cpu_last + cfg.vocab_size);
 
     const int32_t input_token = 7;
     const uint16_t* cpu_decode = mruntime::qwen2_decode(
@@ -159,12 +149,25 @@ void run_smoke() {
         input_token,
         nullptr
     );
+    std::vector<uint16_t> cpu_decode_copy(cpu_decode, cpu_decode + cfg.vocab_size);
+
+    auto vk_state = mruntime::qwen2_vk_create(cfg, weights, max_seq_len, max_batch_tokens);
+    mruntime::destroy_qwen2_arenas(arenas);
+
+    const uint16_t* vk_last = mruntime::qwen2_prefill_vk(
+        *vk_state,
+        prompt.data(),
+        prompt.size(),
+        nullptr
+    );
+
+    check_close_fp16("prefill_logits", vk_last, cpu_last_copy.data(), static_cast<uint32_t>(cfg.vocab_size), 5e-2f);
+
     const uint16_t* vk_decode = mruntime::qwen2_decode_vk(*vk_state, input_token, nullptr);
-    check_close_fp16("decode_logits", vk_decode, cpu_decode, static_cast<uint32_t>(cfg.vocab_size), 5e-2f);
+    check_close_fp16("decode_logits", vk_decode, cpu_decode_copy.data(), static_cast<uint32_t>(cfg.vocab_size), 5e-2f);
 
     std::cout << "vulkan_qwen2_smoke_test PASSED\n";
     vk_state.reset();
-    mruntime::destroy_qwen2_arenas(arenas);
 }
 
 }  // namespace

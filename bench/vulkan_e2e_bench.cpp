@@ -93,16 +93,21 @@ int main(int argc, char** argv) {
         gen_cfg.eos_token_id = args.eos_token_id;
         gen_cfg.seed = args.seed;
 
-        const mruntime::Qwen2MemorySizes sizes =
-            mruntime::qwen2_memory_sizes(cfg, args.max_seq_len, args.max_batch_tokens);
-
-        // CPU weights arena (only): Vulkan path owns KV+scratch buffers.
-        mruntime::Arena weights_arena = mruntime::create_arena(sizes.weights_bytes);
-
         auto st = mruntime::SafeTensorsFile::open(mruntime::bench::join_path(model_dir, "model.safetensors"));
         if (!st) {
             throw std::runtime_error("Failed to open model.safetensors");
         }
+
+        const mruntime::Qwen2MemorySizes sizes = mruntime::qwen2_memory_sizes(
+            cfg,
+            args.max_seq_len,
+            args.max_batch_tokens,
+            st->has_tensor("lm_head.weight")
+        );
+
+        // CPU weights arena (only): Vulkan path owns KV+scratch buffers.
+        mruntime::Arena weights_arena = mruntime::create_arena(sizes.weights_bytes);
+
         mruntime::Qwen2Weights weights =
             mruntime::qwen2_load_weights(cfg, *st, weights_arena, /*pack_for_kai=*/false);
 

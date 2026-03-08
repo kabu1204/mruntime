@@ -211,8 +211,18 @@ int main(int argc, char** argv) {
 
         // Calculate memory requirements
         const size_t max_batch_tokens = 64;  // Max tokens per forward call
-        mruntime::Qwen2MemorySizes sizes =
-            mruntime::qwen2_memory_sizes(cfg, args.max_seq_len, max_batch_tokens);
+
+        auto st = mruntime::SafeTensorsFile::open(join_path(model_dir, "model.safetensors"));
+        if (!st) {
+            throw std::runtime_error("Failed to open model weights");
+        }
+
+        mruntime::Qwen2MemorySizes sizes = mruntime::qwen2_memory_sizes(
+            cfg,
+            args.max_seq_len,
+            max_batch_tokens,
+            st->has_tensor("lm_head.weight")
+        );
 
         std::cout << "Memory: weights=" << sizes.weights_bytes / 1024 / 1024 << "MB, "
                   << "packed=" << sizes.packed_weights_bytes / 1024 / 1024 << "MB, "
@@ -238,10 +248,6 @@ int main(int argc, char** argv) {
 
         // Load weights
         std::cout << "Loading weights...\n";
-        auto st = mruntime::SafeTensorsFile::open(join_path(model_dir, "model.safetensors"));
-        if (!st) {
-            throw std::runtime_error("Failed to open model weights");
-        }
         mruntime::Qwen2Weights weights =
             mruntime::qwen2_load_weights(cfg, *st, *cpu_weights_arena, /*pack_for_kai=*/!use_vulkan);
 

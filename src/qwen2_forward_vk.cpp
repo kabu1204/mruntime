@@ -751,7 +751,9 @@ Qwen2VkStatePtr qwen2_vk_create(
     if (cpu_weights.layers == nullptr || cpu_weights.num_layers != cfg.num_layers) {
         throw std::runtime_error("qwen2_vk_create: cpu_weights.layers is null or num_layers mismatch");
     }
-    if (cpu_weights.final_norm == nullptr || cpu_weights.lm_head == nullptr) {
+    if (cpu_weights.embed_tokens == nullptr ||
+        cpu_weights.final_norm == nullptr ||
+        cpu_weights.lm_head == nullptr) {
         throw std::runtime_error("qwen2_vk_create: cpu_weights is missing required tensors");
     }
 
@@ -801,7 +803,15 @@ Qwen2VkStatePtr qwen2_vk_create(
     state->weights_arena = vulkan::VkBufferArena::Create(
         state->vk.physical_device(), state->vk.device(), weights_info);
 
-    // Upload weights to weights_arena.
+    // Copy CPU embedding weights for the CPU-side embedding lookup used by the Vulkan path.
+    {
+        const size_t count = cfg.vocab_size * cfg.hidden_size;
+        state->embed_tokens_cpu.resize(count);
+        std::memcpy(state->embed_tokens_cpu.data(), cpu_weights.embed_tokens, count * sizeof(uint16_t));
+        state->weights.embed_tokens = state->embed_tokens_cpu.data();
+    }
+
+    // Upload Vulkan-consumed weights to weights_arena.
     state->weights.num_layers = cfg.num_layers;
     state->layer_weights.resize(cfg.num_layers);
     state->weights.layers = state->layer_weights.data();
@@ -826,13 +836,6 @@ Qwen2VkStatePtr qwen2_vk_create(
         std::memcpy(dst, cpu_weights.lm_head, count * sizeof(uint16_t));
         state->weights.lm_head = dst;
         state->weights.lm_head_packed = nullptr;
-    }
-
-    // embed_tokens: avoid uploading if untied; otherwise reuse lm_head.
-    if (cpu_weights.embed_tokens == cpu_weights.lm_head) {
-        state->weights.embed_tokens = state->weights.lm_head;
-    } else {
-        state->weights.embed_tokens = cpu_weights.embed_tokens;
     }
 
     for (size_t i = 0; i < cfg.num_layers; ++i) {

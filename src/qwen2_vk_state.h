@@ -19,6 +19,8 @@ struct Qwen2VkState {
     size_t max_seq_len = 0;
     size_t max_batch_tokens = 0;
 
+    std::vector<uint16_t> embed_tokens_cpu;
+
     Qwen2Weights weights = {};
     std::vector<Qwen2LayerWeights> layer_weights;
 
@@ -37,4 +39,3 @@ struct Qwen2VkState {
 };
 
 }  // namespace mruntime
-

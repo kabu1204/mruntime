@@ -22,6 +22,8 @@ struct Qwen2VkStateDeleter {
 
 using Qwen2VkStatePtr = std::unique_ptr<Qwen2VkState, Qwen2VkStateDeleter>;
 
+// `cpu_weights` only needs to remain valid during this call.
+// The returned Vulkan state owns all weight data needed for subsequent inference.
 Qwen2VkStatePtr qwen2_vk_create(
     const QwenConfig& cfg,
     const Qwen2Weights& cpu_weights,
