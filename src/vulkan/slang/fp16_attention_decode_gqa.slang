@@ -130,42 +130,16 @@ void main(
     Workgroup::gather_slice<SharedQueryStorage, WG_SIZE>(q_data, q_slice, tid);
     GroupMemoryBarrierWithGroupSync();
 
-    float max_score = NEG_INF;
-    [loop]
-    for (uint slice_base = 0u; slice_base < kv_slices.slice_count; slice_base += uint(SCORE_TILE)) {
-        const uint tile_count = min(uint(SCORE_TILE), kv_slices.slice_count - slice_base);
-        if (tid < tile_count) {
-            const Fp16Span score_slice = kv_slices.slice(slice_base + tid);
-            float score = 0.0;
-            uint index = 0u;
-            const uint vectorized_end = score_slice.vectorized_count8();
-
-            for (; index < vectorized_end; index += 8u) {
-                const FloatPack8 src_values = Thread::load_fp16_pack8(k_data, score_slice.offset(index));
-                score += dot(Thread::gather_storage4<SharedQueryStorage>(index + 0u), src_values.lo);
-                score += dot(Thread::gather_storage4<SharedQueryStorage>(index + 4u), src_values.hi);
-            }
-
-            for (; index < score_slice.count; ++index) {
-                score += SharedQueryStorage::load(index) * Thread::load_fp16(k_data, score_slice.offset(index));
-            }
-
-            max_score = max(max_score, score * pc.scale);
-        }
-    }
-
-    const float stabilized_max = Workgroup::broadcast_scalar<SharedScalarStorage>(
-        Workgroup::leader_reduce_max<SharedScalarStorage, WG_SIZE>(max_score, tid),
-        tid);
-
     float4 accum = float4(0.0);
-    float norm_sum = 0.0;
+    float running_max = NEG_INF;
+    float running_norm = 0.0;
     [loop]
     for (uint slice_base = 0u; slice_base < kv_slices.slice_count; slice_base += uint(SCORE_TILE)) {
         const uint tile_count = min(uint(SCORE_TILE), kv_slices.slice_count - slice_base);
+        float score = NEG_INF;
         if (tid < tile_count) {
             const Fp16Span score_slice = kv_slices.slice(slice_base + tid);
-            float score = 0.0;
+            score = 0.0;
             uint index = 0u;
             const uint vectorized_end = score_slice.vectorized_count8();
 
@@ -179,35 +153,51 @@ void main(
                 score += SharedQueryStorage::load(index) * Thread::load_fp16(k_data, score_slice.offset(index));
             }
 
-            const float weight = exp(score * pc.scale - stabilized_max);
-            SharedScoreTileStorage::store(tid, weight);
-            norm_sum += weight;
+            score *= pc.scale;
+        }
+
+        const float tile_max = Workgroup::broadcast_scalar<SharedScalarStorage>(
+            Workgroup::leader_reduce_max<SharedScalarStorage, WG_SIZE>(score, tid),
+            tid);
+
+        float local_weight = 0.0;
+        if (tid < tile_count) {
+            local_weight = exp(score - tile_max);
+            SharedScoreTileStorage::store(tid, local_weight);
         }
         GroupMemoryBarrierWithGroupSync();
 
+        const float tile_norm = Workgroup::broadcast_scalar<SharedScalarStorage>(
+            Workgroup::leader_reduce_sum<SharedScalarStorage, WG_SIZE>(local_weight, tid),
+            tid);
+
+        float4 tile_accum = float4(0.0);
         for (uint slice = 0u; slice < tile_count; ++slice) {
             const float weight = SharedScoreTileStorage::load(slice);
             const Fp16Span value_slice = kv_slices.slice(slice_base + slice);
             if (index0 < value_slice.count) {
-                accum.x += weight * Thread::load_fp16(v_data, value_slice.offset(index0));
+                tile_accum.x += weight * Thread::load_fp16(v_data, value_slice.offset(index0));
             }
             if (index1 < value_slice.count) {
-                accum.y += weight * Thread::load_fp16(v_data, value_slice.offset(index1));
+                tile_accum.y += weight * Thread::load_fp16(v_data, value_slice.offset(index1));
             }
             if (index2 < value_slice.count) {
-                accum.z += weight * Thread::load_fp16(v_data, value_slice.offset(index2));
+                tile_accum.z += weight * Thread::load_fp16(v_data, value_slice.offset(index2));
             }
             if (index3 < value_slice.count) {
-                accum.w += weight * Thread::load_fp16(v_data, value_slice.offset(index3));
+                tile_accum.w += weight * Thread::load_fp16(v_data, value_slice.offset(index3));
             }
         }
         GroupMemoryBarrierWithGroupSync();
+
+        const float merged_max = max(running_max, tile_max);
+        const float running_scale = (running_norm > 0.0) ? exp(running_max - merged_max) : 0.0;
+        const float tile_scale = exp(tile_max - merged_max);
+        accum = accum * running_scale + tile_accum * tile_scale;
+        running_norm = running_norm * running_scale + tile_norm * tile_scale;
+        running_max = merged_max;
     }
 
-    const float total_norm = Workgroup::broadcast_scalar<SharedScalarStorage>(
-        Workgroup::leader_reduce_sum<SharedScalarStorage, WG_SIZE>(norm_sum, tid),
-        tid);
-
-    const float inv_norm = (total_norm > 0.0) ? (1.0 / total_norm) : 0.0;
+    const float inv_norm = (running_norm > 0.0) ? (1.0 / running_norm) : 0.0;
     Thread::scatter_values4(o_data, o_slice, tid, WG_SIZE, accum * inv_norm);
 }
