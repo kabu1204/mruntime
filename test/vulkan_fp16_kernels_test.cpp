@@ -286,6 +286,126 @@ void test_rope(TestContext& tc) {
     std::cout << "  rope PASSED\n";
 }
 
+void test_qkv_bias_rope_cache_decode(TestContext& tc, bool has_bias) {
+    const uint32_t num_q_heads = 6;
+    const uint32_t num_kv_heads = 2;
+    const uint32_t head_dim = 64;
+    const uint32_t q_dim = num_q_heads * head_dim;
+    const uint32_t kv_dim = num_kv_heads * head_dim;
+    const uint32_t qkv_dim = q_dim + 2 * kv_dim;
+    const uint32_t max_seq_len = 16;
+    const uint32_t position_offset = 5;
+    const uint32_t half_dim = head_dim / 2;
+    const uint32_t cache_count = num_kv_heads * max_seq_len * head_dim;
+    const uint32_t cos_sin_count = max_seq_len * head_dim;
+
+    const VkDeviceSize qkv_bytes = qkv_dim * sizeof(uint16_t);
+    const VkDeviceSize bias_bytes = qkv_dim * sizeof(uint16_t);
+    const VkDeviceSize cos_sin_bytes = cos_sin_count * sizeof(float);
+    const VkDeviceSize q_out_bytes = q_dim * sizeof(uint16_t);
+    const VkDeviceSize cache_bytes = cache_count * sizeof(uint16_t);
+
+    auto arena = make_arena(tc, qkv_bytes + bias_bytes + cos_sin_bytes + q_out_bytes + 2 * cache_bytes + 6 * tc.alignment);
+
+    const VkDeviceSize qkv_offset = arena.alloc(qkv_bytes);
+    const VkDeviceSize bias_offset = arena.alloc(bias_bytes);
+    const VkDeviceSize cos_sin_offset = arena.alloc(cos_sin_bytes);
+    const VkDeviceSize q_out_offset = arena.alloc(q_out_bytes);
+    const VkDeviceSize k_cache_offset = arena.alloc(cache_bytes);
+    const VkDeviceSize v_cache_offset = arena.alloc(cache_bytes);
+
+    uint16_t* qkv_data = arena.host_ptr<uint16_t>(qkv_offset);
+    uint16_t* bias_data = arena.host_ptr<uint16_t>(bias_offset);
+    float* cos_sin_data = arena.host_ptr<float>(cos_sin_offset);
+    uint16_t* q_out_data = arena.host_ptr<uint16_t>(q_out_offset);
+    uint16_t* k_cache_data = arena.host_ptr<uint16_t>(k_cache_offset);
+    uint16_t* v_cache_data = arena.host_ptr<uint16_t>(v_cache_offset);
+
+    for (uint32_t i = 0; i < qkv_dim; ++i) {
+        const float value = -0.35f + 0.0025f * static_cast<float>((i * 13u) % 257u);
+        qkv_data[i] = mruntime::float_to_fp16_bits(value);
+        const float bias = has_bias ? (-0.03f + 0.0004f * static_cast<float>((i * 7u) % 97u)) : 0.0f;
+        bias_data[i] = mruntime::float_to_fp16_bits(bias);
+    }
+
+    for (uint32_t pos = 0; pos < max_seq_len; ++pos) {
+        for (uint32_t i = 0; i < half_dim; ++i) {
+            const float freq = 1.0f / std::pow(10000.0f, 2.0f * static_cast<float>(i) / static_cast<float>(head_dim));
+            const float angle = static_cast<float>(pos) * freq;
+            cos_sin_data[pos * head_dim + i * 2] = std::cos(angle);
+            cos_sin_data[pos * head_dim + i * 2 + 1] = std::sin(angle);
+        }
+    }
+
+    const uint16_t cache_sentinel_k = mruntime::float_to_fp16_bits(11.0f);
+    const uint16_t cache_sentinel_v = mruntime::float_to_fp16_bits(-7.0f);
+    std::fill(q_out_data, q_out_data + q_dim, mruntime::float_to_fp16_bits(0.0f));
+    std::fill(k_cache_data, k_cache_data + cache_count, cache_sentinel_k);
+    std::fill(v_cache_data, v_cache_data + cache_count, cache_sentinel_v);
+
+    std::vector<float> q_expected(q_dim, 0.0f);
+    std::vector<float> k_expected(cache_count, mruntime::fp16_bits_to_float(cache_sentinel_k));
+    std::vector<float> v_expected(cache_count, mruntime::fp16_bits_to_float(cache_sentinel_v));
+
+    for (uint32_t head = 0; head < num_q_heads; ++head) {
+        const uint32_t base = head * head_dim;
+        for (uint32_t i = 0; i < half_dim; ++i) {
+            const uint32_t idx0 = base + i;
+            const uint32_t idx1 = base + half_dim + i;
+            const float x0 = mruntime::fp16_bits_to_float(qkv_data[idx0]) + mruntime::fp16_bits_to_float(bias_data[idx0]);
+            const float x1 = mruntime::fp16_bits_to_float(qkv_data[idx1]) + mruntime::fp16_bits_to_float(bias_data[idx1]);
+            const float cos_val = cos_sin_data[position_offset * head_dim + i * 2];
+            const float sin_val = cos_sin_data[position_offset * head_dim + i * 2 + 1];
+            q_expected[idx0] = x0 * cos_val - x1 * sin_val;
+            q_expected[idx1] = x1 * cos_val + x0 * sin_val;
+        }
+    }
+
+    for (uint32_t head = 0; head < num_kv_heads; ++head) {
+        const uint32_t src_base = q_dim + head * head_dim;
+        const uint32_t dst_base = (head * max_seq_len + position_offset) * head_dim;
+        for (uint32_t i = 0; i < half_dim; ++i) {
+            const uint32_t src0 = src_base + i;
+            const uint32_t src1 = src_base + half_dim + i;
+            const float x0 = mruntime::fp16_bits_to_float(qkv_data[src0]) + mruntime::fp16_bits_to_float(bias_data[src0]);
+            const float x1 = mruntime::fp16_bits_to_float(qkv_data[src1]) + mruntime::fp16_bits_to_float(bias_data[src1]);
+            const float cos_val = cos_sin_data[position_offset * head_dim + i * 2];
+            const float sin_val = cos_sin_data[position_offset * head_dim + i * 2 + 1];
+            k_expected[dst_base + i] = x0 * cos_val - x1 * sin_val;
+            k_expected[dst_base + half_dim + i] = x1 * cos_val + x0 * sin_val;
+        }
+
+        const uint32_t v_src_base = q_dim + kv_dim + head * head_dim;
+        for (uint32_t d = 0; d < head_dim; ++d) {
+            const uint32_t src = v_src_base + d;
+            v_expected[dst_base + d] =
+                mruntime::fp16_bits_to_float(qkv_data[src]) + mruntime::fp16_bits_to_float(bias_data[src]);
+        }
+    }
+
+    tc.fp16_ops.qkv_bias_rope_cache_decode(
+        arena.descriptor(qkv_offset, qkv_bytes),
+        has_bias ? arena.descriptor(bias_offset, bias_bytes) : arena.descriptor(qkv_offset, qkv_bytes),
+        arena.descriptor(cos_sin_offset, cos_sin_bytes),
+        arena.descriptor(q_out_offset, q_out_bytes),
+        arena.descriptor(k_cache_offset, cache_bytes),
+        arena.descriptor(v_cache_offset, cache_bytes),
+        q_dim,
+        kv_dim,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+        max_seq_len,
+        position_offset,
+        has_bias);
+
+    const std::string label = has_bias ? "qkv_bias_rope_cache_decode(bias)" : "qkv_bias_rope_cache_decode(no_bias)";
+    check_close((label + ":Q").c_str(), q_out_data, q_expected.data(), q_dim, 5e-3f);
+    check_close((label + ":K").c_str(), k_cache_data, k_expected.data(), cache_count, 5e-3f);
+    check_close((label + ":V").c_str(), v_cache_data, v_expected.data(), cache_count, 5e-3f);
+    std::cout << "  " << label << " PASSED\n";
+}
+
 // ---- transpose BSHD -> BHSD ----
 
 void test_transpose(TestContext& tc) {
@@ -614,6 +734,8 @@ void run_all_tests() {
 
     test_silu_mul_interleaved(tc);
     test_rmsnorm(tc);
+    test_qkv_bias_rope_cache_decode(tc, false);
+    test_qkv_bias_rope_cache_decode(tc, true);
     test_rope(tc);
     test_transpose(tc);
     test_kv_cache_copy(tc);

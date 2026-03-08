@@ -78,6 +78,24 @@ class VkFp16Ops {
         VkDispatchBatch* batch = nullptr
     ) const;
 
+    void qkv_bias_rope_cache_decode(
+        const VkDescriptorBufferInfo& qkv,
+        const VkDescriptorBufferInfo& bias,
+        const VkDescriptorBufferInfo& rope_cos_sin,
+        const VkDescriptorBufferInfo& q_out,
+        const VkDescriptorBufferInfo& k_cache,
+        const VkDescriptorBufferInfo& v_cache,
+        uint32_t q_dim,
+        uint32_t kv_dim,
+        uint32_t num_q_heads,
+        uint32_t num_kv_heads,
+        uint32_t head_dim,
+        uint32_t max_seq_len,
+        uint32_t position_offset,
+        bool has_bias,
+        VkDispatchBatch* batch = nullptr
+    ) const;
+
     void transpose_bshd_to_bhsd(
         const VkDescriptorBufferInfo& input,
         const VkDescriptorBufferInfo& output,
@@ -170,6 +188,7 @@ class VkFp16Ops {
     VkKernel silu_mul_interleaved_kernel_ = {};
     VkKernel rmsnorm_kernel_ = {};
     VkKernel qkv_bias_split_kernel_ = {};
+    VkKernel qkv_bias_rope_cache_decode_kernel_ = {};
     VkKernel rope_kernel_ = {};
     VkKernel transpose_kernel_ = {};
     VkKernel kv_cache_copy_kernel_ = {};

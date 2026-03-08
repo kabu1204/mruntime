@@ -1,0 +1,104 @@
+#version 460
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer QkvBuffer {
+    float16_t qkv[];
+} qkv_buf;
+
+layout(set = 0, binding = 1, std430) readonly buffer BiasBuffer {
+    float16_t bias[];
+} bias_buf;
+
+layout(set = 0, binding = 2, std430) readonly buffer RopeCosSinBuffer {
+    vec2 data[];
+} rope_cs_buf;
+
+layout(set = 0, binding = 3, std430) writeonly buffer QOutBuffer {
+    float16_t q_out[];
+} q_out_buf;
+
+layout(set = 0, binding = 4, std430) buffer KCacheBuffer {
+    float16_t data[];
+} k_cache_buf;
+
+layout(set = 0, binding = 5, std430) buffer VCacheBuffer {
+    float16_t data[];
+} v_cache_buf;
+
+layout(push_constant) uniform PushConstants {
+    uint q_dim;
+    uint kv_dim;
+    uint num_q_heads;
+    uint num_kv_heads;
+    uint head_dim;
+    uint max_seq_len;
+    uint position_offset;
+    uint has_bias;
+} pc;
+
+void main() {
+    const uint half_dim = pc.head_dim / 2u;
+    const uint q_pair_total = pc.num_q_heads * half_dim;
+    const uint k_pair_total = pc.num_kv_heads * half_dim;
+    const uint total = q_pair_total + k_pair_total + pc.kv_dim;
+    const uint gid = gl_GlobalInvocationID.x;
+    if (gid >= total) {
+        return;
+    }
+
+    if (gid < q_pair_total) {
+        const uint head = gid / half_dim;
+        const uint dim_half = gid % half_dim;
+        const uint src_base = head * pc.head_dim;
+        const uint src0 = src_base + dim_half;
+        const uint src1 = src_base + half_dim + dim_half;
+        float x0 = float(qkv_buf.qkv[src0]);
+        float x1 = float(qkv_buf.qkv[src1]);
+        if (pc.has_bias != 0u) {
+            x0 += float(bias_buf.bias[src0]);
+            x1 += float(bias_buf.bias[src1]);
+        }
+
+        vec2 cs = rope_cs_buf.data[pc.position_offset * half_dim + dim_half];
+        q_out_buf.q_out[src0] = float16_t(x0 * cs.x - x1 * cs.y);
+        q_out_buf.q_out[src1] = float16_t(x1 * cs.x + x0 * cs.y);
+        return;
+    }
+
+    if (gid < q_pair_total + k_pair_total) {
+        const uint local = gid - q_pair_total;
+        const uint head = local / half_dim;
+        const uint dim_half = local % half_dim;
+        const uint src_base = pc.q_dim + head * pc.head_dim;
+        const uint src0 = src_base + dim_half;
+        const uint src1 = src_base + half_dim + dim_half;
+        float x0 = float(qkv_buf.qkv[src0]);
+        float x1 = float(qkv_buf.qkv[src1]);
+        if (pc.has_bias != 0u) {
+            x0 += float(bias_buf.bias[src0]);
+            x1 += float(bias_buf.bias[src1]);
+        }
+
+        vec2 cs = rope_cs_buf.data[pc.position_offset * half_dim + dim_half];
+        const uint dst_base = (head * pc.max_seq_len + pc.position_offset) * pc.head_dim;
+        k_cache_buf.data[dst_base + dim_half] = float16_t(x0 * cs.x - x1 * cs.y);
+        k_cache_buf.data[dst_base + half_dim + dim_half] = float16_t(x1 * cs.x + x0 * cs.y);
+        return;
+    }
+
+    const uint local = gid - q_pair_total - k_pair_total;
+    const uint head = local / pc.head_dim;
+    const uint dim = local % pc.head_dim;
+    const uint src = pc.q_dim + pc.kv_dim + head * pc.head_dim + dim;
+    float value = float(qkv_buf.qkv[src]);
+    if (pc.has_bias != 0u) {
+        value += float(bias_buf.bias[src]);
+    }
+
+    const uint dst = (head * pc.max_seq_len + pc.position_offset) * pc.head_dim + dim;
+    v_cache_buf.data[dst] = float16_t(value);
+}

@@ -9,6 +9,7 @@
 #include "fp16_gemv_rows4_vec4_spv.h"
 #include "fp16_kv_cache_copy_spv.h"
 #include "fp16_mul_spv.h"
+#include "fp16_qkv_bias_rope_cache_decode_spv.h"
 #include "fp16_qkv_bias_split_spv.h"
 #include "fp16_rmsnorm_spv.h"
 #include "fp16_rope_spv.h"
@@ -71,6 +72,12 @@ VkFp16Ops VkFp16Ops::Create(VkKernelRuntime* runtime) {
             shaders::kFp16QkvBiasSplitSpvSize,
             5,
             4 * sizeof(uint32_t)));
+    ops.qkv_bias_rope_cache_decode_kernel_ = runtime->get_or_create_kernel(
+        make_kernel_create_info(
+            shaders::kFp16QkvBiasRopeCacheDecodeSpv,
+            shaders::kFp16QkvBiasRopeCacheDecodeSpvSize,
+            6,
+            8 * sizeof(uint32_t)));
     ops.rope_kernel_ = runtime->get_or_create_kernel(
         make_kernel_create_info(shaders::kFp16RopeSpv, shaders::kFp16RopeSpvSize, 3, 6 * sizeof(uint32_t)));
     ops.transpose_kernel_ = runtime->get_or_create_kernel(
@@ -314,6 +321,79 @@ void VkFp16Ops::rope(
         rope_kernel_,
         buffers,
         3,
+        total,
+        kLocalSizeX,
+        &push_constants,
+        sizeof(push_constants),
+        -1,
+        VK_NULL_HANDLE,
+        batch
+    );
+}
+
+void VkFp16Ops::qkv_bias_rope_cache_decode(
+    const VkDescriptorBufferInfo& qkv,
+    const VkDescriptorBufferInfo& bias,
+    const VkDescriptorBufferInfo& rope_cos_sin,
+    const VkDescriptorBufferInfo& q_out,
+    const VkDescriptorBufferInfo& k_cache,
+    const VkDescriptorBufferInfo& v_cache,
+    uint32_t q_dim,
+    uint32_t kv_dim,
+    uint32_t num_q_heads,
+    uint32_t num_kv_heads,
+    uint32_t head_dim,
+    uint32_t max_seq_len,
+    uint32_t position_offset,
+    bool has_bias,
+    VkDispatchBatch* batch
+) const {
+    if (runtime_ == nullptr) {
+        throw std::runtime_error("VkFp16Ops::qkv_bias_rope_cache_decode: runtime is null");
+    }
+    if (q_dim == 0 || kv_dim == 0 || num_q_heads == 0 || num_kv_heads == 0 || head_dim == 0) {
+        return;
+    }
+    if ((head_dim & 1u) != 0u) {
+        throw std::runtime_error("VkFp16Ops::qkv_bias_rope_cache_decode: head_dim must be even");
+    }
+    if (q_dim != num_q_heads * head_dim) {
+        throw std::runtime_error("VkFp16Ops::qkv_bias_rope_cache_decode: q_dim mismatch");
+    }
+    if (kv_dim != num_kv_heads * head_dim) {
+        throw std::runtime_error("VkFp16Ops::qkv_bias_rope_cache_decode: kv_dim mismatch");
+    }
+    if (position_offset >= max_seq_len) {
+        throw std::runtime_error("VkFp16Ops::qkv_bias_rope_cache_decode: position_offset out of range");
+    }
+
+    const VkDescriptorBufferInfo buffers[6] = {qkv, bias, rope_cos_sin, q_out, k_cache, v_cache};
+    struct {
+        uint32_t q_dim;
+        uint32_t kv_dim;
+        uint32_t num_q_heads;
+        uint32_t num_kv_heads;
+        uint32_t head_dim;
+        uint32_t max_seq_len;
+        uint32_t position_offset;
+        uint32_t has_bias;
+    } push_constants = {
+        q_dim,
+        kv_dim,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+        max_seq_len,
+        position_offset,
+        has_bias ? 1u : 0u,
+    };
+
+    const uint32_t half_dim = head_dim / 2u;
+    const uint32_t total = (num_q_heads + num_kv_heads) * half_dim + kv_dim;
+    runtime_->dispatch_1d(
+        qkv_bias_rope_cache_decode_kernel_,
+        buffers,
+        6,
         total,
         kLocalSizeX,
         &push_constants,

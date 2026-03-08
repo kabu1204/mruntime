@@ -262,73 +262,98 @@ void qwen2_attention_vk(
         );
     }
 
-    // Split fused QKV output into separate Q, K, V buffers and optionally add bias.
-    {
-        TRACE_SCOPE_CAT("qkv_split_vk", "elementwise");
-        const VkDescriptorBufferInfo qkv_desc =
-            descriptor_for_ptr(state.scratch_arena, scratch.qkv_out, num_tokens * qkv_dim * sizeof(uint16_t));
-        state.fp16_ops.qkv_bias_split(
+    const VkDescriptorBufferInfo qkv_desc =
+        descriptor_for_ptr(state.scratch_arena, scratch.qkv_out, num_tokens * qkv_dim * sizeof(uint16_t));
+    const VkDescriptorBufferInfo q_proj_desc =
+        descriptor_for_ptr(state.scratch_arena, scratch.q_proj, num_tokens * q_dim * sizeof(uint16_t));
+    const VkDeviceSize rope_bytes =
+        static_cast<VkDeviceSize>(max_seq_len) * (head_dim / 2) * 2 * sizeof(float);
+    const VkDeviceSize cache_bytes =
+        static_cast<VkDeviceSize>(num_kv_heads) * max_seq_len * head_dim * sizeof(uint16_t);
+    const VkDescriptorBufferInfo qkv_bias_desc =
+        layer.qkv_bias != nullptr
+            ? descriptor_for_ptr(state.weights_arena, layer.qkv_bias, qkv_dim * sizeof(uint16_t))
+            : qkv_desc;
+    const bool has_qkv_bias = (layer.qkv_bias != nullptr);
+
+    if (is_single_token_decode) {
+        TRACE_SCOPE_CAT("qkv_decode_postprocess_vk", "attention");
+        state.fp16_ops.qkv_bias_rope_cache_decode(
             qkv_desc,
-            layer.qkv_bias != nullptr
-                ? descriptor_for_ptr(state.weights_arena, layer.qkv_bias, qkv_dim * sizeof(uint16_t))
-                : qkv_desc,
-            descriptor_for_ptr(state.scratch_arena, scratch.q_proj, num_tokens * q_dim * sizeof(uint16_t)),
-            descriptor_for_ptr(state.scratch_arena, scratch.k_proj, num_tokens * kv_dim * sizeof(uint16_t)),
-            descriptor_for_ptr(state.scratch_arena, scratch.v_proj, num_tokens * kv_dim * sizeof(uint16_t)),
-            static_cast<uint32_t>(num_tokens),
+            qkv_bias_desc,
+            descriptor_for_ptr(state.kv_arena, rope_cos_sin, rope_bytes),
+            q_proj_desc,
+            descriptor_for_ptr(state.kv_arena, k_cache, cache_bytes),
+            descriptor_for_ptr(state.kv_arena, v_cache, cache_bytes),
             static_cast<uint32_t>(q_dim),
             static_cast<uint32_t>(kv_dim),
-            layer.qkv_bias != nullptr,
-            batch
-        );
-    }
-
-    // RoPE in-place on Q and K.
-    {
-        TRACE_SCOPE_CAT("rope_vk", "attention");
-        const VkDeviceSize rope_bytes =
-            static_cast<VkDeviceSize>(max_seq_len) * (head_dim / 2) * 2 * sizeof(float);
-        state.fp16_ops.rope(
-            descriptor_for_ptr(state.scratch_arena, scratch.q_proj, num_tokens * q_dim * sizeof(uint16_t)),
-            descriptor_for_ptr(state.scratch_arena, scratch.k_proj, num_tokens * kv_dim * sizeof(uint16_t)),
-            descriptor_for_ptr(state.kv_arena, rope_cos_sin, rope_bytes),
-            1,  // batch
-            static_cast<uint32_t>(num_tokens),
             static_cast<uint32_t>(num_heads),
-            static_cast<uint32_t>(num_kv_heads),
-            static_cast<uint32_t>(head_dim),
-            static_cast<uint32_t>(position_offset),
-            batch
-        );
-    }
-
-    // Copy K/V into the KV cache.
-    {
-        TRACE_SCOPE_CAT("kv_cache_copy_vk", "attention");
-        const VkDeviceSize kv_in_bytes = num_tokens * kv_dim * sizeof(uint16_t);
-        const VkDeviceSize cache_bytes =
-            static_cast<VkDeviceSize>(num_kv_heads) * max_seq_len * head_dim * sizeof(uint16_t);
-
-        VkDescriptorBufferInfo k_cache_desc = descriptor_for_ptr(state.kv_arena, k_cache, cache_bytes);
-        k_cache_desc.range = 0;  // VK_WHOLE_SIZE (also covers V cache when suballocated after K).
-
-        state.fp16_ops.kv_cache_copy(
-            descriptor_for_ptr(state.scratch_arena, scratch.k_proj, kv_in_bytes),
-            descriptor_for_ptr(state.scratch_arena, scratch.v_proj, kv_in_bytes),
-            k_cache_desc,
-            descriptor_for_ptr(state.kv_arena, v_cache, cache_bytes),
-            1,  // batch
-            static_cast<uint32_t>(num_tokens),
             static_cast<uint32_t>(num_kv_heads),
             static_cast<uint32_t>(head_dim),
             static_cast<uint32_t>(max_seq_len),
             static_cast<uint32_t>(position_offset),
+            has_qkv_bias,
             batch
         );
+    } else {
+        // Split fused QKV output into separate Q, K, V buffers and optionally add bias.
+        {
+            TRACE_SCOPE_CAT("qkv_split_vk", "elementwise");
+            state.fp16_ops.qkv_bias_split(
+                qkv_desc,
+                qkv_bias_desc,
+                q_proj_desc,
+                descriptor_for_ptr(state.scratch_arena, scratch.k_proj, num_tokens * kv_dim * sizeof(uint16_t)),
+                descriptor_for_ptr(state.scratch_arena, scratch.v_proj, num_tokens * kv_dim * sizeof(uint16_t)),
+                static_cast<uint32_t>(num_tokens),
+                static_cast<uint32_t>(q_dim),
+                static_cast<uint32_t>(kv_dim),
+                has_qkv_bias,
+                batch
+            );
+        }
+
+        // RoPE in-place on Q and K.
+        {
+            TRACE_SCOPE_CAT("rope_vk", "attention");
+            state.fp16_ops.rope(
+                q_proj_desc,
+                descriptor_for_ptr(state.scratch_arena, scratch.k_proj, num_tokens * kv_dim * sizeof(uint16_t)),
+                descriptor_for_ptr(state.kv_arena, rope_cos_sin, rope_bytes),
+                1,  // batch
+                static_cast<uint32_t>(num_tokens),
+                static_cast<uint32_t>(num_heads),
+                static_cast<uint32_t>(num_kv_heads),
+                static_cast<uint32_t>(head_dim),
+                static_cast<uint32_t>(position_offset),
+                batch
+            );
+        }
+
+        // Copy K/V into the KV cache.
+        {
+            TRACE_SCOPE_CAT("kv_cache_copy_vk", "attention");
+            const VkDeviceSize kv_in_bytes = num_tokens * kv_dim * sizeof(uint16_t);
+
+            VkDescriptorBufferInfo k_cache_desc = descriptor_for_ptr(state.kv_arena, k_cache, cache_bytes);
+            k_cache_desc.range = 0;  // VK_WHOLE_SIZE (also covers V cache when suballocated after K).
+
+            state.fp16_ops.kv_cache_copy(
+                descriptor_for_ptr(state.scratch_arena, scratch.k_proj, kv_in_bytes),
+                descriptor_for_ptr(state.scratch_arena, scratch.v_proj, kv_in_bytes),
+                k_cache_desc,
+                descriptor_for_ptr(state.kv_arena, v_cache, cache_bytes),
+                1,  // batch
+                static_cast<uint32_t>(num_tokens),
+                static_cast<uint32_t>(num_kv_heads),
+                static_cast<uint32_t>(head_dim),
+                static_cast<uint32_t>(max_seq_len),
+                static_cast<uint32_t>(position_offset),
+                batch
+            );
+        }
     }
 
-    const VkDescriptorBufferInfo q_proj_desc =
-        descriptor_for_ptr(state.scratch_arena, scratch.q_proj, num_tokens * q_dim * sizeof(uint16_t));
     const VkDescriptorBufferInfo q_transposed_desc =
         descriptor_for_ptr(state.scratch_arena, scratch.q_transposed, num_tokens * q_dim * sizeof(uint16_t));
     const VkDescriptorBufferInfo attn_out_desc =
