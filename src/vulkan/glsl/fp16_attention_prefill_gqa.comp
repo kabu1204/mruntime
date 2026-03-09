@@ -1,0 +1,207 @@
+#version 460
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// Causal FP16 GQA prefill attention.
+// Q: [1, num_q_heads, q_len, head_dim] BHSD FP16
+// K: [1, num_kv_heads, kv_stride, head_dim] BHSD FP16
+// V: [1, num_kv_heads, kv_stride, head_dim] BHSD FP16
+// O: [1, num_q_heads, q_len, head_dim] BHSD FP16
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(scalar, set = 0, binding = 0, std430) readonly buffer QBuffer {
+    float16_t q[];
+} q_buf;
+
+layout(scalar, set = 0, binding = 1, std430) readonly buffer KBuffer {
+    float16_t k[];
+} k_buf;
+
+layout(scalar, set = 0, binding = 2, std430) readonly buffer VBuffer {
+    float16_t v[];
+} v_buf;
+
+layout(scalar, set = 0, binding = 3, std430) writeonly buffer OBuffer {
+    float16_t o[];
+} o_buf;
+
+layout(push_constant) uniform PushConstants {
+    uint num_q_heads;
+    uint num_kv_heads;
+    uint q_len;
+    uint kv_len;
+    uint kv_stride;
+    uint head_dim;
+    float scale;
+} pc;
+
+const uint SCORE_TILE = 32u;
+const uint MAX_HEAD_DIM = 512u;
+const float NEG_INF = -3.402823466e38;
+
+shared float shared_q[MAX_HEAD_DIM];
+shared float score_tile[SCORE_TILE];
+shared float subgroup_reduce[32];
+shared float shared_scalar;
+
+uint q_offset(uint q_head, uint q_seq, uint dim) {
+    return ((q_head * pc.q_len + q_seq) * pc.head_dim) + dim;
+}
+
+uint kv_offset(uint kv_head, uint kv_seq, uint dim) {
+    return (kv_head * pc.kv_stride + kv_seq) * pc.head_dim + dim;
+}
+
+float compute_score(uint kv_head, uint kv_seq) {
+    const uint k_base = kv_offset(kv_head, kv_seq, 0u);
+    float score = 0.0;
+    for (uint dim = 0u; dim < pc.head_dim; ++dim) {
+        score += shared_q[dim] * float(k_buf.k[k_base + dim]);
+    }
+    return score * pc.scale;
+}
+
+float reduce_workgroup_max(float local_value, uint tid) {
+    float wave_value = subgroupMax(local_value);
+    if (gl_NumSubgroups == 1u) {
+        return (gl_SubgroupInvocationID == 0u) ? wave_value : 0.0;
+    }
+
+    if (gl_SubgroupInvocationID == 0u) {
+        subgroup_reduce[gl_SubgroupID] = wave_value;
+    }
+    barrier();
+
+    if (tid != 0u) {
+        return 0.0;
+    }
+
+    float total = subgroup_reduce[0];
+    for (uint subgroup = 1u; subgroup < gl_NumSubgroups; ++subgroup) {
+        total = max(total, subgroup_reduce[subgroup]);
+    }
+    return total;
+}
+
+float reduce_workgroup_sum(float local_value, uint tid) {
+    float wave_value = subgroupAdd(local_value);
+    if (gl_NumSubgroups == 1u) {
+        return (gl_SubgroupInvocationID == 0u) ? wave_value : 0.0;
+    }
+
+    if (gl_SubgroupInvocationID == 0u) {
+        subgroup_reduce[gl_SubgroupID] = wave_value;
+    }
+    barrier();
+
+    if (tid != 0u) {
+        return 0.0;
+    }
+
+    float total = 0.0;
+    for (uint subgroup = 0u; subgroup < gl_NumSubgroups; ++subgroup) {
+        total += subgroup_reduce[subgroup];
+    }
+    return total;
+}
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint q_head = gl_WorkGroupID.x;
+    const uint q_seq = gl_WorkGroupID.y;
+    if (q_head >= pc.num_q_heads || q_seq >= pc.q_len) {
+        return;
+    }
+
+    for (uint dim = tid; dim < pc.head_dim; dim += gl_WorkGroupSize.x) {
+        shared_q[dim] = float(q_buf.q[q_offset(q_head, q_seq, dim)]);
+    }
+    barrier();
+
+    const uint heads_per_kv = pc.num_q_heads / pc.num_kv_heads;
+    const uint kv_head = q_head / heads_per_kv;
+    const uint base_position = pc.kv_len - pc.q_len;
+    const uint attended_kv_len = base_position + q_seq + 1u;
+
+    float local_max = NEG_INF;
+    for (uint k_base = 0u; k_base < attended_kv_len; k_base += SCORE_TILE) {
+        const uint tile_len = min(SCORE_TILE, attended_kv_len - k_base);
+        if (tid < tile_len) {
+            local_max = max(local_max, compute_score(kv_head, k_base + tid));
+        }
+    }
+
+    const float workgroup_max = reduce_workgroup_max(local_max, tid);
+    if (tid == 0u) {
+        shared_scalar = workgroup_max;
+    }
+    barrier();
+
+    const float max_score = shared_scalar;
+    float local_lsum = 0.0;
+
+    float acc0 = 0.0;
+    float acc1 = 0.0;
+    float acc2 = 0.0;
+    float acc3 = 0.0;
+
+    const uint dim0 = tid;
+    const uint dim1 = tid + gl_WorkGroupSize.x;
+    const uint dim2 = tid + 2u * gl_WorkGroupSize.x;
+    const uint dim3 = tid + 3u * gl_WorkGroupSize.x;
+
+    for (uint k_base = 0u; k_base < attended_kv_len; k_base += SCORE_TILE) {
+        const uint tile_len = min(SCORE_TILE, attended_kv_len - k_base);
+        if (tid < tile_len) {
+            const float weight = exp(compute_score(kv_head, k_base + tid) - max_score);
+            score_tile[tid] = weight;
+            local_lsum += weight;
+        }
+        barrier();
+
+        if (dim0 < pc.head_dim || dim1 < pc.head_dim || dim2 < pc.head_dim || dim3 < pc.head_dim) {
+            for (uint tile_idx = 0u; tile_idx < tile_len; ++tile_idx) {
+                const float weight = score_tile[tile_idx];
+                const uint v_base = kv_offset(kv_head, k_base + tile_idx, 0u);
+                if (dim0 < pc.head_dim) {
+                    acc0 += weight * float(v_buf.v[v_base + dim0]);
+                }
+                if (dim1 < pc.head_dim) {
+                    acc1 += weight * float(v_buf.v[v_base + dim1]);
+                }
+                if (dim2 < pc.head_dim) {
+                    acc2 += weight * float(v_buf.v[v_base + dim2]);
+                }
+                if (dim3 < pc.head_dim) {
+                    acc3 += weight * float(v_buf.v[v_base + dim3]);
+                }
+            }
+        }
+        barrier();
+    }
+
+    const float workgroup_lsum = reduce_workgroup_sum(local_lsum, tid);
+    if (tid == 0u) {
+        shared_scalar = workgroup_lsum;
+    }
+    barrier();
+
+    const float inv_lsum = (shared_scalar > 0.0) ? (1.0 / shared_scalar) : 0.0;
+    if (dim0 < pc.head_dim) {
+        o_buf.o[q_offset(q_head, q_seq, dim0)] = float16_t(acc0 * inv_lsum);
+    }
+    if (dim1 < pc.head_dim) {
+        o_buf.o[q_offset(q_head, q_seq, dim1)] = float16_t(acc1 * inv_lsum);
+    }
+    if (dim2 < pc.head_dim) {
+        o_buf.o[q_offset(q_head, q_seq, dim2)] = float16_t(acc2 * inv_lsum);
+    }
+    if (dim3 < pc.head_dim) {
+        o_buf.o[q_offset(q_head, q_seq, dim3)] = float16_t(acc3 * inv_lsum);
+    }
+}

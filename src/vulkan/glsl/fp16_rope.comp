@@ -1,0 +1,69 @@
+#version 460
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) buffer QBuffer {
+    float16_t data[];
+} q_buf;
+
+layout(set = 0, binding = 1, std430) buffer KBuffer {
+    float16_t data[];
+} k_buf;
+
+// cos/sin table is FP32: layout [max_seq_len, head_dim/2] as vec2(cos, sin)
+// Backing memory is still interleaved [max_seq_len, half_dim, 2] (cos, sin).
+layout(set = 0, binding = 2, std430) readonly buffer RopeCosSinBuffer {
+    vec2 data[];
+} rope_cs_buf;
+
+layout(push_constant) uniform PushConstants {
+    uint batch;
+    uint seq_len;
+    uint num_q_heads;
+    uint num_kv_heads;
+    uint head_dim;
+    uint position_offset;
+} pc;
+
+void main() {
+    const uint half_dim = pc.head_dim / 2u;
+    const uint total_heads = pc.num_q_heads + pc.num_kv_heads;
+    const uint total = pc.batch * pc.seq_len * total_heads * half_dim;
+
+    const uint gid = gl_GlobalInvocationID.x;
+    if (gid >= total) {
+        return;
+    }
+
+    // Decompose gid -> (b, s, h, i) where h indexes across both Q and K heads.
+    const uint i = gid % half_dim;
+    const uint h = (gid / half_dim) % total_heads;
+    const uint s = (gid / (half_dim * total_heads)) % pc.seq_len;
+    const uint b = gid / (half_dim * total_heads * pc.seq_len);
+
+    // Look up cos/sin for this position and pair index.
+    const uint pos = pc.position_offset + s;
+    vec2 cs = rope_cs_buf.data[pos * half_dim + i];
+    float cos_val = cs.x;
+    float sin_val = cs.y;
+
+    if (h < pc.num_q_heads) {
+        // Q head
+        uint base = ((b * pc.seq_len + s) * pc.num_q_heads + h) * pc.head_dim;
+        float x0 = float(q_buf.data[base + i]);
+        float x1 = float(q_buf.data[base + half_dim + i]);
+        q_buf.data[base + i] = float16_t(x0 * cos_val - x1 * sin_val);
+        q_buf.data[base + half_dim + i] = float16_t(x1 * cos_val + x0 * sin_val);
+    } else {
+        // K head
+        uint kh = h - pc.num_q_heads;
+        uint base = ((b * pc.seq_len + s) * pc.num_kv_heads + kh) * pc.head_dim;
+        float x0 = float(k_buf.data[base + i]);
+        float x1 = float(k_buf.data[base + half_dim + i]);
+        k_buf.data[base + i] = float16_t(x0 * cos_val - x1 * sin_val);
+        k_buf.data[base + half_dim + i] = float16_t(x1 * cos_val + x0 * sin_val);
+    }
+}

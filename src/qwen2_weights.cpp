@@ -20,7 +20,8 @@ namespace mruntime {
 Qwen2MemorySizes qwen2_memory_sizes(
     const QwenConfig& cfg,
     size_t max_seq_len,
-    size_t max_batch_tokens
+    size_t max_batch_tokens,
+    bool has_separate_lm_head
 ) {
     Qwen2MemorySizes sizes = {};
     const size_t elem_size = sizeof(uint16_t);  // FP16
@@ -28,7 +29,7 @@ Qwen2MemorySizes qwen2_memory_sizes(
     // Weight sizes
     size_t embed_size = cfg.vocab_size * cfg.hidden_size * elem_size;
     size_t final_norm_size = cfg.hidden_size * elem_size;
-    size_t lm_head_size = cfg.vocab_size * cfg.hidden_size * elem_size;
+    size_t lm_head_size = has_separate_lm_head ? cfg.vocab_size * cfg.hidden_size * elem_size : 0;
 
     size_t head_dim = cfg.head_dim();
     size_t q_proj_size = cfg.num_attention_heads * head_dim * cfg.hidden_size * elem_size;

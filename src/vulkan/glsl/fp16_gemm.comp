@@ -1,0 +1,162 @@
+#version 460
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_control_flow_attributes : require
+
+// Dense FP16 GEMM: C = A @ B^T
+// A: [M, K] row-major FP16
+// B: [N, K] row-major FP16  (transposed access: B[n, :])
+// C: [M, N] row-major FP16
+//
+// Strategy:
+// - Workgroup: 16x16 threads (256 threads).
+// - Each workgroup computes a 64x64 output tile.
+// - Each thread computes a 4x4 sub-tile with FP32 accumulation.
+// - Shared memory stores packed pairs (f16vec2) with padding to reduce bank conflicts.
+// - K is tiled by 32 for better reuse and lower barrier/loop overhead.
+
+#define TILE_M 64
+#define TILE_N 64
+#define TILE_K 32
+#define TILE_K2 (TILE_K / 2)        // packed pairs
+#define THREAD_TILE 4
+#define SHMEM_K2 (TILE_K2 + 1)      // padding to mitigate bank conflicts
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer ABuffer {
+    float16_t a[];
+} a_buf;
+
+layout(set = 0, binding = 1, std430) readonly buffer BBuffer {
+    float16_t b[];
+} b_buf;
+
+layout(set = 0, binding = 2, std430) writeonly buffer CBuffer {
+    float16_t c[];
+} c_buf;
+
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint N;
+    uint K;
+} pc;
+
+shared f16vec2 tile_a[TILE_M][SHMEM_K2];
+shared f16vec2 tile_b[TILE_N][SHMEM_K2];
+
+void main() {
+    const uint tx = gl_LocalInvocationID.x;  // 0..15
+    const uint ty = gl_LocalInvocationID.y;  // 0..15
+    const uint tid = ty * 16u + tx;          // 0..255
+
+    const uint sub_m = ty * THREAD_TILE;     // 0..60
+    const uint sub_n = tx * THREAD_TILE;     // 0..60
+
+    const uint tile_row = gl_WorkGroupID.y * TILE_M;
+    const uint tile_col = gl_WorkGroupID.x * TILE_N;
+
+    float acc[THREAD_TILE][THREAD_TILE];
+    for (uint i = 0; i < THREAD_TILE; ++i) {
+        for (uint j = 0; j < THREAD_TILE; ++j) {
+            acc[i][j] = 0.0;
+        }
+    }
+
+    const uint num_k_tiles = (pc.K + TILE_K - 1u) / TILE_K;
+
+    for (uint kt = 0; kt < num_k_tiles; ++kt) {
+        const uint k_base = kt * TILE_K;
+
+        // Load A tile as packed pairs: 64 x 16 f16vec2 entries (1024 entries).
+        [[unroll]]
+        for (uint i = 0; i < 4u; ++i) {
+            const uint idx = i * 256u + tid;  // 0..1023
+            const uint row = idx >> 4;        // /16 -> 0..63
+            const uint k2  = idx & 15u;       // %16 -> 0..15
+
+            const uint gm = tile_row + row;
+            const uint gk0 = k_base + 2u * k2;
+            const uint gk1 = gk0 + 1u;
+
+            const float16_t v0 = (gm < pc.M && gk0 < pc.K)
+                ? a_buf.a[gm * pc.K + gk0]
+                : float16_t(0.0);
+            const float16_t v1 = (gm < pc.M && gk1 < pc.K)
+                ? a_buf.a[gm * pc.K + gk1]
+                : float16_t(0.0);
+
+            tile_a[row][k2] = f16vec2(v0, v1);
+        }
+
+        // Load B tile as packed pairs: 64 x 16 f16vec2 entries (1024 entries).
+        [[unroll]]
+        for (uint i = 0; i < 4u; ++i) {
+            const uint idx = i * 256u + tid;  // 0..1023
+            const uint row = idx >> 4;        // /16 -> 0..63
+            const uint k2  = idx & 15u;       // %16 -> 0..15
+
+            const uint gn = tile_col + row;
+            const uint gk0 = k_base + 2u * k2;
+            const uint gk1 = gk0 + 1u;
+
+            const float16_t v0 = (gn < pc.N && gk0 < pc.K)
+                ? b_buf.b[gn * pc.K + gk0]
+                : float16_t(0.0);
+            const float16_t v1 = (gn < pc.N && gk1 < pc.K)
+                ? b_buf.b[gn * pc.K + gk1]
+                : float16_t(0.0);
+
+            tile_b[row][k2] = f16vec2(v0, v1);
+        }
+
+        barrier();
+
+        [[unroll]]
+        for (uint k2 = 0; k2 < TILE_K2; ++k2) {
+            const f16vec2 a_pair[4] = {
+                tile_a[sub_m + 0u][k2],
+                tile_a[sub_m + 1u][k2],
+                tile_a[sub_m + 2u][k2],
+                tile_a[sub_m + 3u][k2],
+            };
+            const f16vec2 b_pair[4] = {
+                tile_b[sub_n + 0u][k2],
+                tile_b[sub_n + 1u][k2],
+                tile_b[sub_n + 2u][k2],
+                tile_b[sub_n + 3u][k2],
+            };
+
+            const float bx0[4] = {
+                float(b_pair[0].x), float(b_pair[1].x), float(b_pair[2].x), float(b_pair[3].x),
+            };
+            const float bx1[4] = {
+                float(b_pair[0].y), float(b_pair[1].y), float(b_pair[2].y), float(b_pair[3].y),
+            };
+
+            [[unroll]]
+            for (uint i = 0; i < THREAD_TILE; ++i) {
+                const float ax0 = float(a_pair[i].x);
+                const float ax1 = float(a_pair[i].y);
+                [[unroll]]
+                for (uint j = 0; j < THREAD_TILE; ++j) {
+                    acc[i][j] = fma(ax0, bx0[j], acc[i][j]);
+                    acc[i][j] = fma(ax1, bx1[j], acc[i][j]);
+                }
+            }
+        }
+
+        barrier();
+    }
+
+    for (uint i = 0; i < THREAD_TILE; ++i) {
+        for (uint j = 0; j < THREAD_TILE; ++j) {
+            const uint gm = tile_row + sub_m + i;
+            const uint gn = tile_col + sub_n + j;
+            if (gm < pc.M && gn < pc.N) {
+                c_buf.c[gm * pc.N + gn] = float16_t(acc[i][j]);
+            }
+        }
+    }
+}
