@@ -1,34 +1,9 @@
 enable_testing()
 
-add_executable(tensor_test tensor_test.cpp)
-target_link_libraries(tensor_test PRIVATE mruntime)
-target_include_directories(tensor_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
-add_test(NAME tensor_test COMMAND tensor_test)
-
-add_executable(backend_test backend_test.cpp)
-target_link_libraries(backend_test PRIVATE mruntime)
-target_include_directories(backend_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
-add_test(NAME backend_test COMMAND backend_test)
-
-add_executable(profiling_backend_test profiling_backend_test.cpp)
-target_link_libraries(profiling_backend_test PRIVATE mruntime)
-target_include_directories(profiling_backend_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
-add_test(NAME profiling_backend_test COMMAND profiling_backend_test)
-
 add_executable(loader_test loader_test.cpp)
 target_link_libraries(loader_test PRIVATE mruntime)
 target_include_directories(loader_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
 add_test(NAME loader_test COMMAND loader_test)
-
-add_executable(model_test model_test.cpp)
-target_link_libraries(model_test PRIVATE mruntime)
-target_include_directories(model_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
-add_test(NAME model_test COMMAND model_test)
-
-add_executable(engine_test engine_test.cpp)
-target_link_libraries(engine_test PRIVATE mruntime)
-target_include_directories(engine_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
-add_test(NAME engine_test COMMAND engine_test)
 
 add_executable(pthreadpool_raii_test pthreadpool_raii_test.cpp)
 target_link_libraries(pthreadpool_raii_test PRIVATE mruntime)
@@ -54,7 +29,90 @@ target_include_directories(qwen2_tokenizer_test PRIVATE
 )
 add_test(NAME qwen2_tokenizer_test COMMAND qwen2_tokenizer_test)
 
+# Bare-metal API tests
+add_executable(qwen2_ops_test qwen2_ops_test.cpp)
+target_link_libraries(qwen2_ops_test PRIVATE mruntime GTest::gtest_main)
+target_include_directories(qwen2_ops_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
+add_test(NAME qwen2_ops_test COMMAND qwen2_ops_test)
+
+if(MRUNTIME_ENABLE_VULKAN)
+    add_executable(vulkan_smoke_test vulkan_smoke_test.cpp)
+    target_link_libraries(vulkan_smoke_test PRIVATE mruntime Vulkan::Vulkan)
+    target_include_directories(vulkan_smoke_test PRIVATE
+        ${MRUNTIME_VULKAN_GENERATED_DIR}
+        ${CMAKE_SOURCE_DIR}/src/vulkan
+    )
+    add_dependencies(vulkan_smoke_test mruntime_vulkan_shaders)
+    add_test(NAME vulkan_smoke_test COMMAND vulkan_smoke_test)
+    set_tests_properties(vulkan_smoke_test PROPERTIES SKIP_RETURN_CODE 77)
+
+    add_executable(vulkan_trace_timing_test vulkan_trace_timing_test.cpp)
+    target_link_libraries(vulkan_trace_timing_test PRIVATE mruntime Vulkan::Vulkan)
+    target_include_directories(vulkan_trace_timing_test PRIVATE
+        ${MRUNTIME_VULKAN_GENERATED_DIR}
+        ${CMAKE_SOURCE_DIR}/include
+        ${CMAKE_SOURCE_DIR}/src/vulkan
+    )
+    add_dependencies(vulkan_trace_timing_test mruntime_vulkan_shaders)
+    add_test(NAME vulkan_trace_timing_test COMMAND vulkan_trace_timing_test)
+    set_tests_properties(vulkan_trace_timing_test PROPERTIES SKIP_RETURN_CODE 77)
+
+    add_executable(vulkan_fp16_ops_test vulkan_fp16_ops_test.cpp)
+    target_link_libraries(vulkan_fp16_ops_test PRIVATE mruntime Vulkan::Vulkan)
+    target_include_directories(vulkan_fp16_ops_test PRIVATE
+        ${MRUNTIME_VULKAN_GENERATED_DIR}
+        ${CMAKE_SOURCE_DIR}/include
+        ${CMAKE_SOURCE_DIR}/src/vulkan
+    )
+    add_dependencies(vulkan_fp16_ops_test mruntime_vulkan_shaders)
+    add_test(NAME vulkan_fp16_ops_test COMMAND vulkan_fp16_ops_test)
+    set_tests_properties(vulkan_fp16_ops_test PROPERTIES SKIP_RETURN_CODE 77)
+
+    add_executable(vulkan_fp16_kernels_test vulkan_fp16_kernels_test.cpp)
+    target_link_libraries(vulkan_fp16_kernels_test PRIVATE mruntime Vulkan::Vulkan)
+    target_include_directories(vulkan_fp16_kernels_test PRIVATE
+        ${MRUNTIME_VULKAN_GENERATED_DIR}
+        ${CMAKE_SOURCE_DIR}/include
+        ${CMAKE_SOURCE_DIR}/src/vulkan
+    )
+    add_dependencies(vulkan_fp16_kernels_test mruntime_vulkan_shaders)
+    add_test(NAME vulkan_fp16_kernels_test COMMAND vulkan_fp16_kernels_test)
+    set_tests_properties(vulkan_fp16_kernels_test PROPERTIES SKIP_RETURN_CODE 77)
+
+    add_executable(vulkan_gemm_test vulkan_gemm_test.cpp)
+    target_link_libraries(vulkan_gemm_test PRIVATE mruntime Vulkan::Vulkan)
+    target_include_directories(vulkan_gemm_test PRIVATE
+        ${MRUNTIME_VULKAN_GENERATED_DIR}
+        ${CMAKE_SOURCE_DIR}/include
+        ${CMAKE_SOURCE_DIR}/src/vulkan
+    )
+    add_dependencies(vulkan_gemm_test mruntime_vulkan_shaders)
+    add_test(NAME vulkan_gemm_test COMMAND vulkan_gemm_test)
+    set_tests_properties(vulkan_gemm_test PROPERTIES SKIP_RETURN_CODE 77)
+
+    add_executable(vulkan_gemv_test vulkan_gemv_test.cpp)
+    target_link_libraries(vulkan_gemv_test PRIVATE mruntime Vulkan::Vulkan)
+    target_include_directories(vulkan_gemv_test PRIVATE
+        ${MRUNTIME_VULKAN_GENERATED_DIR}
+        ${CMAKE_SOURCE_DIR}/include
+        ${CMAKE_SOURCE_DIR}/src/vulkan
+    )
+    add_dependencies(vulkan_gemv_test mruntime_vulkan_shaders)
+    add_test(NAME vulkan_gemv_test COMMAND vulkan_gemv_test)
+    set_tests_properties(vulkan_gemv_test PROPERTIES SKIP_RETURN_CODE 77)
+
+    add_executable(vulkan_qwen2_smoke_test vulkan_qwen2_smoke_test.cpp)
+    target_link_libraries(vulkan_qwen2_smoke_test PRIVATE mruntime Vulkan::Vulkan)
+    target_include_directories(vulkan_qwen2_smoke_test PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+        ${CMAKE_SOURCE_DIR}/src/vulkan
+    )
+    add_test(NAME vulkan_qwen2_smoke_test COMMAND vulkan_qwen2_smoke_test)
+    set_tests_properties(vulkan_qwen2_smoke_test PROPERTIES SKIP_RETURN_CODE 77)
+
+endif()
+
 # Some tests assume working-directory == ${CMAKE_BINARY_DIR} (out-of-source build root).
-set_tests_properties(loader_test model_test engine_test qwen2_tokenizer_test PROPERTIES
+set_tests_properties(loader_test qwen2_tokenizer_test PROPERTIES
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
 )

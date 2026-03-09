@@ -1,0 +1,58 @@
+#version 460
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer KInBuffer {
+    float16_t data[];
+} k_in_buf;
+
+layout(set = 0, binding = 1, std430) readonly buffer VInBuffer {
+    float16_t data[];
+} v_in_buf;
+
+// Cache layout: [batch, num_kv_heads, max_seq_len, head_dim]
+layout(set = 0, binding = 2, std430) buffer KCacheBuffer {
+    float16_t data[];
+} k_cache_buf;
+
+layout(set = 0, binding = 3, std430) buffer VCacheBuffer {
+    float16_t data[];
+} v_cache_buf;
+
+layout(push_constant) uniform PushConstants {
+    uint batch;
+    uint seq_len;
+    uint num_kv_heads;
+    uint head_dim;
+    uint max_seq_len;
+    uint position_offset;
+} pc;
+
+void main() {
+    // Each invocation handles one (b, s, h) triple, copying head_dim elements.
+    const uint total = pc.batch * pc.seq_len * pc.num_kv_heads;
+    const uint gid = gl_GlobalInvocationID.x;
+    if (gid >= total) {
+        return;
+    }
+
+    const uint h = gid % pc.num_kv_heads;
+    const uint s = (gid / pc.num_kv_heads) % pc.seq_len;
+    const uint b = gid / (pc.num_kv_heads * pc.seq_len);
+
+    // Input layout: [batch, seq_len, num_kv_heads, head_dim]
+    const uint src_base = ((b * pc.seq_len + s) * pc.num_kv_heads + h) * pc.head_dim;
+
+    // Cache layout: [batch, num_kv_heads, max_seq_len, head_dim]
+    // Position in cache = position_offset + s
+    const uint cache_pos = pc.position_offset + s;
+    const uint dst_base = ((b * pc.num_kv_heads + h) * pc.max_seq_len + cache_pos) * pc.head_dim;
+
+    for (uint d = 0u; d < pc.head_dim; ++d) {
+        k_cache_buf.data[dst_base + d] = k_in_buf.data[src_base + d];
+        v_cache_buf.data[dst_base + d] = v_in_buf.data[src_base + d];
+    }
+}

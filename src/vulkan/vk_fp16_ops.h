@@ -1,0 +1,201 @@
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+
+#include "vk_kernel_runtime.h"
+
+namespace mruntime::vulkan {
+
+class VkFp16Ops {
+  public:
+    VkFp16Ops() = default;
+    static VkFp16Ops Create(VkKernelRuntime* runtime);
+
+    VkFp16Ops(const VkFp16Ops&) = delete;
+    VkFp16Ops& operator=(const VkFp16Ops&) = delete;
+
+    VkFp16Ops(VkFp16Ops&&) noexcept = default;
+    VkFp16Ops& operator=(VkFp16Ops&&) noexcept = default;
+
+    void add(
+        const VkDescriptorBufferInfo& a,
+        const VkDescriptorBufferInfo& b,
+        const VkDescriptorBufferInfo& out,
+        uint32_t n,
+        VkDispatchBatch* batch = nullptr
+    ) const;
+
+    void mul(
+        const VkDescriptorBufferInfo& a,
+        const VkDescriptorBufferInfo& b,
+        const VkDescriptorBufferInfo& out,
+        uint32_t n,
+        VkDispatchBatch* batch = nullptr
+    ) const;
+
+    void silu_mul_interleaved(
+        const VkDescriptorBufferInfo& gate_up,
+        const VkDescriptorBufferInfo& out,
+        uint32_t intermediate_size,
+        uint32_t num_tokens,
+        VkDispatchBatch* batch = nullptr
+    ) const;
+
+    void rmsnorm(
+        const VkDescriptorBufferInfo& input,
+        const VkDescriptorBufferInfo& weight,
+        const VkDescriptorBufferInfo& output,
+        uint32_t hidden_size,
+        uint32_t num_tokens,
+        float eps,
+        VkDispatchBatch* batch = nullptr
+    ) const;
+
+    void qkv_bias_split(
+        const VkDescriptorBufferInfo& qkv,
+        const VkDescriptorBufferInfo& bias,
+        const VkDescriptorBufferInfo& q_out,
+        const VkDescriptorBufferInfo& k_out,
+        const VkDescriptorBufferInfo& v_out,
+        uint32_t num_tokens,
+        uint32_t q_dim,
+        uint32_t kv_dim,
+        bool has_bias,
+        VkDispatchBatch* batch = nullptr
+    ) const;
+
+    void rope(
+        const VkDescriptorBufferInfo& q,
+        const VkDescriptorBufferInfo& k,
+        const VkDescriptorBufferInfo& rope_cos_sin,
+        uint32_t batch_size,
+        uint32_t seq_len,
+        uint32_t num_q_heads,
+        uint32_t num_kv_heads,
+        uint32_t head_dim,
+        uint32_t position_offset,
+        VkDispatchBatch* batch = nullptr
+    ) const;
+
+    void qkv_bias_rope_cache_decode(
+        const VkDescriptorBufferInfo& qkv,
+        const VkDescriptorBufferInfo& bias,
+        const VkDescriptorBufferInfo& rope_cos_sin,
+        const VkDescriptorBufferInfo& q_out,
+        const VkDescriptorBufferInfo& k_cache,
+        const VkDescriptorBufferInfo& v_cache,
+        uint32_t q_dim,
+        uint32_t kv_dim,
+        uint32_t num_q_heads,
+        uint32_t num_kv_heads,
+        uint32_t head_dim,
+        uint32_t max_seq_len,
+        uint32_t position_offset,
+        bool has_bias,
+        VkDispatchBatch* batch = nullptr
+    ) const;
+
+    void transpose_bshd_to_bhsd(
+        const VkDescriptorBufferInfo& input,
+        const VkDescriptorBufferInfo& output,
+        uint32_t B,
+        uint32_t S,
+        uint32_t H,
+        uint32_t D,
+        VkDispatchBatch* batch = nullptr
+    ) const;
+
+    void kv_cache_copy(
+        const VkDescriptorBufferInfo& k_in,
+        const VkDescriptorBufferInfo& v_in,
+        const VkDescriptorBufferInfo& k_cache,
+        const VkDescriptorBufferInfo& v_cache,
+        uint32_t batch_size,
+        uint32_t seq_len,
+        uint32_t num_kv_heads,
+        uint32_t head_dim,
+        uint32_t max_seq_len,
+        uint32_t position_offset,
+        VkDispatchBatch* batch = nullptr
+    ) const;
+
+    // Decode-only grouped-query attention.
+    // Q:[1,num_q_heads,1,head_dim], K/V:[1,num_kv_heads,kv_stride,head_dim], O:[1,num_q_heads,1,head_dim].
+    void attention_decode_gqa(
+        const VkDescriptorBufferInfo& q,
+        const VkDescriptorBufferInfo& k,
+        const VkDescriptorBufferInfo& v,
+        const VkDescriptorBufferInfo& out,
+        uint32_t num_q_heads,
+        uint32_t num_kv_heads,
+        uint32_t kv_len,
+        uint32_t kv_stride,
+        uint32_t head_dim,
+        float scale,
+        VkDispatchBatch* batch = nullptr
+    ) const;
+
+    // Causal grouped-query prefill attention. Q covers the last q_len positions of the KV stream.
+    // Q/O:[1,num_q_heads,q_len,head_dim], K/V:[1,num_kv_heads,kv_stride,head_dim].
+    void attention_prefill_gqa(
+        const VkDescriptorBufferInfo& q,
+        const VkDescriptorBufferInfo& k,
+        const VkDescriptorBufferInfo& v,
+        const VkDescriptorBufferInfo& out,
+        uint32_t num_q_heads,
+        uint32_t num_kv_heads,
+        uint32_t q_len,
+        uint32_t kv_len,
+        uint32_t kv_stride,
+        uint32_t head_dim,
+        float scale,
+        VkDispatchBatch* batch = nullptr
+    ) const;
+
+    // C = A @ B^T.  A:[M,K], B:[N,K], C:[M,N] — all row-major FP16.
+    void gemm(
+        const VkDescriptorBufferInfo& a,
+        const VkDescriptorBufferInfo& b,
+        const VkDescriptorBufferInfo& c,
+        uint32_t M,
+        uint32_t N,
+        uint32_t K,
+        VkQueryPool query_pool = VK_NULL_HANDLE,
+        VkDispatchBatch* batch = nullptr
+    ) const;
+
+    // y = W @ x. x:[K], W:[N,K], y:[N] — all row-major FP16.
+    void gemv(
+        const VkDescriptorBufferInfo& x,
+        const VkDescriptorBufferInfo& w,
+        const VkDescriptorBufferInfo& y,
+        uint32_t N,
+        uint32_t K,
+        VkQueryPool query_pool = VK_NULL_HANDLE,
+        VkDispatchBatch* batch = nullptr
+    ) const;
+
+  private:
+    static constexpr uint32_t kLocalSizeX = 256;
+    static constexpr uint32_t kAttentionGqaLocalSizeX = 128;
+    static constexpr uint32_t kGemvRows4Vec4LocalSizeX = 128;
+    static constexpr uint32_t kGemvRows4Vec4RowsPerWg = 4;
+
+    VkKernelRuntime* runtime_ = nullptr;
+    VkKernel add_kernel_ = {};
+    VkKernel mul_kernel_ = {};
+    VkKernel silu_mul_interleaved_kernel_ = {};
+    VkKernel rmsnorm_kernel_ = {};
+    VkKernel qkv_bias_split_kernel_ = {};
+    VkKernel qkv_bias_rope_cache_decode_kernel_ = {};
+    VkKernel rope_kernel_ = {};
+    VkKernel transpose_kernel_ = {};
+    VkKernel kv_cache_copy_kernel_ = {};
+    VkKernel attention_decode_gqa_kernel_ = {};
+    VkKernel attention_prefill_gqa_kernel_ = {};
+    VkKernel gemv_rows4_vec4_kernel_ = {};
+    VkKernel gemm_kernel_ = {};
+};
+
+}  // namespace mruntime::vulkan

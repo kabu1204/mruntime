@@ -1,0 +1,27 @@
+#version 460
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer ABuffer {
+    float a[];
+} a_buf;
+
+layout(set = 0, binding = 1, std430) readonly buffer BBuffer {
+    float b[];
+} b_buf;
+
+layout(set = 0, binding = 2, std430) writeonly buffer CBuffer {
+    float c[];
+} c_buf;
+
+layout(push_constant) uniform PushConstants {
+    uint n;
+} pc;
+
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n) {
+        return;
+    }
+    c_buf.c[i] = a_buf.a[i] + b_buf.b[i];
+}

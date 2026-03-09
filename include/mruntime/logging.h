@@ -1,4 +1,3 @@
-// Lightweight logging wrapper built on top of spdlog.
 #pragma once
 
 #include <memory>
@@ -65,4 +64,3 @@ inline void set_log_level(spdlog::level::level_enum level) {
 #define MRUNTIME_LOG_WARN(...) MRUNTIME_LOG_CALL_(spdlog::level::warn, __VA_ARGS__)
 #define MRUNTIME_LOG_ERROR(...) MRUNTIME_LOG_CALL_(spdlog::level::err, __VA_ARGS__)
 #define MRUNTIME_LOG_CRITICAL(...) MRUNTIME_LOG_CALL_(spdlog::level::critical, __VA_ARGS__)
-

@@ -3,6 +3,7 @@
 #include <fstream>
 #include <iostream>
 
+#include "mruntime/dtype.h"
 #include "mruntime/safetensors.h"
 
 using namespace mruntime;
@@ -51,43 +52,29 @@ void test_tensor_info() {
     std::cout << "test_tensor_info PASSED\n";
 }
 
-void test_load_tensor_view() {
+void test_tensor_data() {
     auto file = SafeTensorsFile::open(MODEL_PATH);
 
-    Tensor view = file->load_tensor_view("model.norm.weight");
-    assert(view.dtype() == DType::BF16);
-    assert(view.ndim() == 1);
-    assert(view.dim(0) == 896);
-    assert(!view.owns_data());  // View should not own data
+    // Get raw pointer to norm weight
+    const auto& info = file->tensor_info("model.norm.weight");
+    const void* data = file->tensor_data("model.norm.weight");
 
-    std::cout << "test_load_tensor_view PASSED\n";
-}
+    assert(data != nullptr);
+    assert(info.dtype == DType::BF16);
+    assert(info.shape.size() == 1);
+    assert(info.shape[0] == 896);
 
-void test_load_tensor_copy() {
-    auto file = SafeTensorsFile::open(MODEL_PATH);
-
-    // Load without conversion (keeps BF16)
-    Tensor copy_native = file->load_tensor_copy("model.norm.weight");
-    assert(copy_native.dtype() == DType::BF16);
-    assert(copy_native.owns_data());
-
-    // Load with conversion to FP16 (runtime activation dtype)
-    Tensor copy_fp16 = file->load_tensor_copy("model.norm.weight", DType::FP16);
-    assert(copy_fp16.dtype() == DType::FP16);
-    assert(copy_fp16.owns_data());
-    assert(copy_fp16.dim(0) == 896);
-
-    // Verify conversion produces reasonable values
-    const uint16_t* fp16_data = copy_fp16.data_ptr<uint16_t>();
+    // Verify the data is readable and has non-zero values
+    const uint16_t* bf16_data = static_cast<const uint16_t*>(data);
     bool has_nonzero = false;
-    for (size_t i = 0; i < copy_fp16.numel(); ++i) {
-        float v = fp16_bits_to_float(fp16_data[i]);
+    for (size_t i = 0; i < info.shape[0]; ++i) {
+        float v = bf16_to_float(bf16_data[i]);
         assert(std::isfinite(v));
         if (v != 0.0f) has_nonzero = true;
     }
     assert(has_nonzero);  // Weight should have non-zero values
 
-    std::cout << "test_load_tensor_copy PASSED\n";
+    std::cout << "test_tensor_data PASSED\n";
 }
 
 void test_bf16_dtype_parsing() {
@@ -141,8 +128,7 @@ int main() {
     test_open_safetensors();
     test_tensor_names();
     test_tensor_info();
-    test_load_tensor_view();
-    test_load_tensor_copy();
+    test_tensor_data();
     test_bf16_dtype_parsing();
     test_has_tensor();
     test_layer_count();
