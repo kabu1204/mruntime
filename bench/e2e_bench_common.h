@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cctype>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -94,6 +95,20 @@ inline auto is_help_flag(const std::string& arg) -> bool {
     return arg == "-h" || arg == "--help";
 }
 
+inline auto trim_ascii_whitespace(const std::string& text) -> std::string {
+    size_t start = 0;
+    while (start < text.size() && std::isspace(static_cast<unsigned char>(text[start])) != 0) {
+        ++start;
+    }
+
+    size_t end = text.size();
+    while (end > start && std::isspace(static_cast<unsigned char>(text[end - 1])) != 0) {
+        --end;
+    }
+
+    return text.substr(start, end - start);
+}
+
 inline auto print_common_e2e_usage(std::ostream& os) -> void {
     os << "  --model-dir PATH        Path to model directory (default: auto-detect)\n"
        << "  --prompt-len N          Prompt length in tokens (default: 8)\n"
@@ -132,6 +147,46 @@ inline auto parse_common_e2e_arg(const std::string& arg, RequireValue&& require_
     return true;
 }
 
+inline auto parse_size_t_list(const std::string& value, const char* flag) -> std::vector<size_t> {
+    std::vector<size_t> values;
+    std::stringstream ss(value);
+    std::string item;
+    while (std::getline(ss, item, ',')) {
+        item = trim_ascii_whitespace(item);
+        if (item.empty()) {
+            throw std::runtime_error(std::string(flag) + " contains an empty entry");
+        }
+
+        size_t parsed = 0;
+        const unsigned long long v = std::stoull(item, &parsed);
+        if (parsed != item.size()) {
+            throw std::runtime_error(std::string(flag) + " contains an invalid integer: " + item);
+        }
+        values.push_back(static_cast<size_t>(v));
+    }
+
+    if (values.empty()) {
+        throw std::runtime_error(std::string(flag) + " must not be empty");
+    }
+
+    return values;
+}
+
+inline auto format_size_t_list(const std::vector<size_t>& values) -> std::string {
+    std::ostringstream os;
+    for (size_t i = 0; i < values.size(); ++i) {
+        if (i != 0) {
+            os << ",";
+        }
+        os << values[i];
+    }
+    return os.str();
+}
+
+inline auto default_prompt_len_sweep() -> std::vector<size_t> {
+    return {8, 64, 256, 512, 1024, 1536, 2016};
+}
+
 template <typename Args>
 inline auto validate_common_e2e_args(const Args& args) -> void {
     if (args.prompt_len == 0) {
@@ -145,6 +200,33 @@ inline auto validate_common_e2e_args(const Args& args) -> void {
         ss << "prompt_len + max_new_tokens exceeds max_seq_len: "
            << args.prompt_len << " + " << args.max_new_tokens << " > " << args.max_seq_len;
         throw std::runtime_error(ss.str());
+    }
+}
+
+inline auto validate_prompt_len_sweep(
+    const std::vector<size_t>& prompt_lens,
+    size_t max_new_tokens,
+    size_t max_seq_len,
+    size_t max_batch_tokens
+) -> void {
+    if (prompt_lens.empty()) {
+        throw std::runtime_error("--prompt-lens must not be empty");
+    }
+    if (max_batch_tokens == 0) {
+        throw std::runtime_error("--max-batch-tokens must be > 0");
+    }
+    for (size_t i = 0; i < prompt_lens.size(); ++i) {
+        const size_t prompt_len = prompt_lens[i];
+        if (prompt_len == 0) {
+            throw std::runtime_error("--prompt-lens entries must be > 0");
+        }
+        if (prompt_len + max_new_tokens > max_seq_len) {
+            std::ostringstream ss;
+            ss << "--prompt-lens entry at index " << i
+               << " exceeds max_seq_len: " << prompt_len
+               << " + " << max_new_tokens << " > " << max_seq_len;
+            throw std::runtime_error(ss.str());
+        }
     }
 }
 
@@ -194,6 +276,53 @@ inline auto print_e2e_metrics(const E2EMetrics& metrics, std::ostream& os = std:
        << tokens_per_second(metrics.prompt_len, metrics.prefill_s) << " tok/s\n";
     os << "decode:              " << metrics.decode_steps << " tokens, " << (metrics.decode_s * 1000.0)
        << " ms, " << tokens_per_second(metrics.decode_steps, metrics.decode_s) << " tok/s\n";
+}
+
+inline auto print_e2e_sweep_header(
+    const std::string& backend,
+    const std::string& model_dir,
+    const std::vector<size_t>& prompt_lens,
+    size_t max_new_tokens,
+    size_t max_seq_len,
+    size_t max_batch_tokens,
+    size_t threads,
+    std::ostream& os = std::cout
+) -> void {
+    os << "=== E2E Context Sweep ===\n";
+    os << "backend:             " << backend << "\n";
+    os << "model_dir:           " << model_dir << "\n";
+    os << "prompt_lens:         " << format_size_t_list(prompt_lens) << "\n";
+    os << "max_new_tokens:      " << max_new_tokens << "\n";
+    os << "max_seq_len:         " << max_seq_len << "\n";
+    os << "max_batch_tokens:    " << max_batch_tokens << "\n";
+    os << "threads:             " << threads << "\n";
+}
+
+inline auto print_e2e_sweep_metrics(
+    const std::vector<E2EMetrics>& metrics,
+    std::ostream& os = std::cout
+) -> void {
+    os << std::fixed << std::setprecision(3);
+    os << "\n"
+       << std::setw(12) << "prompt_len"
+       << std::setw(12) << "ttft_ms"
+       << std::setw(14) << "prefill_ms"
+       << std::setw(16) << "prefill_tok/s"
+       << std::setw(14) << "decode_steps"
+       << std::setw(12) << "decode_ms"
+       << std::setw(15) << "decode_tok/s"
+       << "\n";
+
+    for (const E2EMetrics& metric : metrics) {
+        os << std::setw(12) << metric.prompt_len
+           << std::setw(12) << metric.ttft_ms
+           << std::setw(14) << (metric.prefill_s * 1000.0)
+           << std::setw(16) << tokens_per_second(metric.prompt_len, metric.prefill_s)
+           << std::setw(14) << metric.decode_steps
+           << std::setw(12) << (metric.decode_s * 1000.0)
+           << std::setw(15) << tokens_per_second(metric.decode_steps, metric.decode_s)
+           << "\n";
+    }
 }
 
 }  // namespace mruntime::bench

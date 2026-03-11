@@ -73,6 +73,7 @@ Benchmarks:
 ```bash
 ./build/bench/cpu_micro_bench
 ./build/bench/cpu_e2e_bench --prompt-len 8 --max-new-tokens 32 --threads 8
+./build/bench/cpu_e2e_context_sweep_bench --prompt-lens 8,64,256,512 --max-new-tokens 32 --threads 8
 ```
 
 With Vulkan enabled:
@@ -80,6 +81,7 @@ With Vulkan enabled:
 ```bash
 ./build/bench/vulkan_gemm_bench
 ./build/bench/vulkan_e2e_bench --prompt-len 8 --max-new-tokens 32 --threads 8 --trace 0
+./build/bench/vulkan_e2e_context_sweep_bench --prompt-lens 8,64,256,512 --max-new-tokens 32 --threads 8
 ```
 
 ## Architecture
