@@ -252,6 +252,64 @@ void flash_attention_gqa_reference_fp32(
     }
 }
 
+void expect_flash_attention_gqa_matches_reference(
+    const std::vector<uint16_t>& Q,
+    const std::vector<uint16_t>& K,
+    const std::vector<uint16_t>& V,
+    std::vector<uint16_t>* O,
+    size_t batch,
+    size_t num_q_heads,
+    size_t num_kv_heads,
+    size_t q_len,
+    size_t kv_len,
+    size_t kv_stride,
+    size_t head_dim,
+    float scale,
+    bool causal,
+    float tol
+) {
+    std::vector<float> O_ref(batch * num_q_heads * q_len * head_dim);
+
+    flash_attention_gqa_reference_fp32(
+        Q.data(),
+        K.data(),
+        V.data(),
+        O_ref.data(),
+        batch,
+        num_q_heads,
+        num_kv_heads,
+        q_len,
+        kv_len,
+        kv_stride,
+        head_dim,
+        scale,
+        causal
+    );
+
+    qwen2_flash_attention_gqa_fp16(
+        Q.data(),
+        K.data(),
+        V.data(),
+        O->data(),
+        batch,
+        num_q_heads,
+        num_kv_heads,
+        q_len,
+        kv_len,
+        kv_stride,
+        head_dim,
+        scale,
+        causal,
+        /*pool=*/nullptr
+    );
+
+    for (size_t i = 0; i < O->size(); ++i) {
+        const float got = fp16_bits_to_float((*O)[i]);
+        ASSERT_TRUE(std::isfinite(got)) << "O[" << i << "] is not finite";
+        EXPECT_NEAR(got, O_ref[i], tol) << "i=" << i;
+    }
+}
+
 }  // namespace
 
 TEST(Qwen2OpsTest, Rope) {
@@ -358,29 +416,12 @@ TEST(Qwen2OpsTest, FlashAttentionGqaDecodeCausal) {
     }
 
     std::vector<uint16_t> O(batch * num_q_heads * q_len * head_dim);
-    std::vector<float> O_ref(batch * num_q_heads * q_len * head_dim);
-
-    flash_attention_gqa_reference_fp32(
-        Q.data(),
-        K.data(),
-        V.data(),
-        O_ref.data(),
-        batch,
-        num_q_heads,
-        num_kv_heads,
-        q_len,
-        kv_len,
-        kv_stride,
-        head_dim,
-        scale,
-        /*causal=*/true
-    );
-
-    qwen2_flash_attention_gqa_fp16(
-        Q.data(),
-        K.data(),
-        V.data(),
-        O.data(),
+    constexpr float kTol = 5e-2f;
+    expect_flash_attention_gqa_matches_reference(
+        Q,
+        K,
+        V,
+        &O,
         batch,
         num_q_heads,
         num_kv_heads,
@@ -390,15 +431,8 @@ TEST(Qwen2OpsTest, FlashAttentionGqaDecodeCausal) {
         head_dim,
         scale,
         /*causal=*/true,
-        /*pool=*/nullptr
+        kTol
     );
-
-    constexpr float kTol = 5e-2f;
-    for (size_t i = 0; i < O.size(); ++i) {
-        const float got = fp16_bits_to_float(O[i]);
-        ASSERT_TRUE(std::isfinite(got)) << "O[" << i << "] is not finite";
-        EXPECT_NEAR(got, O_ref[i], kTol) << "i=" << i;
-    }
 }
 
 TEST(Qwen2OpsTest, FlashAttentionGqaPrefillCausal) {
@@ -482,6 +516,68 @@ TEST(Qwen2OpsTest, FlashAttentionGqaPrefillCausal) {
     }
 }
 
+TEST(Qwen2OpsTest, FlashAttentionGqaPrefillCausalHeadDim64) {
+    const size_t batch = 1;
+    const size_t num_q_heads = 14;
+    const size_t num_kv_heads = 2;
+    const size_t q_len = 16;
+    const size_t kv_len = 80;
+    const size_t kv_stride = 96;
+    const size_t head_dim = 64;
+    const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+
+    std::vector<uint16_t> Q(batch * num_q_heads * q_len * head_dim);
+    std::vector<uint16_t> K(batch * num_kv_heads * kv_stride * head_dim);
+    std::vector<uint16_t> V(batch * num_kv_heads * kv_stride * head_dim);
+
+    for (size_t i = 0; i < Q.size(); ++i) {
+        const int centered = static_cast<int>(i % 257) - 128;
+        Q[i] = float_to_fp16_bits(static_cast<float>(centered) * 0.0035f);
+    }
+
+    for (size_t h = 0; h < num_kv_heads; ++h) {
+        for (size_t t = 0; t < kv_stride; ++t) {
+            for (size_t d = 0; d < head_dim; ++d) {
+                const size_t idx = (h * kv_stride + t) * head_dim + d;
+                if (t < kv_len) {
+                    K[idx] = float_to_fp16_bits(
+                        0.017f * static_cast<float>(h + 1) +
+                        0.004f * static_cast<float>(t + 1) -
+                        0.0008f * static_cast<float>(d)
+                    );
+                    V[idx] = float_to_fp16_bits(
+                        -0.013f * static_cast<float>(h + 1) +
+                        0.0025f * static_cast<float>(t + 1) +
+                        0.0009f * static_cast<float>(d)
+                    );
+                } else {
+                    K[idx] = float_to_fp16_bits(123.0f);
+                    V[idx] = float_to_fp16_bits(-123.0f);
+                }
+            }
+        }
+    }
+
+    std::vector<uint16_t> O(batch * num_q_heads * q_len * head_dim);
+    constexpr float kTol = 8e-2f;
+    expect_flash_attention_gqa_matches_reference(
+        Q,
+        K,
+        V,
+        &O,
+        batch,
+        num_q_heads,
+        num_kv_heads,
+        q_len,
+        kv_len,
+        kv_stride,
+        head_dim,
+        scale,
+        /*causal=*/true,
+        kTol
+    );
+}
+
 TEST(Qwen2OpsTest, FlashAttentionGqaNonCausal) {
     const size_t batch = 1;
     const size_t num_q_heads = 2;
@@ -513,29 +609,12 @@ TEST(Qwen2OpsTest, FlashAttentionGqaNonCausal) {
     }
 
     std::vector<uint16_t> O(batch * num_q_heads * q_len * head_dim);
-    std::vector<float> O_ref(batch * num_q_heads * q_len * head_dim);
-
-    flash_attention_gqa_reference_fp32(
-        Q.data(),
-        K.data(),
-        V.data(),
-        O_ref.data(),
-        batch,
-        num_q_heads,
-        num_kv_heads,
-        q_len,
-        kv_len,
-        kv_stride,
-        head_dim,
-        scale,
-        /*causal=*/false
-    );
-
-    qwen2_flash_attention_gqa_fp16(
-        Q.data(),
-        K.data(),
-        V.data(),
-        O.data(),
+    constexpr float kTol = 5e-2f;
+    expect_flash_attention_gqa_matches_reference(
+        Q,
+        K,
+        V,
+        &O,
         batch,
         num_q_heads,
         num_kv_heads,
@@ -545,15 +624,8 @@ TEST(Qwen2OpsTest, FlashAttentionGqaNonCausal) {
         head_dim,
         scale,
         /*causal=*/false,
-        /*pool=*/nullptr
+        kTol
     );
-
-    constexpr float kTol = 5e-2f;
-    for (size_t i = 0; i < O.size(); ++i) {
-        const float got = fp16_bits_to_float(O[i]);
-        ASSERT_TRUE(std::isfinite(got)) << "O[" << i << "] is not finite";
-        EXPECT_NEAR(got, O_ref[i], kTol) << "i=" << i;
-    }
 }
 
 TEST(Qwen2OpsTest, SiluMul) {

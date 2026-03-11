@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "mruntime/arena.h"
+#include "mruntime/dtype.h"
 #include "mruntime/qwen2_ops.h"
 #include "mruntime/pthreadpool_raii.h"
 
@@ -22,6 +23,10 @@ constexpr size_t kBenchAlign = 64;
 constexpr size_t kCacheLineBytes = 128; // depends on platforms, double-check
 constexpr double kBytesPerMiB = 1024.0 * 1024.0;
 constexpr double kBytesPerGB = 1e9;
+constexpr size_t kFlashAttentionBenchBatch = 1;
+constexpr size_t kFlashAttentionBenchNumQHeads = 14;
+constexpr size_t kFlashAttentionBenchNumKvHeads = 2;
+constexpr size_t kFlashAttentionBenchHeadDim = 64;
 
 size_t round_up(size_t n, size_t align) {
     return (n + align - 1) / align * align;
@@ -92,6 +97,25 @@ private:
     std::ios::fmtflags flags_;
     std::streamsize precision_;
 };
+
+void initialize_flash_attention_gqa_prefill_bench_inputs(
+    uint16_t* Q,
+    uint16_t* K,
+    uint16_t* V,
+    size_t q_size,
+    size_t kv_size
+) {
+    for (size_t i = 0; i < q_size; ++i) {
+        const int centered = static_cast<int>(i % 97) - 48;
+        Q[i] = float_to_fp16_bits(static_cast<float>(centered) * 0.01f);
+    }
+    for (size_t i = 0; i < kv_size; ++i) {
+        const int centered_k = static_cast<int>(i % 89) - 44;
+        const int centered_v = static_cast<int>(i % 83) - 41;
+        K[i] = float_to_fp16_bits(static_cast<float>(centered_k) * 0.008f);
+        V[i] = float_to_fp16_bits(static_cast<float>(centered_v) * 0.009f);
+    }
+}
 
 }  // namespace
 
@@ -210,6 +234,73 @@ double benchmark_rmsnorm(size_t num_tokens, size_t hidden_size, int iterations, 
     std::free(input);
     std::free(weight);
     std::free(output);
+
+    return elapsed.count() / iterations;
+}
+
+double benchmark_flash_attention_gqa_prefill(size_t q_len, size_t kv_len, int iterations, PThreadPool* pool) {
+    const size_t batch = kFlashAttentionBenchBatch;
+    const size_t num_q_heads = kFlashAttentionBenchNumQHeads;
+    const size_t num_kv_heads = kFlashAttentionBenchNumKvHeads;
+    const size_t head_dim = kFlashAttentionBenchHeadDim;
+    const size_t kv_stride = kv_len;
+    const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+
+    const size_t q_size = batch * num_q_heads * q_len * head_dim;
+    const size_t kv_size = batch * num_kv_heads * kv_stride * head_dim;
+    const size_t o_size = batch * num_q_heads * q_len * head_dim;
+
+    uint16_t* Q = static_cast<uint16_t*>(aligned_alloc_or_die(q_size * sizeof(uint16_t)));
+    uint16_t* K = static_cast<uint16_t*>(aligned_alloc_or_die(kv_size * sizeof(uint16_t)));
+    uint16_t* V = static_cast<uint16_t*>(aligned_alloc_or_die(kv_size * sizeof(uint16_t)));
+    uint16_t* O = static_cast<uint16_t*>(aligned_alloc_or_die(o_size * sizeof(uint16_t)));
+
+    initialize_flash_attention_gqa_prefill_bench_inputs(Q, K, V, q_size, kv_size);
+    std::memset(O, 0, o_size * sizeof(uint16_t));
+
+    qwen2_flash_attention_gqa_fp16(
+        Q,
+        K,
+        V,
+        O,
+        batch,
+        num_q_heads,
+        num_kv_heads,
+        q_len,
+        kv_len,
+        kv_stride,
+        head_dim,
+        scale,
+        /*causal=*/true,
+        pool
+    );
+
+    auto start = std::chrono::steady_clock::now();
+    for (int i = 0; i < iterations; ++i) {
+        qwen2_flash_attention_gqa_fp16(
+            Q,
+            K,
+            V,
+            O,
+            batch,
+            num_q_heads,
+            num_kv_heads,
+            q_len,
+            kv_len,
+            kv_stride,
+            head_dim,
+            scale,
+            /*causal=*/true,
+            pool
+        );
+    }
+    auto end = std::chrono::steady_clock::now();
+    std::chrono::duration<double, std::milli> elapsed = end - start;
+
+    std::free(Q);
+    std::free(K);
+    std::free(V);
+    std::free(O);
 
     return elapsed.count() / iterations;
 }
@@ -335,6 +426,13 @@ int main() {
 
     double rmsnorm_512 = benchmark_rmsnorm(512, 896, iterations, &pool);
     std::cout << "  tokens=512, hidden=896: " << rmsnorm_512 << " ms\n";
+
+    std::cout << "\nFlashAttention GQA Prefill Benchmarks:\n";
+    for (size_t q_len : {64UL, 256UL, 512UL, 1024UL, 2048UL}) {
+        const double time_ms = benchmark_flash_attention_gqa_prefill(q_len, q_len, iterations, &pool);
+        const double tok_per_s = (time_ms > 0.0) ? (static_cast<double>(q_len) * 1000.0 / time_ms) : 0.0;
+        std::cout << "  q_len=kv_len=" << q_len << ": " << time_ms << " ms (" << tok_per_s << " tok/s)\n";
+    }
 
     // =========================================================================
     // Memory Bandwidth Benchmark
