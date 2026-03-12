@@ -15,6 +15,14 @@ namespace {
 constexpr uint32_t kTimestampQueryCount = 4096;
 
 constexpr const char* kKhrPortabilitySubsetExtensionName = "VK_KHR_portability_subset";
+constexpr VkSubgroupFeatureFlags kRequiredSubgroupOperations =
+    VK_SUBGROUP_FEATURE_BASIC_BIT |
+    VK_SUBGROUP_FEATURE_VOTE_BIT |
+    VK_SUBGROUP_FEATURE_ARITHMETIC_BIT |
+    VK_SUBGROUP_FEATURE_BALLOT_BIT |
+    VK_SUBGROUP_FEATURE_SHUFFLE_BIT |
+    VK_SUBGROUP_FEATURE_SHUFFLE_RELATIVE_BIT |
+    VK_SUBGROUP_FEATURE_QUAD_BIT;
 
 void require_fp16_features(VkPhysicalDevice physical_device) {
     VkPhysicalDeviceShaderFloat16Int8FeaturesKHR float16 = {};
@@ -60,6 +68,32 @@ void require_vulkan13_features(VkPhysicalDevice physical_device) {
     }
     if (!features13.maintenance4) {
         throw std::runtime_error("Required Vulkan 1.3 feature missing: maintenance4");
+    }
+    if (!features13.computeFullSubgroups) {
+        throw std::runtime_error("Required Vulkan 1.3 feature missing: computeFullSubgroups");
+    }
+}
+
+void require_subgroup_support(VkPhysicalDevice physical_device) {
+    VkPhysicalDeviceSubgroupProperties subgroup_props = {};
+    subgroup_props.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES;
+
+    VkPhysicalDeviceProperties2 props2 = {};
+    props2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+    props2.pNext = &subgroup_props;
+    vkGetPhysicalDeviceProperties2(physical_device, &props2);
+
+    if (subgroup_props.subgroupSize == 0) {
+        throw std::runtime_error("Required Vulkan capability missing: subgroup support");
+    }
+    if ((subgroup_props.supportedStages & VK_SHADER_STAGE_COMPUTE_BIT) == 0) {
+        throw std::runtime_error("Required Vulkan capability missing: compute-stage subgroup support");
+    }
+    if ((subgroup_props.supportedOperations & kRequiredSubgroupOperations) !=
+        kRequiredSubgroupOperations) {
+        throw std::runtime_error(
+            "Required Vulkan subgroup operations missing: basic/vote/arithmetic/ballot/"
+            "shuffle/shuffle-relative/quad");
     }
 }
 
@@ -171,6 +205,7 @@ VkContext VkContext::Create(const VkContextCreateInfo& info) {
             (void)find_compute_queue_family(dev);
             require_fp16_features(dev);
             require_vulkan13_features(dev);
+            require_subgroup_support(dev);
         } catch (...) {
             continue;
         }
@@ -205,6 +240,10 @@ VkContext VkContext::Create(const VkContextCreateInfo& info) {
 
     // Optional calibrated timestamps extension (prefer KHR, fall back to EXT alias).
     const auto dev_exts = enumerate_device_extensions(ctx.physical_device_);
+#ifdef VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME
+    ctx.cooperative_matrix_supported_ =
+        has_extension(dev_exts, VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME);
+#endif
     const char* calibrated_ext_name = nullptr;
 #if defined(VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME)
     if (has_extension(dev_exts, VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME)) {
@@ -243,6 +282,7 @@ VkContext VkContext::Create(const VkContextCreateInfo& info) {
     features13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
     features13.synchronization2 = VK_TRUE;
     features13.maintenance4 = VK_TRUE;
+    features13.computeFullSubgroups = VK_TRUE;
     scalar_layout.pNext = &features13;
 
     VkPhysicalDeviceFeatures2 features2 = {};
@@ -382,6 +422,7 @@ VkContext& VkContext::operator=(VkContext&& other) noexcept {
     min_storage_buffer_offset_alignment_ = std::exchange(other.min_storage_buffer_offset_alignment_, VkDeviceSize{0});
     timestamp_period_ns_ = std::exchange(other.timestamp_period_ns_, 0.0f);
     timestamp_valid_bits_ = std::exchange(other.timestamp_valid_bits_, 0u);
+    cooperative_matrix_supported_ = std::exchange(other.cooperative_matrix_supported_, false);
 
     get_time_domains_ = std::exchange(other.get_time_domains_, nullptr);
     get_calibrated_timestamps_ = std::exchange(other.get_calibrated_timestamps_, nullptr);
@@ -423,6 +464,7 @@ void VkContext::reset() noexcept {
     timestamp_query_count_ = 0u;
     timestamp_period_ns_ = 0.0f;
     timestamp_valid_bits_ = 0u;
+    cooperative_matrix_supported_ = false;
 
     get_time_domains_ = nullptr;
     get_calibrated_timestamps_ = nullptr;

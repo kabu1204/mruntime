@@ -1,0 +1,122 @@
+#version 460
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_control_flow_attributes : require
+
+#define TILE_M 64
+#define TILE_N 128
+#define TILE_K 64
+#define TILE_K4 (TILE_K / 4)
+#define THREAD_TILE_M 4
+#define THREAD_TILE_N 8
+#define SHMEM_K4 (TILE_K4 + 1)
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(scalar, set = 0, binding = 0, std430) readonly buffer ABuffer {
+    f16vec4 a4[];
+} a_buf;
+
+layout(scalar, set = 0, binding = 1, std430) readonly buffer BBuffer {
+    f16vec4 b4[];
+} b_buf;
+
+layout(set = 0, binding = 2, std430) writeonly buffer CBuffer {
+    float16_t c[];
+} c_buf;
+
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint N;
+    uint K;
+} pc;
+
+shared f16vec4 tile_a[TILE_M][SHMEM_K4];
+shared f16vec4 tile_b[TILE_N][SHMEM_K4];
+
+void main() {
+    const uint tx = gl_LocalInvocationID.x;
+    const uint ty = gl_LocalInvocationID.y;
+    const uint tid = ty * 16u + tx;
+
+    const uint sub_m = ty * THREAD_TILE_M;
+    const uint sub_n = tx * THREAD_TILE_N;
+    const uint tile_row = gl_WorkGroupID.y * TILE_M;
+    const uint tile_col = gl_WorkGroupID.x * TILE_N;
+    const uint K4 = pc.K >> 2u;
+    const uint num_k_tiles = (pc.K + TILE_K - 1u) / TILE_K;
+
+    float acc[THREAD_TILE_M][THREAD_TILE_N];
+    for (uint i = 0; i < THREAD_TILE_M; ++i) {
+        for (uint j = 0; j < THREAD_TILE_N; ++j) {
+            acc[i][j] = 0.0;
+        }
+    }
+
+    for (uint kt = 0; kt < num_k_tiles; ++kt) {
+        const uint k_base4 = kt * TILE_K4;
+
+        [[unroll]]
+        for (uint iter = 0; iter < 4u; ++iter) {
+            const uint idx = iter * 256u + tid;
+            const uint row = idx >> 4;
+            const uint k4 = idx & 15u;
+            const uint gm = tile_row + row;
+            const uint gk4 = k_base4 + k4;
+            tile_a[row][k4] = (gm < pc.M && gk4 < K4)
+                ? a_buf.a4[gm * K4 + gk4]
+                : f16vec4(0.0);
+        }
+
+        [[unroll]]
+        for (uint iter = 0; iter < 8u; ++iter) {
+            const uint idx = iter * 256u + tid;
+            const uint row = idx >> 4;
+            const uint k4 = idx & 15u;
+            const uint gn = tile_col + row;
+            const uint gk4 = k_base4 + k4;
+            tile_b[row][k4] = (gn < pc.N && gk4 < K4)
+                ? b_buf.b4[gn * K4 + gk4]
+                : f16vec4(0.0);
+        }
+
+        barrier();
+
+        [[unroll]]
+        for (uint k4 = 0; k4 < TILE_K4; ++k4) {
+            const vec4 b_vec[THREAD_TILE_N] = {
+                vec4(tile_b[sub_n + 0u][k4]),
+                vec4(tile_b[sub_n + 1u][k4]),
+                vec4(tile_b[sub_n + 2u][k4]),
+                vec4(tile_b[sub_n + 3u][k4]),
+                vec4(tile_b[sub_n + 4u][k4]),
+                vec4(tile_b[sub_n + 5u][k4]),
+                vec4(tile_b[sub_n + 6u][k4]),
+                vec4(tile_b[sub_n + 7u][k4]),
+            };
+
+            [[unroll]]
+            for (uint i = 0; i < THREAD_TILE_M; ++i) {
+                const vec4 a_vec = vec4(tile_a[sub_m + i][k4]);
+                [[unroll]]
+                for (uint j = 0; j < THREAD_TILE_N; ++j) {
+                    acc[i][j] += dot(a_vec, b_vec[j]);
+                }
+            }
+        }
+
+        barrier();
+    }
+
+    for (uint i = 0; i < THREAD_TILE_M; ++i) {
+        for (uint j = 0; j < THREAD_TILE_N; ++j) {
+            const uint gm = tile_row + sub_m + i;
+            const uint gn = tile_col + sub_n + j;
+            if (gm < pc.M && gn < pc.N) {
+                c_buf.c[gm * pc.N + gn] = float16_t(acc[i][j]);
+            }
+        }
+    }
+}

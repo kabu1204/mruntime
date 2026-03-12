@@ -6,6 +6,7 @@
 #include "fp16_attention_decode_gqa_spv.h"
 #include "fp16_attention_prefill_gqa_spv.h"
 #include "fp16_gemm_spv.h"
+#include "fp16_gemm_prefill_wide_spv.h"
 #include "fp16_gemv_rows4_vec4_spv.h"
 #include "fp16_kv_cache_copy_spv.h"
 #include "fp16_mul_spv.h"
@@ -24,13 +25,15 @@ KernelCreateInfo make_kernel_create_info(
     const uint8_t* spirv,
     size_t spirv_size,
     uint32_t storage_buffer_count,
-    uint32_t push_constant_size
+    uint32_t push_constant_size,
+    uint32_t required_subgroup_size = 0
 ) {
     KernelCreateInfo info;
     info.spirv = spirv;
     info.spirv_size = spirv_size;
     info.storage_buffer_count = storage_buffer_count;
     info.push_constant_size = push_constant_size;
+    info.required_subgroup_size = required_subgroup_size;
     return info;
 }
 
@@ -49,7 +52,6 @@ VkFp16Ops VkFp16Ops::Create(VkKernelRuntime* runtime) {
 
     VkFp16Ops ops;
     ops.runtime_ = runtime;
-
     ops.add_kernel_ = runtime->get_or_create_kernel(
         make_kernel_create_info(shaders::kFp16AddSpv, shaders::kFp16AddSpvSize, 3, sizeof(uint32_t)));
     ops.mul_kernel_ = runtime->get_or_create_kernel(
@@ -108,6 +110,12 @@ VkFp16Ops VkFp16Ops::Create(VkKernelRuntime* runtime) {
             2 * sizeof(uint32_t)));
     ops.gemm_kernel_ = runtime->get_or_create_kernel(
         make_kernel_create_info(shaders::kFp16GemmSpv, shaders::kFp16GemmSpvSize, 3, 3 * sizeof(uint32_t)));
+    ops.gemm_prefill_kernel_ = runtime->get_or_create_kernel(
+        make_kernel_create_info(
+            shaders::kFp16GemmPrefillWideSpv,
+            shaders::kFp16GemmPrefillWideSpvSize,
+            3,
+            3 * sizeof(uint32_t)));
 
     return ops;
 }
@@ -222,6 +230,9 @@ void VkFp16Ops::rmsnorm(
     if (num_tokens == 0 || hidden_size == 0) {
         return;
     }
+    if ((hidden_size & 3u) != 0u) {
+        throw std::runtime_error("VkFp16Ops::rmsnorm: hidden_size must be divisible by 4");
+    }
 
     const VkDescriptorBufferInfo buffers[3] = {input, weight, output};
     struct {
@@ -234,8 +245,8 @@ void VkFp16Ops::rmsnorm(
         rmsnorm_kernel_,
         buffers,
         3,
-        num_tokens * kLocalSizeX,
-        kLocalSizeX,
+        num_tokens * kRmsnormLocalSizeX,
+        kRmsnormLocalSizeX,
         &push_constants,
         sizeof(push_constants),
         2,
@@ -633,6 +644,52 @@ void VkFp16Ops::gemm(
         3,
         N,
         M,
+        tile_N,
+        tile_M,
+        &push_constants,
+        sizeof(push_constants),
+        2,
+        query_pool,
+        batch
+    );
+}
+
+void VkFp16Ops::gemm_prefill(
+    const VkDescriptorBufferInfo& a,
+    const VkDescriptorBufferInfo& b,
+    const VkDescriptorBufferInfo& c,
+    uint32_t M,
+    uint32_t N,
+    uint32_t K,
+    VkQueryPool query_pool,
+    VkDispatchBatch* batch
+) const {
+    if (runtime_ == nullptr) {
+        throw std::runtime_error("VkFp16Ops::gemm_prefill: runtime is null");
+    }
+    if (M == 0 || N == 0 || K == 0) {
+        return;
+    }
+    if ((K & 3u) != 0u) {
+        gemm(a, b, c, M, N, K, query_pool, batch);
+        return;
+    }
+
+    const VkDescriptorBufferInfo buffers[3] = {a, b, c};
+    struct {
+        uint32_t M;
+        uint32_t N;
+        uint32_t K;
+    } push_constants = {M, N, K};
+
+    constexpr uint32_t tile_M = 64;
+    constexpr uint32_t tile_N = 128;
+    runtime_->dispatch_2d(
+        gemm_prefill_kernel_,
+        buffers,
+        3,
+        tile_N * ((N + tile_N - 1u) / tile_N),
+        tile_M * ((M + tile_M - 1u) / tile_M),
         tile_N,
         tile_M,
         &push_constants,

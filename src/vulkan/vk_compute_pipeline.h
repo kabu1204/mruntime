@@ -16,6 +16,7 @@ struct ComputePipelineCreateInfo {
     uint32_t storage_buffer_count = 0;
     uint32_t push_constant_size = 0;
     VkPipelineCache pipeline_cache = VK_NULL_HANDLE;
+    uint32_t required_subgroup_size = 0;
 };
 
 struct VkDispatchTraceInfo {

@@ -303,6 +303,12 @@ if(MRUNTIME_ENABLE_VULKAN)
         "${CMAKE_SOURCE_DIR}/src/vulkan/slang/fp16_gemm.slang"
         kFp16GemmSpv
     )
+    mruntime_add_vulkan_shader_variant(
+        fp16_gemm_prefill_wide
+        "${CMAKE_SOURCE_DIR}/src/vulkan/glsl/fp16_gemm_prefill_wide.comp"
+        "${CMAKE_SOURCE_DIR}/src/vulkan/slang/fp16_gemm_prefill_wide.slang"
+        kFp16GemmPrefillWideSpv
+    )
 
     add_custom_target(mruntime_vulkan_shaders DEPENDS "${MRUNTIME_VULKAN_SHADER_HEADERS}")
 endif()

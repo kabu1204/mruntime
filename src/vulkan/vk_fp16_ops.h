@@ -165,6 +165,17 @@ class VkFp16Ops {
         VkDispatchBatch* batch = nullptr
     ) const;
 
+    void gemm_prefill(
+        const VkDescriptorBufferInfo& a,
+        const VkDescriptorBufferInfo& b,
+        const VkDescriptorBufferInfo& c,
+        uint32_t M,
+        uint32_t N,
+        uint32_t K,
+        VkQueryPool query_pool = VK_NULL_HANDLE,
+        VkDispatchBatch* batch = nullptr
+    ) const;
+
     // y = W @ x. x:[K], W:[N,K], y:[N] — all row-major FP16.
     void gemv(
         const VkDescriptorBufferInfo& x,
@@ -178,6 +189,7 @@ class VkFp16Ops {
 
   private:
     static constexpr uint32_t kLocalSizeX = 256;
+    static constexpr uint32_t kRmsnormLocalSizeX = 64;
     static constexpr uint32_t kAttentionGqaLocalSizeX = 128;
     static constexpr uint32_t kGemvRows4Vec4LocalSizeX = 128;
     static constexpr uint32_t kGemvRows4Vec4RowsPerWg = 4;
@@ -196,6 +208,7 @@ class VkFp16Ops {
     VkKernel attention_prefill_gqa_kernel_ = {};
     VkKernel gemv_rows4_vec4_kernel_ = {};
     VkKernel gemm_kernel_ = {};
+    VkKernel gemm_prefill_kernel_ = {};
 };
 
 }  // namespace mruntime::vulkan

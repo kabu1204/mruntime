@@ -61,6 +61,27 @@ void check_close(const char* test_name, const uint16_t* got_fp16, const float* e
     }
 }
 
+void check_close_fp16(
+    const char* test_name,
+    const uint16_t* got_fp16,
+    const uint16_t* expected_fp16,
+    uint32_t n,
+    float tolerance
+) {
+    for (uint32_t i = 0; i < n; ++i) {
+        float got = mruntime::fp16_bits_to_float(got_fp16[i]);
+        float expected = mruntime::fp16_bits_to_float(expected_fp16[i]);
+        float diff = std::fabs(got - expected);
+        if (!std::isfinite(got) || !std::isfinite(expected) || diff > tolerance) {
+            throw std::runtime_error(
+                std::string(test_name) + " mismatch at i=" + std::to_string(i) +
+                ": got=" + std::to_string(got) +
+                ", expected=" + std::to_string(expected) +
+                ", diff=" + std::to_string(diff));
+        }
+    }
+}
+
 // CPU reference: C = A @ B^T, FP32 accumulation.
 void cpu_gemm(const uint16_t* a, const uint16_t* b, float* c,
               uint32_t M, uint32_t N, uint32_t K) {
@@ -124,6 +145,61 @@ void test_gemm(TestContext& tc, uint32_t M, uint32_t N, uint32_t K) {
     std::cout << "  " << label << " PASSED\n";
 }
 
+void test_prefill_kernel_matches_generic(
+    TestContext& tc,
+    const char* name,
+    uint32_t M,
+    uint32_t N,
+    uint32_t K
+) {
+    const std::string label =
+        std::string(name) + "(" + std::to_string(M) + "," +
+        std::to_string(N) + "," + std::to_string(K) + ")";
+
+    const uint32_t a_count = M * K;
+    const uint32_t b_count = N * K;
+    const uint32_t c_count = M * N;
+
+    const VkDeviceSize a_bytes = static_cast<VkDeviceSize>(a_count) * sizeof(uint16_t);
+    const VkDeviceSize b_bytes = static_cast<VkDeviceSize>(b_count) * sizeof(uint16_t);
+    const VkDeviceSize c_bytes = static_cast<VkDeviceSize>(c_count) * sizeof(uint16_t);
+
+    auto arena = make_arena(tc, a_bytes + b_bytes + 2 * c_bytes + 4 * tc.alignment);
+
+    const VkDeviceSize a_offset = arena.alloc(a_bytes);
+    const VkDeviceSize b_offset = arena.alloc(b_bytes);
+    const VkDeviceSize generic_offset = arena.alloc(c_bytes);
+    const VkDeviceSize fast_offset = arena.alloc(c_bytes);
+
+    uint16_t* a_data = arena.host_ptr<uint16_t>(a_offset);
+    uint16_t* b_data = arena.host_ptr<uint16_t>(b_offset);
+    uint16_t* generic_data = arena.host_ptr<uint16_t>(generic_offset);
+    uint16_t* fast_data = arena.host_ptr<uint16_t>(fast_offset);
+
+    for (uint32_t i = 0; i < a_count; ++i) {
+        float val = -0.5f + 0.001f * static_cast<float>(i % 1000);
+        a_data[i] = mruntime::float_to_fp16_bits(val);
+    }
+    for (uint32_t i = 0; i < b_count; ++i) {
+        float val = 0.3f - 0.001f * static_cast<float>(i % 600);
+        b_data[i] = mruntime::float_to_fp16_bits(val);
+    }
+
+    std::memset(generic_data, 0, c_bytes);
+    std::memset(fast_data, 0, c_bytes);
+
+    const VkDescriptorBufferInfo a_desc = arena.descriptor(a_offset, a_bytes);
+    const VkDescriptorBufferInfo b_desc = arena.descriptor(b_offset, b_bytes);
+    const VkDescriptorBufferInfo generic_desc = arena.descriptor(generic_offset, c_bytes);
+    const VkDescriptorBufferInfo fast_desc = arena.descriptor(fast_offset, c_bytes);
+
+    tc.fp16_ops.gemm(a_desc, b_desc, generic_desc, M, N, K);
+    tc.fp16_ops.gemm_prefill(a_desc, b_desc, fast_desc, M, N, K);
+
+    check_close_fp16(label.c_str(), fast_data, generic_data, c_count, 5e-2f);
+    std::cout << "  " << label << " PASSED\n";
+}
+
 void run_all_tests() {
     TestContext tc = TestContext::Create();
 
@@ -145,6 +221,11 @@ void run_all_tests() {
     test_gemm(tc, 8, 896, 4864);
     // Off-by-one: nothing aligns.
     test_gemm(tc, 7, 1153, 897);
+
+    // Fast-path prefill kernels on exact Qwen2 projection shapes.
+    test_prefill_kernel_matches_generic(tc, "prefill_qkv_proj", 64, 1152, 896);
+    test_prefill_kernel_matches_generic(tc, "prefill_gate_up_proj", 64, 9728, 896);
+    test_prefill_kernel_matches_generic(tc, "prefill_down_proj", 64, 896, 4864);
 }
 
 }  // namespace

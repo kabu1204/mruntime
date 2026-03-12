@@ -2,19 +2,22 @@
 
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
 
-layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
-layout(set = 0, binding = 0, std430) readonly buffer InputBuffer {
-    float16_t data[];
+layout(scalar, set = 0, binding = 0, std430) readonly buffer InputBuffer {
+    f16vec4 data4[];
 } input_buf;
 
-layout(set = 0, binding = 1, std430) readonly buffer WeightBuffer {
-    float16_t data[];
+layout(scalar, set = 0, binding = 1, std430) readonly buffer WeightBuffer {
+    f16vec4 data4[];
 } weight_buf;
 
-layout(set = 0, binding = 2, std430) writeonly buffer OutBuffer {
-    float16_t data[];
+layout(scalar, set = 0, binding = 2, std430) writeonly buffer OutBuffer {
+    f16vec4 data4[];
 } out_buf;
 
 layout(push_constant) uniform PushConstants {
@@ -23,7 +26,7 @@ layout(push_constant) uniform PushConstants {
     float eps;
 } pc;
 
-shared float shared_sum[256];
+shared float subgroup_sums[64];
 
 void main() {
     const uint token = gl_WorkGroupID.x;
@@ -32,32 +35,35 @@ void main() {
     }
 
     const uint tid = gl_LocalInvocationID.x;
-    const uint row_offset = token * pc.hidden_size;
+    const uint hidden4 = pc.hidden_size >> 2u;
+    const uint row_offset4 = token * hidden4;
 
-    // Each thread accumulates its stripe of the sum-of-squares.
     float partial_sum = 0.0;
-    for (uint i = tid; i < pc.hidden_size; i += 256u) {
-        float val = float(input_buf.data[row_offset + i]);
-        partial_sum += val * val;
+    for (uint i4 = tid; i4 < hidden4; i4 += gl_WorkGroupSize.x) {
+        const vec4 values = vec4(input_buf.data4[row_offset4 + i4]);
+        partial_sum += dot(values, values);
     }
 
-    shared_sum[tid] = partial_sum;
+    partial_sum = subgroupAdd(partial_sum);
+    if (gl_SubgroupInvocationID == 0u) {
+        subgroup_sums[gl_SubgroupID] = partial_sum;
+    }
     barrier();
 
-    // Tree reduction.
-    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
-        if (tid < stride) {
-            shared_sum[tid] += shared_sum[tid + stride];
+    if (gl_SubgroupID == 0u) {
+        float subgroup_total = (tid < gl_NumSubgroups) ? subgroup_sums[tid] : 0.0;
+        subgroup_total = subgroupAdd(subgroup_total);
+        if (gl_SubgroupInvocationID == 0u) {
+            subgroup_sums[0] = subgroup_total;
         }
-        barrier();
     }
+    barrier();
 
-    float rms_inv = inversesqrt(shared_sum[0] / float(pc.hidden_size) + pc.eps);
+    const float rms_inv = inversesqrt(subgroup_sums[0] / float(pc.hidden_size) + pc.eps);
 
-    // Normalize and scale.
-    for (uint i = tid; i < pc.hidden_size; i += 256u) {
-        float val = float(input_buf.data[row_offset + i]);
-        float w = float(weight_buf.data[i]);
-        out_buf.data[row_offset + i] = float16_t(val * rms_inv * w);
+    for (uint i4 = tid; i4 < hidden4; i4 += gl_WorkGroupSize.x) {
+        const vec4 values = vec4(input_buf.data4[row_offset4 + i4]);
+        const vec4 weights = vec4(weight_buf.data4[i4]);
+        out_buf.data4[row_offset4 + i4] = f16vec4(values * weights * rms_inv);
     }
 }

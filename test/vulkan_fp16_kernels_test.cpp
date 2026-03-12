@@ -126,10 +126,19 @@ void test_silu_mul_interleaved(TestContext& tc) {
 // ---- rmsnorm ----
 
 void test_rmsnorm(TestContext& tc) {
-    const std::vector<uint32_t> hidden_sizes = {256, 896, 897};
+    struct RmsnormCase {
+        uint32_t hidden_size;
+        uint32_t num_tokens;
+    };
+    const std::vector<RmsnormCase> cases = {
+        {256, 4},
+        {896, 4},
+        {896, 64},
+    };
 
-    for (uint32_t hidden_size : hidden_sizes) {
-        const uint32_t num_tokens = 4;
+    for (const RmsnormCase& tc_case : cases) {
+        const uint32_t hidden_size = tc_case.hidden_size;
+        const uint32_t num_tokens = tc_case.num_tokens;
         const float eps = 1e-6f;
         const uint32_t input_count = num_tokens * hidden_size;
 
@@ -179,9 +188,48 @@ void test_rmsnorm(TestContext& tc) {
             arena.descriptor(out_offset, out_bytes),
             hidden_size, num_tokens, eps);
 
-        check_close(("rmsnorm(hidden=" + std::to_string(hidden_size) + ")").c_str(),
-                     out_data, expected.data(), input_count, 5e-3f);
-        std::cout << "  rmsnorm(hidden=" << hidden_size << ") PASSED\n";
+        check_close(
+            ("rmsnorm(hidden=" + std::to_string(hidden_size) +
+             ",tokens=" + std::to_string(num_tokens) + ")").c_str(),
+            out_data,
+            expected.data(),
+            input_count,
+            5e-3f);
+        std::cout << "  rmsnorm(hidden=" << hidden_size
+                  << ", tokens=" << num_tokens << ") PASSED\n";
+    }
+
+    {
+        const uint32_t hidden_size = 897;
+        const uint32_t num_tokens = 4;
+        const float eps = 1e-6f;
+        const uint32_t input_count = num_tokens * hidden_size;
+        const VkDeviceSize input_bytes = input_count * sizeof(uint16_t);
+        const VkDeviceSize weight_bytes = hidden_size * sizeof(uint16_t);
+        const VkDeviceSize out_bytes = input_count * sizeof(uint16_t);
+
+        auto arena = make_arena(tc, input_bytes + weight_bytes + out_bytes + 3 * tc.alignment);
+        const VkDeviceSize input_offset = arena.alloc(input_bytes);
+        const VkDeviceSize weight_offset = arena.alloc(weight_bytes);
+        const VkDeviceSize out_offset = arena.alloc(out_bytes);
+
+        bool threw = false;
+        try {
+            tc.fp16_ops.rmsnorm(
+                arena.descriptor(input_offset, input_bytes),
+                arena.descriptor(weight_offset, weight_bytes),
+                arena.descriptor(out_offset, out_bytes),
+                hidden_size,
+                num_tokens,
+                eps);
+        } catch (const std::runtime_error&) {
+            threw = true;
+        }
+
+        if (!threw) {
+            throw std::runtime_error("rmsnorm(hidden=897): expected divisible-by-4 validation failure");
+        }
+        std::cout << "  rmsnorm(hidden=897, tokens=4) rejected as expected\n";
     }
 }
 

@@ -60,6 +60,7 @@ struct KernelCreateInfo {
     size_t spirv_size = 0;
     uint32_t storage_buffer_count = 0;
     uint32_t push_constant_size = 0;
+    uint32_t required_subgroup_size = 0;
 };
 
 struct VkKernel {
@@ -91,6 +92,7 @@ class VkKernelRuntime {
 
     void set_timing_enabled(bool enabled) noexcept { timing_enabled_ = enabled; }
     bool timing_enabled() const noexcept { return timing_enabled_; }
+    const VkContext& context() const;
 
     VkDispatchBatch begin_batch() const;
     void finish_batch(
@@ -134,6 +136,7 @@ class VkKernelRuntime {
         std::vector<uint8_t> spirv;
         uint32_t storage_buffer_count = 0;
         uint32_t push_constant_size = 0;
+        uint32_t required_subgroup_size = 0;
 
         bool operator==(const PipelineCacheKey& other) const noexcept;
     };

@@ -70,6 +70,7 @@ vulkan::VkDispatchBatchHostBarrier host_barrier_for_desc(const VkDescriptorBuffe
 void project_fp16_row_major_vk(
     Qwen2VkState& state,
     const char* trace_name,
+    bool allow_prefill_fast_path,
     const VkDescriptorBufferInfo& input,
     const VkDescriptorBufferInfo& weight,
     const VkDescriptorBufferInfo& output,
@@ -79,17 +80,24 @@ void project_fp16_row_major_vk(
     vulkan::VkDispatchBatch* batch
 ) {
     const bool use_gemv = (M == 1u) && ((K & 3u) == 0u);
+    const bool use_prefill = allow_prefill_fast_path && (M >= 64u) && ((K & 3u) == 0u);
+    const int64_t path = use_gemv ? 1 : use_prefill ? 2 : 0;
     TRACE_SCOPE_ARGS_CAT(
         trace_name,
         "gemm_or_gemv",
         ::mruntime::trace_arg("m", static_cast<int64_t>(M)),
         ::mruntime::trace_arg("n", static_cast<int64_t>(N)),
         ::mruntime::trace_arg("k", static_cast<int64_t>(K)),
-        ::mruntime::trace_arg("gemv", use_gemv ? 1 : 0)
+        ::mruntime::trace_arg("path", path)
     );
 
     if (use_gemv) {
         state.fp16_ops.gemv(input, weight, output, N, K, VK_NULL_HANDLE, batch);
+        return;
+    }
+
+    if (use_prefill) {
+        state.fp16_ops.gemm_prefill(input, weight, output, M, N, K, VK_NULL_HANDLE, batch);
         return;
     }
 
@@ -161,6 +169,7 @@ void qwen2_mlp_vk(
         project_fp16_row_major_vk(
             state,
             "gate_up_proj_vk",
+            true,
             descriptor_for_ptr(state.scratch_arena, normed_input, num_tokens * hidden_size * sizeof(uint16_t)),
             descriptor_for_ptr(state.weights_arena, layer.gate_up_proj,
                                2 * intermediate_size * hidden_size * sizeof(uint16_t)),
@@ -191,6 +200,7 @@ void qwen2_mlp_vk(
         project_fp16_row_major_vk(
             state,
             "down_proj_vk",
+            true,
             descriptor_for_ptr(state.scratch_arena, scratch.gate, num_tokens * intermediate_size * sizeof(uint16_t)),
             descriptor_for_ptr(state.weights_arena, layer.down_proj, hidden_size * intermediate_size * sizeof(uint16_t)),
             descriptor_for_ptr(state.scratch_arena, mlp_output, num_tokens * hidden_size * sizeof(uint16_t)),
@@ -252,6 +262,7 @@ void qwen2_attention_vk(
         project_fp16_row_major_vk(
             state,
             "qkv_proj_vk",
+            true,
             descriptor_for_ptr(state.scratch_arena, normed_input, num_tokens * hidden_size * sizeof(uint16_t)),
             descriptor_for_ptr(state.weights_arena, layer.qkv_proj, qkv_dim * hidden_size * sizeof(uint16_t)),
             descriptor_for_ptr(state.scratch_arena, scratch.qkv_out, num_tokens * qkv_dim * sizeof(uint16_t)),
@@ -464,6 +475,7 @@ void qwen2_attention_vk(
         project_fp16_row_major_vk(
             state,
             "o_proj_vk",
+            false,
             o_proj_input_desc,
             descriptor_for_ptr(state.weights_arena, layer.o_proj, hidden_size * q_dim * sizeof(uint16_t)),
             descriptor_for_ptr(state.scratch_arena, attn_output, num_tokens * hidden_size * sizeof(uint16_t)),

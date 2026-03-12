@@ -214,6 +214,13 @@ VkKernelRuntime VkKernelRuntime::Create(const VkContext& context) {
     return runtime;
 }
 
+const VkContext& VkKernelRuntime::context() const {
+    if (context_ == nullptr) {
+        throw std::runtime_error("VkKernelRuntime::context: runtime not initialized");
+    }
+    return *context_;
+}
+
 VkKernel VkKernelRuntime::get_or_create_kernel(const KernelCreateInfo& info) {
     if (context_ == nullptr) {
         throw std::runtime_error("VkKernelRuntime::get_or_create_kernel: runtime not initialized");
@@ -229,6 +236,7 @@ VkKernel VkKernelRuntime::get_or_create_kernel(const KernelCreateInfo& info) {
     key.spirv.assign(info.spirv, info.spirv + info.spirv_size);
     key.storage_buffer_count = info.storage_buffer_count;
     key.push_constant_size = info.push_constant_size;
+    key.required_subgroup_size = info.required_subgroup_size;
 
     auto it = pipeline_cache_.find(key);
     if (it == pipeline_cache_.end()) {
@@ -238,6 +246,7 @@ VkKernel VkKernelRuntime::get_or_create_kernel(const KernelCreateInfo& info) {
         create_info.storage_buffer_count = key.storage_buffer_count;
         create_info.push_constant_size = key.push_constant_size;
         create_info.pipeline_cache = context_->pipeline_cache();
+        create_info.required_subgroup_size = key.required_subgroup_size;
 
         auto pipeline = std::make_unique<VkComputePipeline>(VkComputePipeline::Create(context_->device(), create_info));
         it = pipeline_cache_.emplace(std::move(key), std::move(pipeline)).first;
@@ -670,6 +679,7 @@ void VkKernelRuntime::dispatch_2d(
 bool VkKernelRuntime::PipelineCacheKey::operator==(const PipelineCacheKey& other) const noexcept {
     return storage_buffer_count == other.storage_buffer_count &&
            push_constant_size == other.push_constant_size &&
+           required_subgroup_size == other.required_subgroup_size &&
            spirv == other.spirv;
 }
 
@@ -677,6 +687,7 @@ size_t VkKernelRuntime::PipelineCacheKeyHash::operator()(const PipelineCacheKey&
     size_t hash = fnv1a_hash_bytes(key.spirv.data(), key.spirv.size());
     hash ^= static_cast<size_t>(key.storage_buffer_count) + 0x9e3779b97f4a7c15ull + (hash << 6) + (hash >> 2);
     hash ^= static_cast<size_t>(key.push_constant_size) + 0x9e3779b97f4a7c15ull + (hash << 6) + (hash >> 2);
+    hash ^= static_cast<size_t>(key.required_subgroup_size) + 0x9e3779b97f4a7c15ull + (hash << 6) + (hash >> 2);
     return hash;
 }
 

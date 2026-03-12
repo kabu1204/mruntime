@@ -1,9 +1,9 @@
-// FP16 RMSNorm with FP32 reduction/accumulation.
+// FP16 RMSNorm vec4 kernel for hidden sizes divisible by 4.
 
 import scope_primitives;
 import storage_traits;
 
-static const int WG_SIZE = 256;
+static const int WG_SIZE = 64;
 
 struct PushConstants {
     uint hidden_size;
@@ -15,13 +15,13 @@ struct PushConstants {
 ConstantBuffer<PushConstants> pc;
 
 [vk::binding(0, 0)]
-ByteAddressBuffer input_data;
+StructuredBuffer<half4> input_data;
 
 [vk::binding(1, 0)]
-ByteAddressBuffer weight_data;
+StructuredBuffer<half4> weight_data;
 
 [vk::binding(2, 0)]
-RWStructuredBuffer<half> out_data;
+RWStructuredBuffer<half4> out_data;
 
 groupshared float shared_sum[WG_SIZE];
 
@@ -54,22 +54,13 @@ void main(
     }
 
     const uint tid = local_id.x;
-    const uint row_offset = token * pc.hidden_size;
+    const uint hidden4 = pc.hidden_size >> 2u;
+    const uint row_offset4 = token * hidden4;
 
     float partial_sum = 0.0;
-    const uint vectorized_end = pc.hidden_size & ~7u;
-    const uint chunk = 8u;
-    const uint chunk_stride = uint(WG_SIZE) * chunk;
-
-    for (uint i = tid * chunk; i < vectorized_end; i += chunk_stride) {
-        const FloatPack8 values = Thread::load_fp16_pack8(input_data, row_offset + i);
-        partial_sum += dot(values.lo, values.lo);
-        partial_sum += dot(values.hi, values.hi);
-    }
-
-    for (uint i = vectorized_end + tid; i < pc.hidden_size; i += uint(WG_SIZE)) {
-        const float value = Thread::load_fp16(input_data, row_offset + i);
-        partial_sum += value * value;
+    for (uint index4 = tid; index4 < hidden4; index4 += uint(WG_SIZE)) {
+        const float4 value = float4(input_data[row_offset4 + index4]);
+        partial_sum += dot(value, value);
     }
 
     const float block_sum = Workgroup::broadcast_scalar<SharedSumStorage>(
@@ -78,19 +69,9 @@ void main(
 
     const float rms_inv = rsqrt(block_sum / float(pc.hidden_size) + pc.eps);
 
-    for (uint i = tid * chunk; i < vectorized_end; i += chunk_stride) {
-        const FloatPack8 values = Thread::load_fp16_pack8(input_data, row_offset + i);
-        const FloatPack8 weights = Thread::load_fp16_pack8(weight_data, i);
-
-        FloatPack8 outputs;
-        outputs.lo = values.lo * weights.lo * rms_inv;
-        outputs.hi = values.hi * weights.hi * rms_inv;
-        Thread::scatter_contiguous_values8(out_data, row_offset + i, 8u, outputs);
-    }
-
-    for (uint i = vectorized_end + tid; i < pc.hidden_size; i += uint(WG_SIZE)) {
-        const float value = Thread::load_fp16(input_data, row_offset + i);
-        const float weight = Thread::load_fp16(weight_data, i);
-        out_data[row_offset + i] = half(value * rms_inv * weight);
+    for (uint index4 = tid; index4 < hidden4; index4 += uint(WG_SIZE)) {
+        const float4 value = float4(input_data[row_offset4 + index4]);
+        const float4 weight = float4(weight_data[index4]);
+        out_data[row_offset4 + index4] = half4(value * weight * rms_inv);
     }
 }

@@ -88,6 +88,14 @@ VkComputePipeline VkComputePipeline::Create(VkDevice device, const ComputePipeli
     stage.module = shader;
     stage.pName = "main";
 
+    VkPipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup_size_info = {};
+    if (info.required_subgroup_size != 0) {
+        subgroup_size_info.sType =
+            VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO;
+        subgroup_size_info.requiredSubgroupSize = info.required_subgroup_size;
+        stage.pNext = &subgroup_size_info;
+    }
+
     VkComputePipelineCreateInfo vk_ci = {};
     vk_ci.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
     vk_ci.stage = stage;

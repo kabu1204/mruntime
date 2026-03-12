@@ -59,6 +59,8 @@ class VkContext {
     // `out_host_ns` is in nanoseconds for the supported host time domains (CLOCK_MONOTONIC / CLOCK_MONOTONIC_RAW).
     bool calibrated_timestamps_sample(uint64_t* out_device_ticks, uint64_t* out_host_ns, uint64_t* out_max_dev_ns) const;
 
+    bool supports_cooperative_matrix() const noexcept { return cooperative_matrix_supported_; }
+
   private:
     void reset() noexcept;
 
@@ -79,6 +81,7 @@ class VkContext {
 
     float timestamp_period_ns_ = 0.0f;
     uint32_t timestamp_valid_bits_ = 0;
+    bool cooperative_matrix_supported_ = false;
 
     PFN_vkGetPhysicalDeviceCalibrateableTimeDomainsKHR get_time_domains_ = nullptr;
     PFN_vkGetCalibratedTimestampsKHR get_calibrated_timestamps_ = nullptr;
