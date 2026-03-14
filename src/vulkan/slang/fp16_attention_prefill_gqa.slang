@@ -122,6 +122,7 @@ void main(
                 shared_v[kv_index(row, col)] = half(0.0);
             }
         }
+        GroupMemoryBarrierWithGroupSync();
 
         [unroll]
         for (uint r = 0; r < ROWS_PER_THREAD; ++r) {
@@ -168,7 +169,7 @@ void main(
                 for (uint kv_row = 0; kv_row < BLOCK_N; ++kv_row) {
                     pv += qk[kv_row] * float(shared_v[kv_index(kv_row, dim)]);
                 }
-                acc[r][dim] += pv;
+                acc[r][dim] = acc[r][dim] * alpha + pv;
             }
 
             l_i[r] = l_i[r] * alpha + l_ij;
