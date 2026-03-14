@@ -680,7 +680,8 @@ void test_attention_prefill_gqa(
     uint32_t kv_stride
 ) {
     const std::string label =
-        "attention_prefill_gqa(qh=" + std::to_string(num_q_heads) +
+        "attention_prefill_gqa(qh=" +
+        std::to_string(num_q_heads) +
         ",kvh=" + std::to_string(num_kv_heads) +
         ",q_len=" + std::to_string(q_len) +
         ",d=" + std::to_string(head_dim) +
@@ -790,9 +791,9 @@ void run_all_tests() {
     test_attention_decode_gqa(tc, 4, 2, 8, 5, 9);
     test_attention_decode_gqa(tc, 4, 2, 32, 37, 64);
     test_attention_decode_gqa(tc, 14, 2, 64, 129, 256);
-    test_attention_prefill_gqa(tc, 4, 2, 5, 8, 5, 9);
-    test_attention_prefill_gqa(tc, 4, 2, 8, 32, 37, 64);
     test_attention_prefill_gqa(tc, 14, 2, 3, 64, 129, 256);
+    test_attention_prefill_gqa(tc, 8, 2, 17, 64, 33, 40);
+    test_attention_prefill_gqa(tc, 8, 2, 129, 64, 129, 256);
 }
 
 }  // namespace

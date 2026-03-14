@@ -61,6 +61,7 @@ struct KernelCreateInfo {
     uint32_t storage_buffer_count = 0;
     uint32_t push_constant_size = 0;
     uint32_t required_subgroup_size = 0;
+    bool require_full_subgroups = false;
 };
 
 struct VkKernel {
@@ -137,6 +138,7 @@ class VkKernelRuntime {
         uint32_t storage_buffer_count = 0;
         uint32_t push_constant_size = 0;
         uint32_t required_subgroup_size = 0;
+        bool require_full_subgroups = false;
 
         bool operator==(const PipelineCacheKey& other) const noexcept;
     };

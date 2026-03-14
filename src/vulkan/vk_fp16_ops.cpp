@@ -26,7 +26,8 @@ KernelCreateInfo make_kernel_create_info(
     size_t spirv_size,
     uint32_t storage_buffer_count,
     uint32_t push_constant_size,
-    uint32_t required_subgroup_size = 0
+    uint32_t required_subgroup_size = 0,
+    bool require_full_subgroups = false
 ) {
     KernelCreateInfo info;
     info.spirv = spirv;
@@ -34,10 +35,13 @@ KernelCreateInfo make_kernel_create_info(
     info.storage_buffer_count = storage_buffer_count;
     info.push_constant_size = push_constant_size;
     info.required_subgroup_size = required_subgroup_size;
+    info.require_full_subgroups = require_full_subgroups;
     return info;
 }
 
 constexpr uint32_t kPointwiseChunkWidth = 8;
+constexpr uint32_t kAttentionPrefillBlockM = 128;
+constexpr uint32_t kAttentionPrefillHeadDim = 64;
 
 void validate_runtime(VkKernelRuntime* runtime) {
     if (runtime == nullptr) {
@@ -101,7 +105,9 @@ VkFp16Ops VkFp16Ops::Create(VkKernelRuntime* runtime) {
             shaders::kFp16AttentionPrefillGqaSpv,
             shaders::kFp16AttentionPrefillGqaSpvSize,
             4,
-            6 * sizeof(uint32_t) + sizeof(float)));
+            7 * sizeof(uint32_t) + sizeof(float),
+            32,
+            true));
     ops.gemv_rows4_vec4_kernel_ = runtime->get_or_create_kernel(
         make_kernel_create_info(
             shaders::kFp16GemvRows4Vec4Spv,
@@ -581,8 +587,8 @@ void VkFp16Ops::attention_prefill_gqa(
     if ((num_q_heads % num_kv_heads) != 0u) {
         throw std::runtime_error("VkFp16Ops::attention_prefill_gqa: num_q_heads must be divisible by num_kv_heads");
     }
-    if (head_dim > 512u) {
-        throw std::runtime_error("VkFp16Ops::attention_prefill_gqa: head_dim must be <= 512");
+    if (head_dim != kAttentionPrefillHeadDim) {
+        throw std::runtime_error("VkFp16Ops::attention_prefill_gqa: head_dim must be 64");
     }
 
     const VkDescriptorBufferInfo buffers[4] = {q, k, v, out};
@@ -591,17 +597,28 @@ void VkFp16Ops::attention_prefill_gqa(
         uint32_t num_kv_heads;
         uint32_t q_len;
         uint32_t kv_len;
+        uint32_t num_kv_groups;
         uint32_t kv_stride;
         uint32_t head_dim;
         float scale;
-    } push_constants = {num_q_heads, num_kv_heads, q_len, kv_len, kv_stride, head_dim, scale};
+    } push_constants = {
+        num_q_heads,
+        num_kv_heads,
+        q_len,
+        kv_len,
+        num_q_heads / num_kv_heads,
+        kv_stride,
+        head_dim,
+        scale,
+    };
+    const uint32_t q_block_count = (q_len + kAttentionPrefillBlockM - 1u) / kAttentionPrefillBlockM;
 
     runtime_->dispatch_2d(
         attention_prefill_gqa_kernel_,
         buffers,
         4,
         num_q_heads,
-        q_len,
+        q_block_count,
         1,
         1,
         &push_constants,

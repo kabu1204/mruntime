@@ -10,8 +10,8 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 option(MRUNTIME_BUILD_TESTS "Build unit tests" ON)
 option(MRUNTIME_BUILD_BENCH "Build benchmarks" ON)
 option(MRUNTIME_BUILD_CLI "Build CLI tools" ON)
-option(MRUNTIME_ENABLE_VULKAN "Enable Vulkan backend (experimental)" OFF)
-option(MRUNTIME_ENABLE_VULKAN_SLANG "Use Slang instead of GLSL for Vulkan shaders (experimental)" OFF)
+option(MRUNTIME_ENABLE_VULKAN "Enable Vulkan backend (experimental)" ON)
+option(MRUNTIME_ENABLE_VULKAN_SLANG "Use Slang instead of GLSL for Vulkan shaders (experimental)" ON)
 
 include(FetchContent)
 
@@ -285,9 +285,11 @@ if(MRUNTIME_ENABLE_VULKAN)
         "${CMAKE_SOURCE_DIR}/src/vulkan/slang/fp16_attention_decode_gqa.slang"
         kFp16AttentionDecodeGqaSpv
     )
-    mruntime_add_vulkan_shader_variant(
+    if(NOT MRUNTIME_ENABLE_VULKAN_SLANG)
+        message(FATAL_ERROR "fp16_attention_prefill_gqa requires MRUNTIME_ENABLE_VULKAN_SLANG=ON; the legacy GLSL path has been removed.")
+    endif()
+    mruntime_add_vulkan_slang_shader(
         fp16_attention_prefill_gqa
-        "${CMAKE_SOURCE_DIR}/src/vulkan/glsl/fp16_attention_prefill_gqa.comp"
         "${CMAKE_SOURCE_DIR}/src/vulkan/slang/fp16_attention_prefill_gqa.slang"
         kFp16AttentionPrefillGqaSpv
     )

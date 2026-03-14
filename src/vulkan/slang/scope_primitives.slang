@@ -392,9 +392,19 @@ public struct Thread
 
 public struct Subgroup
 {
+    public static uint lane_id()
+    {
+        return WaveGetLaneIndex();
+    }
+
+    public static uint lane_count()
+    {
+        return WaveGetLaneCount();
+    }
+
     public static bool is_leader()
     {
-        return WaveGetLaneIndex() == 0u;
+        return lane_id() == 0u;
     }
 
     public static float reduce_sum(float value)
@@ -414,6 +424,11 @@ public struct Subgroup
             WaveActiveSum(value.y),
             WaveActiveSum(value.z),
             WaveActiveSum(value.w));
+    }
+
+    public static float read_lane(float value, uint lane)
+    {
+        return WaveReadLaneAt(value, lane);
     }
 
     public static void mma<

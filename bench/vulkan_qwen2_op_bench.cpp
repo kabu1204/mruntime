@@ -74,7 +74,7 @@ struct RunMetrics {
 struct CaseResult {
     std::string label;
     std::string stage;
-    std::string dispatch_shape;
+    std::string dispatch_label;
     size_t estimated_calls = 0;
     RunMetrics metrics;
 
@@ -92,7 +92,7 @@ using RunFn = std::function<RunMetrics(BenchContext&, const mruntime::QwenConfig
 struct CaseSpec {
     std::string label;
     std::string stage;
-    std::string dispatch_shape;
+    std::string dispatch_label;
     size_t estimated_calls = 0;
     RunFn run;
 };
@@ -1046,7 +1046,7 @@ auto stage_sort_key(const std::string& stage) -> int {
 auto print_results(const std::vector<CaseResult>& results) -> void {
     constexpr int kStageWidth = 18;
     constexpr int kOpWidth = 28;
-    constexpr int kShapeWidth = 14;
+    constexpr int kDispatchWidth = 14;
     constexpr int kCallsWidth = 12;
     constexpr int kMetricWidth = 12;
     constexpr int kEstimateWidth = 14;
@@ -1055,7 +1055,7 @@ auto print_results(const std::vector<CaseResult>& results) -> void {
     std::cout << "\n=== Vulkan Qwen2 Op Bench ===\n";
     std::cout << std::setw(kStageWidth) << "stage"
               << std::setw(kOpWidth) << "op"
-              << std::setw(kShapeWidth) << "shape"
+              << std::setw(kDispatchWidth) << "dispatch"
               << std::setw(kCallsWidth) << "calls"
               << std::setw(kMetricWidth) << "gpu_ms"
               << std::setw(kMetricWidth) << "wait_ms"
@@ -1067,7 +1067,7 @@ auto print_results(const std::vector<CaseResult>& results) -> void {
     for (const auto& result : results) {
         std::cout << std::setw(kStageWidth) << result.stage
                   << std::setw(kOpWidth) << result.label
-                  << std::setw(kShapeWidth) << result.dispatch_shape
+                  << std::setw(kDispatchWidth) << result.dispatch_label
                   << std::setw(kCallsWidth) << result.estimated_calls
                   << std::setw(kMetricWidth) << result.metrics.kernel_ms
                   << std::setw(kMetricWidth) << result.metrics.wait_ms
@@ -1106,7 +1106,7 @@ int main(int argc, char** argv) {
             CaseResult result;
             result.label = spec.label;
             result.stage = spec.stage;
-            result.dispatch_shape = spec.dispatch_shape;
+            result.dispatch_label = spec.dispatch_label;
             result.estimated_calls = spec.estimated_calls;
             result.metrics = spec.run(bc, cfg, args);
             results.push_back(std::move(result));

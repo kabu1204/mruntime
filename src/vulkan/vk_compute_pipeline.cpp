@@ -87,6 +87,9 @@ VkComputePipeline VkComputePipeline::Create(VkDevice device, const ComputePipeli
     stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
     stage.module = shader;
     stage.pName = "main";
+    if (info.require_full_subgroups) {
+        stage.flags |= VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT;
+    }
 
     VkPipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup_size_info = {};
     if (info.required_subgroup_size != 0) {

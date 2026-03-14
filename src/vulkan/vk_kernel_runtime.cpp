@@ -237,6 +237,7 @@ VkKernel VkKernelRuntime::get_or_create_kernel(const KernelCreateInfo& info) {
     key.storage_buffer_count = info.storage_buffer_count;
     key.push_constant_size = info.push_constant_size;
     key.required_subgroup_size = info.required_subgroup_size;
+    key.require_full_subgroups = info.require_full_subgroups;
 
     auto it = pipeline_cache_.find(key);
     if (it == pipeline_cache_.end()) {
@@ -247,6 +248,7 @@ VkKernel VkKernelRuntime::get_or_create_kernel(const KernelCreateInfo& info) {
         create_info.push_constant_size = key.push_constant_size;
         create_info.pipeline_cache = context_->pipeline_cache();
         create_info.required_subgroup_size = key.required_subgroup_size;
+        create_info.require_full_subgroups = key.require_full_subgroups;
 
         auto pipeline = std::make_unique<VkComputePipeline>(VkComputePipeline::Create(context_->device(), create_info));
         it = pipeline_cache_.emplace(std::move(key), std::move(pipeline)).first;
@@ -680,6 +682,7 @@ bool VkKernelRuntime::PipelineCacheKey::operator==(const PipelineCacheKey& other
     return storage_buffer_count == other.storage_buffer_count &&
            push_constant_size == other.push_constant_size &&
            required_subgroup_size == other.required_subgroup_size &&
+           require_full_subgroups == other.require_full_subgroups &&
            spirv == other.spirv;
 }
 
@@ -688,6 +691,7 @@ size_t VkKernelRuntime::PipelineCacheKeyHash::operator()(const PipelineCacheKey&
     hash ^= static_cast<size_t>(key.storage_buffer_count) + 0x9e3779b97f4a7c15ull + (hash << 6) + (hash >> 2);
     hash ^= static_cast<size_t>(key.push_constant_size) + 0x9e3779b97f4a7c15ull + (hash << 6) + (hash >> 2);
     hash ^= static_cast<size_t>(key.required_subgroup_size) + 0x9e3779b97f4a7c15ull + (hash << 6) + (hash >> 2);
+    hash ^= static_cast<size_t>(key.require_full_subgroups) + 0x9e3779b97f4a7c15ull + (hash << 6) + (hash >> 2);
     return hash;
 }
 
