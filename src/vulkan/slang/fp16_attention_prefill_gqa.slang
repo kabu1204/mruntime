@@ -37,13 +37,14 @@ StructuredBuffer<half> v_data;
 [vk::binding(3, 0)]
 RWStructuredBuffer<half> o_data;
 
-groupshared half shared_q[BLOCK_M * HEAD_DIM];
+static const int Q_STRIDE = HEAD_DIM + 1;
+groupshared half shared_q[BLOCK_M * Q_STRIDE];
 groupshared half shared_k[BLOCK_N * HEAD_DIM];
 groupshared half shared_v[BLOCK_N * HEAD_DIM];
 
 uint q_index(uint row, uint dim)
 {
-    return row * uint(HEAD_DIM) + dim;
+    return row * uint(Q_STRIDE) + dim;
 }
 
 uint kv_index(uint row, uint dim)
@@ -104,8 +105,11 @@ void main(
         }
     }
 
+    const uint q_end = min(q_start + uint(BLOCK_M), pc.seqlen_q);
+    const uint kv_end = min(pc.seqlen_kv, cached_kv_len + q_end);
     [loop]
-    for (uint kv_start = 0; kv_start < pc.seqlen_kv; kv_start += uint(BLOCK_N)) {
+    for (uint kv_start = 0; kv_start < kv_end; kv_start += uint(BLOCK_N)) {
+        [unroll]
         for (uint idx = tid; idx < uint(BLOCK_N) * HEAD_DIM; idx += uint(WG_SIZE)) {
             const uint row = idx / HEAD_DIM;
             const uint col = idx % HEAD_DIM;
@@ -118,7 +122,6 @@ void main(
                 shared_v[kv_index(row, col)] = half(0.0);
             }
         }
-        GroupMemoryBarrierWithGroupSync();
 
         [unroll]
         for (uint r = 0; r < ROWS_PER_THREAD; ++r) {
@@ -130,12 +133,6 @@ void main(
             }
 
             float qk[BLOCK_N];
-            float p[BLOCK_N];
-            float acc_o[HEAD_DIM];
-            [unroll]
-            for (uint dim = 0; dim < HEAD_DIM; ++dim) {
-                acc_o[dim] = 0.0;
-            }
 
             float block_max = NEG_INF;
             [unroll]
@@ -145,7 +142,7 @@ void main(
                     score = 0.0;
                     [unroll]
                     for (uint dim = 0; dim < HEAD_DIM; ++dim) {
-                        score += float(shared_q[q_index(row_local, dim)]) * float(shared_k[kv_index(kv_row, dim)]);
+                        score += float(shared_q[q_index(row_local, dim)] * shared_k[kv_index(kv_row, dim)]);
                     }
                     score *= pc.scale;
                 }
@@ -160,7 +157,7 @@ void main(
             [unroll]
             for (uint kv_row = 0; kv_row < BLOCK_N; ++kv_row) {
                 const float weight = exp(qk[kv_row] - m_ij);
-                p[kv_row] = weight;
+                qk[kv_row] = weight;
                 l_ij += weight;
             }
 
@@ -169,15 +166,11 @@ void main(
                 float pv = 0.0;
                 [unroll]
                 for (uint kv_row = 0; kv_row < BLOCK_N; ++kv_row) {
-                    pv += p[kv_row] * float(shared_v[kv_index(kv_row, dim)]);
+                    pv += qk[kv_row] * float(shared_v[kv_index(kv_row, dim)]);
                 }
-                acc_o[dim] = pv;
+                acc[r][dim] += pv;
             }
 
-            [unroll]
-            for (uint dim = 0; dim < HEAD_DIM; ++dim) {
-                acc[r][dim] = acc[r][dim] * alpha + acc_o[dim];
-            }
             l_i[r] = l_i[r] * alpha + l_ij;
             m_i[r] = m_ij;
         }
