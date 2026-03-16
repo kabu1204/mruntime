@@ -592,12 +592,21 @@ void test_attention_decode_gqa(
     const VkDeviceSize q_bytes = q_count * sizeof(uint16_t);
     const VkDeviceSize kv_bytes = kv_count * sizeof(uint16_t);
     const VkDeviceSize out_bytes = out_count * sizeof(uint16_t);
+    const VkDeviceSize partial_out_bytes =
+        static_cast<VkDeviceSize>(mruntime::vulkan::VkFp16Ops::kAttentionDecodeMaxSplitK) * out_bytes;
+    const VkDeviceSize partial_stats_bytes =
+        static_cast<VkDeviceSize>(mruntime::vulkan::VkFp16Ops::kAttentionDecodeMaxSplitK) *
+        num_q_heads * 2u * sizeof(float);
 
-    auto arena = make_arena(tc, q_bytes + 2 * kv_bytes + out_bytes + 4 * tc.alignment);
+    auto arena = make_arena(
+        tc,
+        q_bytes + 2 * kv_bytes + partial_out_bytes + partial_stats_bytes + out_bytes + 6 * tc.alignment);
 
     const VkDeviceSize q_offset = arena.alloc(q_bytes);
     const VkDeviceSize k_offset = arena.alloc(kv_bytes);
     const VkDeviceSize v_offset = arena.alloc(kv_bytes);
+    const VkDeviceSize partial_out_offset = arena.alloc(partial_out_bytes);
+    const VkDeviceSize partial_stats_offset = arena.alloc(partial_stats_bytes);
     const VkDeviceSize out_offset = arena.alloc(out_bytes);
 
     uint16_t* q_data = arena.host_ptr<uint16_t>(q_offset);
@@ -658,6 +667,8 @@ void test_attention_decode_gqa(
         arena.descriptor(q_offset, q_bytes),
         arena.descriptor(k_offset, kv_bytes),
         arena.descriptor(v_offset, kv_bytes),
+        arena.descriptor(partial_out_offset, partial_out_bytes),
+        arena.descriptor(partial_stats_offset, partial_stats_bytes),
         arena.descriptor(out_offset, out_bytes),
         num_q_heads,
         num_kv_heads,
@@ -788,8 +799,8 @@ void run_all_tests() {
     test_rope(tc);
     test_transpose(tc);
     test_kv_cache_copy(tc);
-    test_attention_decode_gqa(tc, 4, 2, 8, 5, 9);
-    test_attention_decode_gqa(tc, 4, 2, 32, 37, 64);
+    test_attention_decode_gqa(tc, 4, 2, 64, 5, 16);
+    test_attention_decode_gqa(tc, 4, 2, 64, 37, 64);
     test_attention_decode_gqa(tc, 14, 2, 64, 129, 256);
     test_attention_prefill_gqa(tc, 14, 2, 3, 64, 129, 256);
     test_attention_prefill_gqa(tc, 8, 2, 17, 64, 33, 40);

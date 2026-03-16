@@ -1,0 +1,136 @@
+#version 460
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// Split-K resolve kernel for decode attention, specialized for head_dim=64.
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(scalar, set = 0, binding = 0, std430) readonly buffer PartialOBuffer {
+    float16_t partial_o[];
+} partial_o_buf;
+
+layout(scalar, set = 0, binding = 1, std430) readonly buffer PartialStatsBuffer {
+    float partial_stats[];
+} partial_stats_buf;
+
+layout(scalar, set = 0, binding = 2, std430) writeonly buffer OBuffer {
+    float16_t o[];
+} o_buf;
+
+layout(push_constant) uniform PushConstants {
+    uint num_q_heads;
+    uint k_num;
+} pc;
+
+const uint WG_SIZE = 128u;
+const uint MAX_SPLIT_K = 4u;
+const uint HEAD_DIM = 64u;
+const uint NUM_SUBGROUPS = WG_SIZE / 32u;
+const float NEG_INF = -3.402823466e38;
+
+shared float split_weights[MAX_SPLIT_K];
+shared float subgroup_reduce[NUM_SUBGROUPS];
+shared float shared_scalar;
+
+uint q_offset(uint q_head, uint dim) {
+    return q_head * HEAD_DIM + dim;
+}
+
+uint partial_o_offset(uint split_idx, uint q_head, uint dim) {
+    return (split_idx * pc.num_q_heads + q_head) * HEAD_DIM + dim;
+}
+
+uint partial_stats_offset(uint split_idx, uint q_head, uint slot) {
+    return ((split_idx * pc.num_q_heads + q_head) * 2u) + slot;
+}
+
+float reduce_workgroup_max(float local_value, uint tid) {
+    const float wave_value = subgroupMax(local_value);
+    if (gl_NumSubgroups == 1u) {
+        return (gl_SubgroupInvocationID == 0u) ? wave_value : NEG_INF;
+    }
+
+    if (gl_SubgroupInvocationID == 0u) {
+        subgroup_reduce[gl_SubgroupID] = wave_value;
+    }
+    barrier();
+
+    if (tid != 0u) {
+        return NEG_INF;
+    }
+    float total = subgroup_reduce[0];
+    for (uint s = 1u; s < gl_NumSubgroups; ++s) {
+        total = max(total, subgroup_reduce[s]);
+    }
+    return total;
+}
+
+float reduce_workgroup_sum(float local_value, uint tid) {
+    const float wave_value = subgroupAdd(local_value);
+    if (gl_NumSubgroups == 1u) {
+        return (gl_SubgroupInvocationID == 0u) ? wave_value : 0.0;
+    }
+
+    if (gl_SubgroupInvocationID == 0u) {
+        subgroup_reduce[gl_SubgroupID] = wave_value;
+    }
+    barrier();
+
+    if (tid != 0u) {
+        return 0.0;
+    }
+    float total = 0.0;
+    for (uint s = 0u; s < gl_NumSubgroups; ++s) {
+        total += subgroup_reduce[s];
+    }
+    return total;
+}
+
+float broadcast_scalar(float value, uint tid) {
+    if (tid == 0u) {
+        shared_scalar = value;
+    }
+    barrier();
+    return shared_scalar;
+}
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint q_head = gl_WorkGroupID.x;
+    if (q_head >= pc.num_q_heads) {
+        return;
+    }
+    if (pc.k_num == 0u || pc.k_num > MAX_SPLIT_K) {
+        return;
+    }
+
+    const float local_max = (tid < pc.k_num)
+        ? partial_stats_buf.partial_stats[partial_stats_offset(tid, q_head, 1u)]
+        : NEG_INF;
+    const float merged_max = broadcast_scalar(reduce_workgroup_max(local_max, tid), tid);
+
+    float local_weight = 0.0;
+    if (tid < pc.k_num) {
+        const float norm = partial_stats_buf.partial_stats[partial_stats_offset(tid, q_head, 0u)];
+        const float part_max = partial_stats_buf.partial_stats[partial_stats_offset(tid, q_head, 1u)];
+        local_weight = norm * exp(part_max - merged_max);
+        split_weights[tid] = local_weight;
+    }
+    barrier();
+
+    const float merged_norm = broadcast_scalar(reduce_workgroup_sum(local_weight, tid), tid);
+    const float inv_norm = (merged_norm > 0.0) ? (1.0 / merged_norm) : 0.0;
+
+    if (tid < HEAD_DIM) {
+        float acc = 0.0;
+        for (uint split_idx = 0u; split_idx < pc.k_num; ++split_idx) {
+            acc += split_weights[split_idx] * float(partial_o_buf.partial_o[partial_o_offset(split_idx, q_head, tid)]);
+        }
+        o_buf.o[q_offset(q_head, tid)] = float16_t(acc * inv_norm);
+    }
+}

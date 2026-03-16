@@ -4,6 +4,7 @@
 
 #include "fp16_add_spv.h"
 #include "fp16_attention_decode_gqa_spv.h"
+#include "fp16_attention_decode_resolve_spv.h"
 #include "fp16_attention_prefill_gqa_spv.h"
 #include "fp16_gemm_spv.h"
 #include "fp16_gemm_prefill_wide_spv.h"
@@ -42,11 +43,22 @@ KernelCreateInfo make_kernel_create_info(
 constexpr uint32_t kPointwiseChunkWidth = 8;
 constexpr uint32_t kAttentionPrefillBlockM = 128;
 constexpr uint32_t kAttentionPrefillHeadDim = 64;
+constexpr uint32_t kAttentionDecodeRequiredSubgroupSize = 32;
 
 void validate_runtime(VkKernelRuntime* runtime) {
     if (runtime == nullptr) {
         throw std::runtime_error("VkFp16Ops::Create: runtime is null");
     }
+}
+
+uint32_t choose_attention_decode_split_count(uint32_t kv_len) {
+    if (kv_len <= 256u) {
+        return 1u;
+    }
+    if (kv_len <= 2048u) {
+        return 2u;
+    }
+    return VkFp16Ops::kAttentionDecodeMaxSplitK;
 }
 
 }  // namespace
@@ -98,16 +110,22 @@ VkFp16Ops VkFp16Ops::Create(VkKernelRuntime* runtime) {
         make_kernel_create_info(
             shaders::kFp16AttentionDecodeGqaSpv,
             shaders::kFp16AttentionDecodeGqaSpvSize,
-            4,
-            5 * sizeof(uint32_t) + sizeof(float)));
+            6,
+            6 * sizeof(uint32_t) + sizeof(float),
+            kAttentionDecodeRequiredSubgroupSize,
+            true));
+    ops.attention_decode_resolve_kernel_ = runtime->get_or_create_kernel(
+        make_kernel_create_info(
+            shaders::kFp16AttentionDecodeResolveSpv,
+            shaders::kFp16AttentionDecodeResolveSpvSize,
+            3,
+            2 * sizeof(uint32_t)));
     ops.attention_prefill_gqa_kernel_ = runtime->get_or_create_kernel(
         make_kernel_create_info(
             shaders::kFp16AttentionPrefillGqaSpv,
             shaders::kFp16AttentionPrefillGqaSpvSize,
             4,
-            7 * sizeof(uint32_t) + sizeof(float),
-            32,
-            true));
+            7 * sizeof(uint32_t) + sizeof(float)));
     ops.gemv_rows4_vec4_kernel_ = runtime->get_or_create_kernel(
         make_kernel_create_info(
             shaders::kFp16GemvRows4Vec4Spv,
@@ -509,6 +527,8 @@ void VkFp16Ops::attention_decode_gqa(
     const VkDescriptorBufferInfo& q,
     const VkDescriptorBufferInfo& k,
     const VkDescriptorBufferInfo& v,
+    const VkDescriptorBufferInfo& partial_out,
+    const VkDescriptorBufferInfo& partial_stats,
     const VkDescriptorBufferInfo& out,
     uint32_t num_q_heads,
     uint32_t num_kv_heads,
@@ -530,25 +550,34 @@ void VkFp16Ops::attention_decode_gqa(
     if ((num_q_heads % num_kv_heads) != 0u) {
         throw std::runtime_error("VkFp16Ops::attention_decode_gqa: num_q_heads must be divisible by num_kv_heads");
     }
-    if (head_dim > 512u) {
-        throw std::runtime_error("VkFp16Ops::attention_decode_gqa: head_dim must be <= 512");
+    if (head_dim != kAttentionDecodeHeadDim) {
+        throw std::runtime_error("VkFp16Ops::attention_decode_gqa: head_dim must be 64");
+    }
+    if (partial_out.buffer == VK_NULL_HANDLE) {
+        throw std::runtime_error("VkFp16Ops::attention_decode_gqa: partial_out buffer is null");
+    }
+    if (partial_stats.buffer == VK_NULL_HANDLE) {
+        throw std::runtime_error("VkFp16Ops::attention_decode_gqa: partial_stats buffer is null");
     }
 
-    const VkDescriptorBufferInfo buffers[4] = {q, k, v, out};
+    const uint32_t k_num = choose_attention_decode_split_count(kv_len);
+    const uint32_t split_kv = (kv_len + k_num - 1u) / k_num;
+    const VkDescriptorBufferInfo buffers[6] = {q, k, v, partial_out, partial_stats, out};
     struct {
         uint32_t num_q_heads;
         uint32_t num_kv_heads;
         uint32_t kv_len;
         uint32_t kv_stride;
-        uint32_t head_dim;
         float scale;
-    } push_constants = {num_q_heads, num_kv_heads, kv_len, kv_stride, head_dim, scale};
+        uint32_t k_num;
+        uint32_t split_kv;
+    } push_constants = {num_q_heads, num_kv_heads, kv_len, kv_stride, scale, k_num, split_kv};
 
     runtime_->dispatch_1d(
         attention_decode_gqa_kernel_,
         buffers,
-        4,
-        num_q_heads * kAttentionGqaLocalSizeX,
+        6,
+        num_q_heads * k_num * kAttentionGqaLocalSizeX,
         kAttentionGqaLocalSizeX,
         &push_constants,
         sizeof(push_constants),
@@ -556,6 +585,27 @@ void VkFp16Ops::attention_decode_gqa(
         VK_NULL_HANDLE,
         batch
     );
+
+    if (k_num > 1u) {
+        const VkDescriptorBufferInfo resolve_buffers[3] = {partial_out, partial_stats, out};
+        struct {
+            uint32_t num_q_heads;
+            uint32_t k_num;
+        } resolve_push_constants = {num_q_heads, k_num};
+
+        runtime_->dispatch_1d(
+            attention_decode_resolve_kernel_,
+            resolve_buffers,
+            3,
+            num_q_heads * kAttentionResolveLocalSizeX,
+            kAttentionResolveLocalSizeX,
+            &resolve_push_constants,
+            sizeof(resolve_push_constants),
+            -1,
+            VK_NULL_HANDLE,
+            batch
+        );
+    }
 }
 
 void VkFp16Ops::attention_prefill_gqa(

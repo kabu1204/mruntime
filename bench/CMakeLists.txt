@@ -35,6 +35,9 @@ if(MRUNTIME_ENABLE_VULKAN)
     mruntime_add_vulkan_bench(vulkan_qwen2_op_bench vulkan_qwen2_op_bench.cpp)
     add_dependencies(vulkan_qwen2_op_bench mruntime_vulkan_shaders)
 
+    mruntime_add_vulkan_bench(vulkan_decode_attention_bench vulkan_decode_attention_bench.cpp)
+    add_dependencies(vulkan_decode_attention_bench mruntime_vulkan_shaders)
+
     mruntime_add_vulkan_bench(vulkan_prefill_attention_bench vulkan_prefill_attention_bench.cpp)
     add_dependencies(vulkan_prefill_attention_bench mruntime_vulkan_shaders)
 endif()

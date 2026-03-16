@@ -173,7 +173,7 @@ if(MRUNTIME_ENABLE_VULKAN)
             OUTPUT "${shader_spv}"
             COMMAND "${MRUNTIME_SLANGC_EXECUTABLE}"
                 -target spirv
-                -profile glsl_460+spirv_1_6+spvGroupNonUniformBallot+spvGroupNonUniformArithmetic
+                -profile glsl_460+spirv_1_6+spvGroupNonUniformBallot+spvGroupNonUniformArithmetic+spvGroupNonUniformShuffle
                 -entry main
                 -stage compute
                 -fvk-use-scalar-layout
@@ -284,6 +284,12 @@ if(MRUNTIME_ENABLE_VULKAN)
         "${CMAKE_SOURCE_DIR}/src/vulkan/glsl/fp16_attention_decode_gqa.comp"
         "${CMAKE_SOURCE_DIR}/src/vulkan/slang/fp16_attention_decode_gqa.slang"
         kFp16AttentionDecodeGqaSpv
+    )
+    mruntime_add_vulkan_shader_variant(
+        fp16_attention_decode_resolve
+        "${CMAKE_SOURCE_DIR}/src/vulkan/glsl/fp16_attention_decode_resolve.comp"
+        "${CMAKE_SOURCE_DIR}/src/vulkan/slang/fp16_attention_decode_resolve.slang"
+        kFp16AttentionDecodeResolveSpv
     )
     if(NOT MRUNTIME_ENABLE_VULKAN_SLANG)
         message(FATAL_ERROR "fp16_attention_prefill_gqa requires MRUNTIME_ENABLE_VULKAN_SLANG=ON; the legacy GLSL path has been removed.")

@@ -18,6 +18,60 @@
 
 namespace mruntime {
 
+namespace {
+
+void qwen2_gemv_decode_fp16(
+    const uint16_t* A,
+    const uint16_t* B,
+    uint16_t* C,
+    size_t N,
+    size_t K,
+    PThreadPool* pool
+) {
+    auto row_worker = [&](size_t n) {
+        float acc = 0.0f;
+#if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+        assert(K <= static_cast<size_t>(std::numeric_limits<int>::max()));
+        ::vec_dot_f16(
+            static_cast<int>(K),
+            &acc,
+            sizeof(uint16_t),
+            const_cast<uint16_t*>(A),
+            sizeof(uint16_t),
+            const_cast<uint16_t*>(B + n * K),
+            sizeof(uint16_t),
+            1
+        );
+#else
+        for (size_t k = 0; k < K; ++k) {
+            acc += fp16_bits_to_float(A[k]) * fp16_bits_to_float(B[n * K + k]);
+        }
+#endif
+        C[n] = float_to_fp16_bits(acc);
+    };
+
+    if (pool == nullptr || pool->threads_count() <= 1 || N <= 1) {
+        for (size_t n = 0; n < N; ++n) {
+            row_worker(n);
+        }
+        return;
+    }
+
+    const size_t target_tasks = std::min(N, pool->threads_count() * 4);
+    const size_t rows_per_task = (N + target_tasks - 1) / target_tasks;
+    const size_t task_count = (N + rows_per_task - 1) / rows_per_task;
+    auto task_worker = [&](size_t task_id) {
+        const size_t row_begin = task_id * rows_per_task;
+        const size_t row_end = std::min(N, row_begin + rows_per_task);
+        for (size_t n = row_begin; n < row_end; ++n) {
+            row_worker(n);
+        }
+    };
+    pool->parallelize_1d(task_count, task_worker);
+}
+
+}  // namespace
+
 void fp16_bits_to_fp32(const uint16_t* src, float* dst, size_t n) {
 #if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
     ::fp16_bits_to_fp32_neon(src, dst, n);
@@ -85,6 +139,13 @@ void qwen2_gemm_fp16(
     const uint16_t* packed_B,
     PThreadPool* pool
 ) {
+    if (M == 0 || N == 0) return;
+
+    // if (M == 1 && B != nullptr) {
+    //     qwen2_gemv_decode_fp16(A, B, C, N, K, pool);
+    //     return;
+    // }
+
     // if (pool == nullptr && qwen2_has_kai_fp16() && packed_B != nullptr) {
     //     kai_matmul_fp16_packed_rhs(
     //         M, N, K,
@@ -160,8 +221,6 @@ void qwen2_gemm_fp16(
     }
 
     // Scalar fallback (no KleidiAI)
-    if (M == 0 || N == 0) return;
-
     constexpr size_t tile_n = 128;
     const size_t n_tiles = (N + tile_n - 1) / tile_n;
     const size_t task_count = M * n_tiles;

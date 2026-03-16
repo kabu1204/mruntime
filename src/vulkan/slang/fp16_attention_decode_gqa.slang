@@ -1,17 +1,20 @@
-// Decode-only FP16 GQA attention.
-// Q: [1, num_q_heads, 1, head_dim] BHSD FP16
-// K: [1, num_kv_heads, kv_stride, head_dim] BHSD FP16
-// V: [1, num_kv_heads, kv_stride, head_dim] BHSD FP16
-// O: [1, num_q_heads, 1, head_dim] BHSD FP16
-
-import layout_traits;
-import scope_primitives;
-import storage_traits;
-import tile_views;
+// Decode-only FP16 GQA attention, specialized for head_dim=64.
+// Q: [1, num_q_heads, 1, 64] BHSD FP16
+// K: [1, num_kv_heads, kv_stride, 64] BHSD FP16
+// V: [1, num_kv_heads, kv_stride, 64] BHSD FP16
+// O: [1, num_q_heads, 1, 64] BHSD FP16
+//
+// FP16 intermediate path: accumulators, Q staging, scores all in half.
+// Only running_max/running_norm kept in float for softmax stability.
 
 static const int WG_SIZE = 128;
-static const int SCORE_TILE = 32;
-static const int MAX_HEAD_DIM = 512;
+static const int BLOCK_N = 32;
+static const int D_SPLIT = 4;
+static const int HEAD_DIM = 64;
+static const int HEAD_DIM_V4 = HEAD_DIM / 4;        // 16
+static const int KV_STRIDE = HEAD_DIM_V4 + 1;       // 17, +1 for bank-conflict avoidance
+static const int OUT_VECS = HEAD_DIM_V4 / D_SPLIT;  // 4
+static const int NUM_SUBGROUPS = 4;                  // WG_SIZE / subgroup_size(32)
 static const float NEG_INF = -3.402823466e38;
 
 struct PushConstants {
@@ -19,78 +22,110 @@ struct PushConstants {
     uint num_kv_heads;
     uint kv_len;
     uint kv_stride;
-    uint head_dim;
     float scale;
+    uint k_num;
+    uint split_kv;
 };
 
 [push_constant]
 ConstantBuffer<PushConstants> pc;
 
-[vk::binding(0, 0)]
-ByteAddressBuffer q_data;
+[vk::binding(0, 0)] StructuredBuffer<half> q_data;
+[vk::binding(1, 0)] StructuredBuffer<half> k_data;
+[vk::binding(2, 0)] StructuredBuffer<half> v_data;
+[vk::binding(3, 0)] RWStructuredBuffer<half> partial_o_data;
+[vk::binding(4, 0)] RWStructuredBuffer<float> partial_stats_data;
+[vk::binding(5, 0)] RWStructuredBuffer<half> o_data;
 
-[vk::binding(1, 0)]
-ByteAddressBuffer k_data;
+// --- Shared memory ---
+// Q row pre-scaled to half4 (no padding needed — all threads broadcast-read same index)
+groupshared half4 shared_q[HEAD_DIM_V4];
+// K/V tile with +1 stride padding for bank-conflict avoidance
+groupshared half4 shared_kv[BLOCK_N * KV_STRIDE];
+// Per-column attention scores (float for exp/softmax precision)
+groupshared float shared_scores[BLOCK_N];
+// Cross-subgroup reduction scratch (only NUM_SUBGROUPS entries)
+groupshared float subgroup_reduce[NUM_SUBGROUPS];
+// Scalar broadcast
+groupshared float shared_scalar;
 
-[vk::binding(2, 0)]
-ByteAddressBuffer v_data;
-
-[vk::binding(3, 0)]
-RWStructuredBuffer<half> o_data;
-
-groupshared float shared_q[MAX_HEAD_DIM];
-groupshared float score_tile[SCORE_TILE];
-groupshared float subgroup_reduce[WG_SIZE];
-
-public struct SharedQueryStorage : IFloatStorage1D
+uint q_offset(uint q_head, uint dim)
 {
-    public static const uint kExtent = MAX_HEAD_DIM;
-    public static const StorageScope kScope = StorageScope::Workgroup;
-    public static const bool kBarrierSafe = true;
-
-    public static void store(uint index, float value)
-    {
-        shared_q[index] = value;
-    }
-
-    public static float load(uint index)
-    {
-        return shared_q[index];
-    }
+    return q_head * uint(HEAD_DIM) + dim;
 }
 
-public struct SharedScoreTileStorage : IFloatStorage1D
+uint kv_offset(uint kv_head, uint kv_seq, uint dim)
 {
-    public static const uint kExtent = SCORE_TILE;
-    public static const StorageScope kScope = StorageScope::Workgroup;
-    public static const bool kBarrierSafe = true;
-
-    public static void store(uint index, float value)
-    {
-        score_tile[index] = value;
-    }
-
-    public static float load(uint index)
-    {
-        return score_tile[index];
-    }
+    return (kv_head * pc.kv_stride + kv_seq) * uint(HEAD_DIM) + dim;
 }
 
-public struct SharedScalarStorage : IFloatStorage1D
+uint partial_o_offset(uint split_idx, uint q_head, uint dim)
 {
-    public static const uint kExtent = WG_SIZE;
-    public static const StorageScope kScope = StorageScope::Workgroup;
-    public static const bool kBarrierSafe = true;
+    return (split_idx * pc.num_q_heads + q_head) * uint(HEAD_DIM) + dim;
+}
 
-    public static void store(uint index, float value)
-    {
-        subgroup_reduce[index] = value;
+uint partial_stats_offset(uint split_idx, uint q_head, uint slot)
+{
+    return ((split_idx * pc.num_q_heads + q_head) * 2u) + slot;
+}
+
+// Workgroup-wide max using subgroup intrinsics + shared memory.
+float reduce_workgroup_max(float local_value, uint tid)
+{
+    const float wave_max = WaveActiveMax(local_value);
+    if (WaveGetLaneCount() == uint(WG_SIZE)) {
+        return (tid == 0u) ? wave_max : NEG_INF;
     }
 
-    public static float load(uint index)
-    {
-        return subgroup_reduce[index];
+    const uint sg_id = tid / WaveGetLaneCount();
+    if (WaveGetLaneIndex() == 0u) {
+        subgroup_reduce[sg_id] = wave_max;
     }
+    GroupMemoryBarrierWithGroupSync();
+
+    if (tid != 0u) {
+        return NEG_INF;
+    }
+    float total = subgroup_reduce[0u];
+    [unroll]
+    for (uint s = 1u; s < uint(NUM_SUBGROUPS); ++s) {
+        total = max(total, subgroup_reduce[s]);
+    }
+    return total;
+}
+
+// Workgroup-wide sum using subgroup intrinsics + shared memory.
+float reduce_workgroup_sum(float local_value, uint tid)
+{
+    const float wave_sum = WaveActiveSum(local_value);
+    if (WaveGetLaneCount() == uint(WG_SIZE)) {
+        return (tid == 0u) ? wave_sum : 0.0;
+    }
+
+    const uint sg_id = tid / WaveGetLaneCount();
+    if (WaveGetLaneIndex() == 0u) {
+        subgroup_reduce[sg_id] = wave_sum;
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    if (tid != 0u) {
+        return 0.0;
+    }
+    float total = 0.0;
+    [unroll]
+    for (uint s = 0u; s < uint(NUM_SUBGROUPS); ++s) {
+        total += subgroup_reduce[s];
+    }
+    return total;
+}
+
+float broadcast_scalar(float value, uint tid)
+{
+    if (tid == 0u) {
+        shared_scalar = value;
+    }
+    GroupMemoryBarrierWithGroupSync();
+    return shared_scalar;
 }
 
 [shader("compute")]
@@ -100,104 +135,172 @@ void main(
     uint3 group_id : SV_GroupID)
 {
     const uint tid = local_id.x;
-    const uint q_head = group_id.x;
+    const uint d_tid = tid % uint(D_SPLIT);
+    const uint col_tid = tid / uint(D_SPLIT);
+    const uint split_count = max(pc.k_num, 1u);
+    const uint dispatch_index = group_id.x;
+    const uint q_head = (split_count > 1u) ? (dispatch_index / split_count) : dispatch_index;
+    const uint split_idx = (split_count > 1u) ? (dispatch_index % split_count) : 0u;
 
     if (q_head >= pc.num_q_heads) {
-        return;
-    }
-    if (pc.head_dim > uint(MAX_HEAD_DIM)) {
         return;
     }
 
     const uint heads_per_kv = pc.num_q_heads / pc.num_kv_heads;
     const uint kv_head = q_head / heads_per_kv;
-    const uint q_batch_stride = pc.num_q_heads * pc.head_dim;
-    const uint q_head_stride = pc.head_dim;
-    const uint q_seq_stride = pc.head_dim;
-    const uint kv_batch_stride = pc.num_kv_heads * pc.kv_stride * pc.head_dim;
-    const uint kv_head_stride = pc.kv_stride * pc.head_dim;
-    const uint kv_seq_stride = pc.head_dim;
-    const uint q_base = StridedLayout::offset4(0u, q_batch_stride, q_head_stride, q_seq_stride, 1u, 0u, q_head, 0u, 0u);
-    const uint kv_base = StridedLayout::offset4(0u, kv_batch_stride, kv_head_stride, kv_seq_stride, 1u, 0u, kv_head, 0u, 0u);
-    const Fp16Span q_slice = {q_base, 1u, pc.head_dim};
-    const Fp16SliceSet kv_slices = {kv_base, kv_seq_stride, 1u, pc.kv_len, pc.head_dim};
-    const RWFp16Span o_slice = {q_base, 1u, pc.head_dim};
-    const uint index0 = tid;
-    const uint index1 = tid + uint(WG_SIZE);
-    const uint index2 = tid + 2u * uint(WG_SIZE);
-    const uint index3 = tid + 3u * uint(WG_SIZE);
+    const uint kv_begin = (split_count > 1u) ? min(pc.kv_len, split_idx * pc.split_kv) : 0u;
+    const uint kv_end = (split_count > 1u) ? min(pc.kv_len, kv_begin + pc.split_kv) : pc.kv_len;
 
-    Workgroup::gather_slice<SharedQueryStorage, WG_SIZE>(q_data, q_slice, tid);
+    // Load Q row into shared memory as pre-scaled half4.
+    if (tid < uint(HEAD_DIM_V4)) {
+        const uint dim = tid * 4u;
+        const uint base = q_offset(q_head, dim);
+        shared_q[tid] = half4(
+            q_data[base + 0u],
+            q_data[base + 1u],
+            q_data[base + 2u],
+            q_data[base + 3u]) * half(pc.scale);
+    }
     GroupMemoryBarrierWithGroupSync();
 
-    float4 accum = float4(0.0);
+    // FP16 output accumulator — 4 half4 vectors per thread.
+    half4 accum[OUT_VECS];
+    [unroll]
+    for (uint i = 0u; i < uint(OUT_VECS); ++i) {
+        accum[i] = half4(0.0h);
+    }
+
     float running_max = NEG_INF;
     float running_norm = 0.0;
+
     [loop]
-    for (uint slice_base = 0u; slice_base < kv_slices.slice_count; slice_base += uint(SCORE_TILE)) {
-        const uint tile_count = min(uint(SCORE_TILE), kv_slices.slice_count - slice_base);
-        float score = NEG_INF;
-        if (tid < tile_count) {
-            const Fp16Span score_slice = kv_slices.slice(slice_base + tid);
-            score = 0.0;
-            uint index = 0u;
-            const uint vectorized_end = score_slice.vectorized_count8();
+    for (uint tile_base = kv_begin; tile_base < kv_end; tile_base += uint(BLOCK_N)) {
+        const uint tile_count = min(uint(BLOCK_N), kv_end - tile_base);
 
-            for (; index < vectorized_end; index += 8u) {
-                const FloatPack8 src_values = Thread::load_fp16_pack8(k_data, score_slice.offset(index));
-                score += dot(Thread::gather_storage4<SharedQueryStorage>(index + 0u), src_values.lo);
-                score += dot(Thread::gather_storage4<SharedQueryStorage>(index + 4u), src_values.hi);
-            }
-
-            for (; index < score_slice.count; ++index) {
-                score += SharedQueryStorage::load(index) * Thread::load_fp16(k_data, score_slice.offset(index));
-            }
-
-            score *= pc.scale;
-        }
-
-        const float tile_max = Workgroup::broadcast_scalar<SharedScalarStorage>(
-            Workgroup::leader_reduce_max<SharedScalarStorage, WG_SIZE>(score, tid),
-            tid);
-
-        float local_weight = 0.0;
-        if (tid < tile_count) {
-            local_weight = exp(score - tile_max);
-            SharedScoreTileStorage::store(tid, local_weight);
+        // ---- Load K tile into shared_kv (with +1 stride padding) ----
+        for (uint idx = tid; idx < tile_count * uint(HEAD_DIM_V4); idx += uint(WG_SIZE)) {
+            const uint col = idx / uint(HEAD_DIM_V4);
+            const uint vec_idx = idx % uint(HEAD_DIM_V4);
+            const uint dim = vec_idx * 4u;
+            const uint base = kv_offset(kv_head, tile_base + col, dim);
+            shared_kv[col * uint(KV_STRIDE) + vec_idx] = half4(
+                k_data[base + 0u],
+                k_data[base + 1u],
+                k_data[base + 2u],
+                k_data[base + 3u]);
         }
         GroupMemoryBarrierWithGroupSync();
 
-        const float tile_norm = Workgroup::broadcast_scalar<SharedScalarStorage>(
-            Workgroup::leader_reduce_sum<SharedScalarStorage, WG_SIZE>(local_weight, tid),
-            tid);
-
-        float4 tile_accum = float4(0.0);
-        for (uint slice = 0u; slice < tile_count; ++slice) {
-            const float weight = SharedScoreTileStorage::load(slice);
-            const Fp16Span value_slice = kv_slices.slice(slice_base + slice);
-            if (index0 < value_slice.count) {
-                tile_accum.x += weight * Thread::load_fp16(v_data, value_slice.offset(index0));
+        // ---- Compute Q·K scores in half, reduced across D_SPLIT ----
+        if (col_tid < tile_count) {
+            half score = half(0.0h);
+            [unroll]
+            for (uint v = d_tid; v < uint(HEAD_DIM_V4); v += uint(D_SPLIT)) {
+                score += dot(shared_q[v],
+                             shared_kv[col_tid * uint(KV_STRIDE) + v]);
             }
-            if (index1 < value_slice.count) {
-                tile_accum.y += weight * Thread::load_fp16(v_data, value_slice.offset(index1));
+            // Butterfly reduction across D_SPLIT lanes
+            [unroll]
+            for (uint shift = uint(D_SPLIT >> 1); shift > 0u; shift >>= 1u) {
+                score += WaveReadLaneAt(score, WaveGetLaneIndex() ^ shift);
             }
-            if (index2 < value_slice.count) {
-                tile_accum.z += weight * Thread::load_fp16(v_data, value_slice.offset(index2));
-            }
-            if (index3 < value_slice.count) {
-                tile_accum.w += weight * Thread::load_fp16(v_data, value_slice.offset(index3));
+            if (d_tid == 0u) {
+                shared_scores[col_tid] = float(score);
             }
         }
         GroupMemoryBarrierWithGroupSync();
 
+        // ---- Online softmax: max ----
+        const float tile_max = broadcast_scalar(
+            reduce_workgroup_max(
+                (d_tid == 0u && col_tid < tile_count)
+                    ? shared_scores[col_tid]
+                    : NEG_INF,
+                tid),
+            tid);
+
+        // ---- Online softmax: exp & sum ----
+        if (d_tid == 0u && col_tid < tile_count) {
+            shared_scores[col_tid] = exp(shared_scores[col_tid] - tile_max);
+        }
+        GroupMemoryBarrierWithGroupSync();
+
+        const float tile_norm = broadcast_scalar(
+            reduce_workgroup_sum(
+                (d_tid == 0u && col_tid < tile_count)
+                    ? shared_scores[col_tid]
+                    : 0.0,
+                tid),
+            tid);
+
+        // ---- Fused softmax correction: pre-scale accumulator ----
         const float merged_max = max(running_max, tile_max);
         const float running_scale = (running_norm > 0.0) ? exp(running_max - merged_max) : 0.0;
         const float tile_scale = exp(tile_max - merged_max);
-        accum = accum * running_scale + tile_accum * tile_scale;
+
+        [unroll]
+        for (uint s = 0u; s < uint(OUT_VECS); ++s) {
+            accum[s] = half(running_scale) * accum[s];
+        }
+
+        // ---- Load V tile into shared_kv (reuse buffer) ----
+        for (uint idx = tid; idx < tile_count * uint(HEAD_DIM_V4); idx += uint(WG_SIZE)) {
+            const uint col = idx / uint(HEAD_DIM_V4);
+            const uint vec_idx = idx % uint(HEAD_DIM_V4);
+            const uint dim = vec_idx * 4u;
+            const uint base = kv_offset(kv_head, tile_base + col, dim);
+            shared_kv[col * uint(KV_STRIDE) + vec_idx] = half4(
+                v_data[base + 0u],
+                v_data[base + 1u],
+                v_data[base + 2u],
+                v_data[base + 3u]);
+        }
+        GroupMemoryBarrierWithGroupSync();
+
+        // ---- Accumulate weighted V directly into accum (fused, no tile_accum) ----
+        const half h_tile_scale = half(tile_scale);
+        [loop]
+        for (uint col = 0u; col < tile_count; ++col) {
+            const half weight = half(shared_scores[col]) * h_tile_scale;
+            uint slot = 0u;
+            [unroll]
+            for (uint v = d_tid; v < uint(HEAD_DIM_V4); v += uint(D_SPLIT)) {
+                accum[slot] += weight * shared_kv[col * uint(KV_STRIDE) + v];
+                ++slot;
+            }
+        }
+        GroupMemoryBarrierWithGroupSync();
+
         running_norm = running_norm * running_scale + tile_norm * tile_scale;
         running_max = merged_max;
     }
 
-    const float inv_norm = (running_norm > 0.0) ? (1.0 / running_norm) : 0.0;
-    Thread::scatter_values4(o_data, o_slice, tid, WG_SIZE, accum * inv_norm);
+    // ---- Write output ----
+    const half inv_norm = half((running_norm > 0.0) ? (1.0 / running_norm) : 0.0);
+
+    if (col_tid == 0u) {
+        uint slot = 0u;
+        [unroll]
+        for (uint v = d_tid; v < uint(HEAD_DIM_V4); v += uint(D_SPLIT)) {
+            const uint dim = v * 4u;
+            const half4 out_vec = accum[slot] * inv_norm;
+            if (split_count > 1u) {
+                partial_o_data[partial_o_offset(split_idx, q_head, dim + 0u)] = out_vec.x;
+                partial_o_data[partial_o_offset(split_idx, q_head, dim + 1u)] = out_vec.y;
+                partial_o_data[partial_o_offset(split_idx, q_head, dim + 2u)] = out_vec.z;
+                partial_o_data[partial_o_offset(split_idx, q_head, dim + 3u)] = out_vec.w;
+            } else {
+                o_data[q_offset(q_head, dim + 0u)] = out_vec.x;
+                o_data[q_offset(q_head, dim + 1u)] = out_vec.y;
+                o_data[q_offset(q_head, dim + 2u)] = out_vec.z;
+                o_data[q_offset(q_head, dim + 3u)] = out_vec.w;
+            }
+            ++slot;
+        }
+
+        if (split_count > 1u && d_tid == 0u) {
+            partial_stats_data[partial_stats_offset(split_idx, q_head, 0u)] = running_norm;
+            partial_stats_data[partial_stats_offset(split_idx, q_head, 1u)] = running_max;
+        }
+    }
 }

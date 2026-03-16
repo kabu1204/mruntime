@@ -1,8 +1,10 @@
 #pragma once
 
+#include <cassert>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 
 #if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
 
@@ -421,6 +423,90 @@ static inline void rmsnorm_fp16_neon(
         vst1q_u16(tmp_out, vreinterpretq_u16_f16(h_out));
         for (size_t j = 0; j < r; ++j) output[i + j] = tmp_out[j];
     }
+}
+
+// ============================================================================
+// GEMV adopted from GGML
+// ============================================================================
+
+#define GEMV_F16_STEP 32
+#define GEMV_F16_EPR  8
+#define GEMV_F16_ARR (GEMV_F16_STEP/GEMV_F16_EPR)
+#define GEMV_F16x8_ZERO vdupq_n_f16(0.0f)
+#define GEMV_F16x8_LOAD(x)      vld1q_f16((const __fp16 *)(x))
+#define GEMV_F16_VEC_LOAD(p, i)     GEMV_F16x8_LOAD(p)
+#define GEMV_F16x8_FMA(a, b, c) vfmaq_f16(a, b, c)
+#define GEMV_F16_VEC_FMA            GEMV_F16x8_FMA
+
+#define GEMV_F16x8_REDUCE(res, x)                               \
+do {                                                            \
+    int offset = GEMV_F16_ARR >> 1;                             \
+    for (int i = 0; i < offset; ++i) {                          \
+        (x)[i] = vaddq_f16((x)[i], (x)[offset+i]);              \
+    }                                                           \
+    offset >>= 1;                                               \
+    for (int i = 0; i < offset; ++i) {                          \
+        (x)[i] = vaddq_f16((x)[i], (x)[offset+i]);              \
+    }                                                           \
+    offset >>= 1;                                               \
+    for (int i = 0; i < offset; ++i) {                          \
+        (x)[i] = vaddq_f16((x)[i], (x)[offset+i]);              \
+    }                                                           \
+    const float32x4_t t0 = vcvt_f32_f16(vget_low_f16 ((x)[0])); \
+    const float32x4_t t1 = vcvt_f32_f16(vget_high_f16((x)[0])); \
+    (res) = (double) vaddvq_f32(vaddq_f32(t0, t1));         \
+} while (0)
+
+#define GEMV_F16_VEC_REDUCE         GEMV_F16x8_REDUCE
+
+static inline float neon_compute_fp16_to_fp32(uint16_t h) {
+    __fp16 tmp;
+    memcpy(&tmp, &h, sizeof(uint16_t));
+    return (float)tmp;
+}
+
+static inline void vec_dot_f16(int n, float * __restrict__ s, 
+    size_t bs, 
+    uint16_t* __restrict__ x,
+    size_t bx,
+    uint16_t* __restrict__ y,
+    size_t by, int nrc) 
+{
+    assert(nrc == 1);
+    (void)(nrc);
+    (void)(bx);
+    (void)(by);
+    (void)(bs);
+
+    double sumf = 0.0;
+
+    const int np = (n & ~(GEMV_F16_STEP - 1));
+
+    float16x8_t sum[GEMV_F16_ARR] = { GEMV_F16x8_ZERO };
+
+    float16x8_t ax[GEMV_F16_ARR];
+    float16x8_t ay[GEMV_F16_ARR];
+
+    for (int i = 0; i < np; i += GEMV_F16_STEP) {
+        for (int j = 0; j < GEMV_F16_ARR; j++) {
+            ax[j] = GEMV_F16_VEC_LOAD(x + i + j*GEMV_F16_EPR, j);
+            ay[j] = GEMV_F16_VEC_LOAD(y + i + j*GEMV_F16_EPR, j);
+
+            sum[j] = GEMV_F16_VEC_FMA(sum[j], ax[j], ay[j]);
+        }
+    }
+
+    // reduce sum0..sum3 to sum0
+    GEMV_F16_VEC_REDUCE(sumf, sum);
+
+    // leftovers
+    for (int i = np; i < n; ++i) {
+        sumf += (double)(neon_compute_fp16_to_fp32(x[i])*neon_compute_fp16_to_fp32(y[i]));
+    }
+    // if you hit this, you are likely running outside the FP range
+    assert(!isnan(sumf) && !isinf(sumf));
+
+    *s = sumf;
 }
 
 #endif

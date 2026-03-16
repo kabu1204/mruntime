@@ -9,6 +9,9 @@ namespace mruntime::vulkan {
 
 class VkFp16Ops {
   public:
+    static constexpr uint32_t kAttentionDecodeHeadDim = 64;
+    static constexpr uint32_t kAttentionDecodeMaxSplitK = 4;
+
     VkFp16Ops() = default;
     static VkFp16Ops Create(VkKernelRuntime* runtime);
 
@@ -126,6 +129,8 @@ class VkFp16Ops {
         const VkDescriptorBufferInfo& q,
         const VkDescriptorBufferInfo& k,
         const VkDescriptorBufferInfo& v,
+        const VkDescriptorBufferInfo& partial_out,
+        const VkDescriptorBufferInfo& partial_stats,
         const VkDescriptorBufferInfo& out,
         uint32_t num_q_heads,
         uint32_t num_kv_heads,
@@ -191,6 +196,7 @@ class VkFp16Ops {
     static constexpr uint32_t kLocalSizeX = 256;
     static constexpr uint32_t kRmsnormLocalSizeX = 64;
     static constexpr uint32_t kAttentionGqaLocalSizeX = 128;
+    static constexpr uint32_t kAttentionResolveLocalSizeX = 128;
     static constexpr uint32_t kGemvRows4Vec4LocalSizeX = 128;
     static constexpr uint32_t kGemvRows4Vec4RowsPerWg = 4;
 
@@ -205,6 +211,7 @@ class VkFp16Ops {
     VkKernel transpose_kernel_ = {};
     VkKernel kv_cache_copy_kernel_ = {};
     VkKernel attention_decode_gqa_kernel_ = {};
+    VkKernel attention_decode_resolve_kernel_ = {};
     VkKernel attention_prefill_gqa_kernel_ = {};
     VkKernel gemv_rows4_vec4_kernel_ = {};
     VkKernel gemm_kernel_ = {};

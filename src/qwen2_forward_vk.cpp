@@ -6,7 +6,6 @@
 #include <cstring>
 #include <stdexcept>
 
-#include "mruntime/dtype.h"
 #include "mruntime/qwen2_ops.h"
 #include "mruntime/trace.h"
 
@@ -65,6 +64,22 @@ vulkan::VkDispatchBatchHostBarrier host_barrier_for_desc(const VkDescriptorBuffe
     barrier.offset = desc.offset;
     barrier.size = (desc.range == 0) ? VK_WHOLE_SIZE : desc.range;
     return barrier;
+}
+
+VkDeviceSize attention_decode_partial_out_bytes(const QwenConfig& cfg) {
+    return static_cast<VkDeviceSize>(vulkan::VkFp16Ops::kAttentionDecodeMaxSplitK) *
+           static_cast<VkDeviceSize>(cfg.num_attention_heads) *
+           static_cast<VkDeviceSize>(cfg.head_dim()) *
+           sizeof(uint16_t);
+}
+
+VkDeviceSize attention_decode_partial_stats_bytes(const QwenConfig& cfg) {
+    return static_cast<VkDeviceSize>(vulkan::VkFp16Ops::kAttentionDecodeMaxSplitK) *
+           static_cast<VkDeviceSize>(cfg.num_attention_heads) * 2u * sizeof(float);
+}
+
+VkDeviceSize attention_decode_scratch_bytes(const QwenConfig& cfg) {
+    return attention_decode_partial_out_bytes(cfg) + attention_decode_partial_stats_bytes(cfg);
 }
 
 void project_fp16_row_major_vk(
@@ -369,6 +384,12 @@ void qwen2_attention_vk(
         descriptor_for_ptr(state.scratch_arena, scratch.q_transposed, num_tokens * q_dim * sizeof(uint16_t));
     const VkDescriptorBufferInfo attn_out_desc =
         descriptor_for_ptr(state.scratch_arena, scratch.attn_out, num_tokens * q_dim * sizeof(uint16_t));
+    const VkDescriptorBufferInfo decode_partial_out_desc =
+        descriptor_for_ptr(state.scratch_arena, state.decode_partial_out, attention_decode_partial_out_bytes(state.cfg));
+    const VkDescriptorBufferInfo decode_partial_stats_desc = descriptor_for_ptr(
+        state.scratch_arena,
+        state.decode_partial_stats,
+        attention_decode_partial_stats_bytes(state.cfg));
 
     const bool attention_uses_q_proj_layout = is_single_token_decode;
     const VkDescriptorBufferInfo attention_q_desc = [&]() {
@@ -401,6 +422,8 @@ void qwen2_attention_vk(
                 state.kv_arena,
                 v_cache,
                 static_cast<VkDeviceSize>(num_kv_heads) * max_seq_len * head_dim * sizeof(uint16_t)),
+            decode_partial_out_desc,
+            decode_partial_stats_desc,
             attn_out_desc,
             static_cast<uint32_t>(num_heads),
             static_cast<uint32_t>(num_kv_heads),
@@ -793,7 +816,7 @@ Qwen2VkStatePtr qwen2_vk_create(
         state->vk.physical_device(), state->vk.device(), kv_info);
 
     vulkan::VkBufferArenaCreateInfo scratch_info;
-    scratch_info.capacity_bytes = sizes.scratch_bytes + 4 * state->alignment;
+    scratch_info.capacity_bytes = sizes.scratch_bytes + attention_decode_scratch_bytes(cfg) + 4 * state->alignment;
     scratch_info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
     scratch_info.memory_properties =
         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
@@ -966,6 +989,12 @@ Qwen2VkStatePtr qwen2_vk_create(
         state->scratch.up = arena_alloc_array<uint16_t>(state->scratch_arena, max_batch_tokens * cfg.intermediate_size * 2);
         state->scratch.mlp_out = arena_alloc_array<uint16_t>(state->scratch_arena, max_batch_tokens * cfg.hidden_size);
         state->scratch.logits = arena_alloc_array<uint16_t>(state->scratch_arena, max_batch_tokens * cfg.vocab_size);
+        state->decode_partial_out = arena_alloc_array<uint16_t>(
+            state->scratch_arena,
+            static_cast<size_t>(vulkan::VkFp16Ops::kAttentionDecodeMaxSplitK) * q_dim_elems);
+        state->decode_partial_stats = arena_alloc_array<float>(
+            state->scratch_arena,
+            static_cast<size_t>(vulkan::VkFp16Ops::kAttentionDecodeMaxSplitK) * cfg.num_attention_heads * 2u);
     }
 
     return state;

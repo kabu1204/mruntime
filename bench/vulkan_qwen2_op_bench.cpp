@@ -574,13 +574,21 @@ auto run_attention_decode_case(
     const size_t q_elems = static_cast<size_t>(num_q_heads) * head_dim;
     const size_t kv_elems = static_cast<size_t>(num_kv_heads) * kv_stride * head_dim;
     const size_t out_elems = q_elems;
+    const size_t partial_out_elems =
+        static_cast<size_t>(mruntime::vulkan::VkFp16Ops::kAttentionDecodeMaxSplitK) * out_elems;
+    const size_t partial_stats_elems =
+        static_cast<size_t>(mruntime::vulkan::VkFp16Ops::kAttentionDecodeMaxSplitK) * num_q_heads * 2u;
     auto arena = make_arena(
         bc,
-        static_cast<VkDeviceSize>((q_elems + 2ull * kv_elems + out_elems) * sizeof(uint16_t)) + 4 * bc.alignment
+        static_cast<VkDeviceSize>((q_elems + 2ull * kv_elems + out_elems + partial_out_elems) * sizeof(uint16_t)) +
+            static_cast<VkDeviceSize>(partial_stats_elems * sizeof(float)) +
+            6 * bc.alignment
     );
     const auto q = alloc_fp16(arena, q_elems);
     const auto k = alloc_fp16(arena, kv_elems);
     const auto v = alloc_fp16(arena, kv_elems);
+    const auto partial_out = alloc_fp16(arena, partial_out_elems);
+    const auto partial_stats = alloc_f32(arena, partial_stats_elems);
     const auto out = alloc_fp16(arena, out_elems, 0);
     const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
     return benchmark_single_dispatch(bc, warmup_iters, bench_iters, [&](VkDispatchBatch* batch) {
@@ -588,6 +596,8 @@ auto run_attention_decode_case(
             q.desc,
             k.desc,
             v.desc,
+            partial_out.desc,
+            partial_stats.desc,
             out.desc,
             num_q_heads,
             num_kv_heads,

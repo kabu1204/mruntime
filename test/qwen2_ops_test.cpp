@@ -116,6 +116,26 @@ TEST(Qwen2OpsTest, RmsNorm) {
 
 namespace {
 
+std::vector<float> gemm_reference_fp32(
+    const std::vector<uint16_t>& A,
+    const std::vector<uint16_t>& B,
+    size_t M,
+    size_t N,
+    size_t K
+) {
+    std::vector<float> C(M * N, 0.0f);
+    for (size_t m = 0; m < M; ++m) {
+        for (size_t n = 0; n < N; ++n) {
+            float acc = 0.0f;
+            for (size_t k = 0; k < K; ++k) {
+                acc += fp16_bits_to_float(A[m * K + k]) * fp16_bits_to_float(B[n * K + k]);
+            }
+            C[m * N + n] = acc;
+        }
+    }
+    return C;
+}
+
 void rope_reference_fp16(
     uint16_t* data,
     size_t batch,
@@ -249,6 +269,57 @@ void flash_attention_gqa_reference_fp32(
                 }
             }
         }
+    }
+}
+
+TEST(Qwen2OpsTest, GemmM1UsesRawDecodeKernel) {
+    constexpr size_t M = 1;
+    constexpr size_t N = 19;
+    constexpr size_t K = 41;
+
+    std::vector<uint16_t> A(M * K);
+    std::vector<uint16_t> B(N * K);
+    for (size_t i = 0; i < A.size(); ++i) {
+        const float value = static_cast<float>((static_cast<int>(i % 11) - 5)) * 0.125f;
+        A[i] = float_to_fp16_bits(value);
+    }
+    for (size_t i = 0; i < B.size(); ++i) {
+        const float value = static_cast<float>((static_cast<int>(i % 17) - 8)) * 0.0625f;
+        B[i] = float_to_fp16_bits(value);
+    }
+
+    const std::vector<float> expected = gemm_reference_fp32(A, B, M, N, K);
+
+    const size_t packed_bytes = qwen2_packed_weight_size_fp16(N, K);
+    std::vector<uint16_t> packed((packed_bytes + sizeof(uint16_t) - 1) / sizeof(uint16_t));
+    if (qwen2_has_kai_fp16()) {
+        qwen2_pack_weight_fp16(B.data(), packed.data(), N, K);
+    }
+
+    std::vector<uint16_t> output_serial(M * N);
+    qwen2_gemm_fp16(
+        A.data(),
+        B.data(),
+        output_serial.data(),
+        M, N, K,
+        packed.empty() ? nullptr : packed.data(),
+        nullptr
+    );
+
+    PThreadPool pool = PThreadPool::Create(4);
+    std::vector<uint16_t> output_parallel(M * N);
+    qwen2_gemm_fp16(
+        A.data(),
+        B.data(),
+        output_parallel.data(),
+        M, N, K,
+        packed.empty() ? nullptr : packed.data(),
+        &pool
+    );
+
+    for (size_t i = 0; i < expected.size(); ++i) {
+        EXPECT_NEAR(fp16_bits_to_float(output_serial[i]), expected[i], 1e-1f);
+        EXPECT_NEAR(fp16_bits_to_float(output_parallel[i]), expected[i], 1e-1f);
     }
 }
 

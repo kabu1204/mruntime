@@ -2,15 +2,20 @@
 
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_subgroup_extended_types_float16 : require
 #extension GL_EXT_scalar_block_layout : require
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
 
-// Decode-only FP16 GQA attention.
-// Q: [1, num_q_heads, 1, head_dim] BHSD FP16
-// K: [1, num_kv_heads, kv_stride, head_dim] BHSD FP16
-// V: [1, num_kv_heads, kv_stride, head_dim] BHSD FP16
-// O: [1, num_q_heads, 1, head_dim] BHSD FP16
+// Decode-only FP16 GQA attention, specialized for head_dim=64.
+// Q: [1, num_q_heads, 1, 64] BHSD FP16
+// K: [1, num_kv_heads, kv_stride, 64] BHSD FP16
+// V: [1, num_kv_heads, kv_stride, 64] BHSD FP16
+// O: [1, num_q_heads, 1, 64] BHSD FP16
+//
+// FP16 intermediate path: accumulators, Q staging, scores all in half.
+// Only running_max/running_norm kept in float for softmax stability.
 
 layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
 
@@ -26,7 +31,15 @@ layout(scalar, set = 0, binding = 2, std430) readonly buffer VBuffer {
     float16_t v[];
 } v_buf;
 
-layout(scalar, set = 0, binding = 3, std430) writeonly buffer OBuffer {
+layout(scalar, set = 0, binding = 3, std430) writeonly buffer PartialOBuffer {
+    float16_t partial_o[];
+} partial_o_buf;
+
+layout(scalar, set = 0, binding = 4, std430) writeonly buffer PartialStatsBuffer {
+    float partial_stats[];
+} partial_stats_buf;
+
+layout(scalar, set = 0, binding = 5, std430) writeonly buffer OBuffer {
     float16_t o[];
 } o_buf;
 
@@ -35,169 +48,257 @@ layout(push_constant) uniform PushConstants {
     uint num_kv_heads;
     uint kv_len;
     uint kv_stride;
-    uint head_dim;
     float scale;
+    uint k_num;
+    uint split_kv;
 } pc;
 
-const uint SCORE_TILE = 32u;
-const uint MAX_HEAD_DIM = 512u;
+const uint WG_SIZE = 128u;
+const uint BLOCK_N = 32u;
+const uint D_SPLIT = 4u;
+const uint HEAD_DIM = 64u;
+const uint HEAD_DIM_V4 = HEAD_DIM / 4u;         // 16
+const uint KV_STRIDE = HEAD_DIM_V4 + 1u;        // 17, +1 bank-conflict padding
+const uint OUT_VECS = HEAD_DIM_V4 / D_SPLIT;    // 4
 const float NEG_INF = -3.402823466e38;
 
-shared float shared_q[MAX_HEAD_DIM];
-shared float score_tile[SCORE_TILE];
-shared float subgroup_reduce[32];
+// Q row pre-scaled to f16vec4
+shared f16vec4 shared_q[HEAD_DIM_V4];
+// K/V tile with +1 stride padding
+shared f16vec4 shared_kv[BLOCK_N * KV_STRIDE];
+// Per-column attention scores (float for exp/softmax)
+shared float shared_scores[BLOCK_N];
+// Cross-subgroup reduction (only gl_NumSubgroups entries used)
+shared float subgroup_reduce[WG_SIZE / 32u];
+// Scalar broadcast
 shared float shared_scalar;
 
-uint q_offset(uint q_head, uint dim) {
-    return q_head * pc.head_dim + dim;
+uint q_offset_fn(uint q_head, uint dim) {
+    return q_head * HEAD_DIM + dim;
 }
 
-uint kv_offset(uint kv_head, uint kv_seq, uint dim) {
-    return (kv_head * pc.kv_stride + kv_seq) * pc.head_dim + dim;
+uint kv_offset_fn(uint kv_head, uint kv_seq, uint dim) {
+    return (kv_head * pc.kv_stride + kv_seq) * HEAD_DIM + dim;
 }
 
-float compute_score(uint kv_head, uint kv_seq) {
-    const uint k_base = kv_offset(kv_head, kv_seq, 0u);
-    float score = 0.0;
-    for (uint dim = 0u; dim < pc.head_dim; ++dim) {
-        score += shared_q[dim] * float(k_buf.k[k_base + dim]);
-    }
-    return score * pc.scale;
+uint partial_o_offset_fn(uint split_idx, uint q_head, uint dim) {
+    return (split_idx * pc.num_q_heads + q_head) * HEAD_DIM + dim;
+}
+
+uint partial_stats_offset_fn(uint split_idx, uint q_head, uint slot) {
+    return ((split_idx * pc.num_q_heads + q_head) * 2u) + slot;
 }
 
 float reduce_workgroup_max(float local_value, uint tid) {
-    float wave_value = subgroupMax(local_value);
+    const float wave_max = subgroupMax(local_value);
     if (gl_NumSubgroups == 1u) {
-        return (gl_SubgroupInvocationID == 0u) ? wave_value : 0.0;
+        return (gl_SubgroupInvocationID == 0u) ? wave_max : NEG_INF;
     }
 
     if (gl_SubgroupInvocationID == 0u) {
-        subgroup_reduce[gl_SubgroupID] = wave_value;
+        subgroup_reduce[gl_SubgroupID] = wave_max;
     }
     barrier();
 
     if (tid != 0u) {
-        return 0.0;
+        return NEG_INF;
     }
-
-    float total = subgroup_reduce[0];
-    for (uint subgroup = 1u; subgroup < gl_NumSubgroups; ++subgroup) {
-        total = max(total, subgroup_reduce[subgroup]);
+    float total = subgroup_reduce[0u];
+    for (uint s = 1u; s < gl_NumSubgroups; ++s) {
+        total = max(total, subgroup_reduce[s]);
     }
     return total;
 }
 
 float reduce_workgroup_sum(float local_value, uint tid) {
-    float wave_value = subgroupAdd(local_value);
+    const float wave_sum = subgroupAdd(local_value);
     if (gl_NumSubgroups == 1u) {
-        return (gl_SubgroupInvocationID == 0u) ? wave_value : 0.0;
+        return (gl_SubgroupInvocationID == 0u) ? wave_sum : 0.0;
     }
 
     if (gl_SubgroupInvocationID == 0u) {
-        subgroup_reduce[gl_SubgroupID] = wave_value;
+        subgroup_reduce[gl_SubgroupID] = wave_sum;
     }
     barrier();
 
     if (tid != 0u) {
         return 0.0;
     }
-
     float total = 0.0;
-    for (uint subgroup = 0u; subgroup < gl_NumSubgroups; ++subgroup) {
-        total += subgroup_reduce[subgroup];
+    for (uint s = 0u; s < gl_NumSubgroups; ++s) {
+        total += subgroup_reduce[s];
     }
     return total;
 }
 
+float broadcast_scalar(float value, uint tid) {
+    if (tid == 0u) {
+        shared_scalar = value;
+    }
+    barrier();
+    return shared_scalar;
+}
+
 void main() {
     const uint tid = gl_LocalInvocationID.x;
-    const uint q_head = gl_WorkGroupID.x;
+    const uint d_tid = tid % D_SPLIT;
+    const uint col_tid = tid / D_SPLIT;
+    const uint split_count = max(pc.k_num, 1u);
+    const uint dispatch_index = gl_WorkGroupID.x;
+    const uint q_head = (split_count > 1u) ? (dispatch_index / split_count) : dispatch_index;
+    const uint split_idx = (split_count > 1u) ? (dispatch_index % split_count) : 0u;
+
     if (q_head >= pc.num_q_heads) {
         return;
     }
 
-    for (uint dim = tid; dim < pc.head_dim; dim += gl_WorkGroupSize.x) {
-        shared_q[dim] = float(q_buf.q[q_offset(q_head, dim)]);
-    }
-    barrier();
-
     const uint heads_per_kv = pc.num_q_heads / pc.num_kv_heads;
     const uint kv_head = q_head / heads_per_kv;
+    const uint kv_begin = (split_count > 1u) ? min(pc.kv_len, split_idx * pc.split_kv) : 0u;
+    const uint kv_end = (split_count > 1u) ? min(pc.kv_len, kv_begin + pc.split_kv) : pc.kv_len;
 
-    float local_max = NEG_INF;
-    for (uint k_base = 0u; k_base < pc.kv_len; k_base += SCORE_TILE) {
-        const uint kv_seq = k_base + tid;
-        if (tid < SCORE_TILE && kv_seq < pc.kv_len) {
-            local_max = max(local_max, compute_score(kv_head, kv_seq));
-        }
-    }
-
-    const float workgroup_max = reduce_workgroup_max(local_max, tid);
-    if (tid == 0u) {
-        shared_scalar = workgroup_max;
+    // Load Q row into shared memory as pre-scaled f16vec4.
+    if (tid < HEAD_DIM_V4) {
+        const uint dim = tid * 4u;
+        const uint base = q_offset_fn(q_head, dim);
+        shared_q[tid] = f16vec4(
+            q_buf.q[base + 0u],
+            q_buf.q[base + 1u],
+            q_buf.q[base + 2u],
+            q_buf.q[base + 3u]) * float16_t(pc.scale);
     }
     barrier();
 
-    const float max_score = shared_scalar;
-    float local_lsum = 0.0;
+    // FP16 output accumulator — 4 f16vec4 vectors per thread.
+    f16vec4 accum[OUT_VECS];
+    for (uint i = 0u; i < OUT_VECS; ++i) {
+        accum[i] = f16vec4(0.0hf);
+    }
 
-    float acc0 = 0.0;
-    float acc1 = 0.0;
-    float acc2 = 0.0;
-    float acc3 = 0.0;
+    float running_max = NEG_INF;
+    float running_norm = 0.0;
 
-    const uint dim0 = tid;
-    const uint dim1 = tid + gl_WorkGroupSize.x;
-    const uint dim2 = tid + 2u * gl_WorkGroupSize.x;
-    const uint dim3 = tid + 3u * gl_WorkGroupSize.x;
+    for (uint tile_base = kv_begin; tile_base < kv_end; tile_base += BLOCK_N) {
+        const uint tile_count = min(BLOCK_N, kv_end - tile_base);
 
-    for (uint k_base = 0u; k_base < pc.kv_len; k_base += SCORE_TILE) {
-        const uint tile_len = min(SCORE_TILE, pc.kv_len - k_base);
-        if (tid < tile_len) {
-            const float weight = exp(compute_score(kv_head, k_base + tid) - max_score);
-            score_tile[tid] = weight;
-            local_lsum += weight;
+        // ---- Load K tile into shared_kv (with +1 stride padding) ----
+        for (uint idx = tid; idx < tile_count * HEAD_DIM_V4; idx += WG_SIZE) {
+            const uint col = idx / HEAD_DIM_V4;
+            const uint vec_idx = idx % HEAD_DIM_V4;
+            const uint dim = vec_idx * 4u;
+            const uint base = kv_offset_fn(kv_head, tile_base + col, dim);
+            shared_kv[col * KV_STRIDE + vec_idx] = f16vec4(
+                k_buf.k[base + 0u],
+                k_buf.k[base + 1u],
+                k_buf.k[base + 2u],
+                k_buf.k[base + 3u]);
         }
         barrier();
 
-        if (dim0 < pc.head_dim || dim1 < pc.head_dim || dim2 < pc.head_dim || dim3 < pc.head_dim) {
-            for (uint tile_idx = 0u; tile_idx < tile_len; ++tile_idx) {
-                const float weight = score_tile[tile_idx];
-                const uint v_base = kv_offset(kv_head, k_base + tile_idx, 0u);
-                if (dim0 < pc.head_dim) {
-                    acc0 += weight * float(v_buf.v[v_base + dim0]);
-                }
-                if (dim1 < pc.head_dim) {
-                    acc1 += weight * float(v_buf.v[v_base + dim1]);
-                }
-                if (dim2 < pc.head_dim) {
-                    acc2 += weight * float(v_buf.v[v_base + dim2]);
-                }
-                if (dim3 < pc.head_dim) {
-                    acc3 += weight * float(v_buf.v[v_base + dim3]);
-                }
+        // ---- Compute Q·K scores in half, reduced across D_SPLIT ----
+        if (col_tid < tile_count) {
+            float16_t score = float16_t(0.0hf);
+            for (uint v = d_tid; v < HEAD_DIM_V4; v += D_SPLIT) {
+                score += dot(shared_q[v],
+                             shared_kv[col_tid * KV_STRIDE + v]);
+            }
+            // Butterfly reduction across D_SPLIT lanes
+            for (uint shift = D_SPLIT >> 1u; shift > 0u; shift >>= 1u) {
+                score += subgroupShuffleXor(score, shift);
+            }
+            if (d_tid == 0u) {
+                shared_scores[col_tid] = float(score);
             }
         }
         barrier();
+
+        // ---- Online softmax: max ----
+        const float tile_max = broadcast_scalar(
+            reduce_workgroup_max(
+                (d_tid == 0u && col_tid < tile_count)
+                    ? shared_scores[col_tid]
+                    : NEG_INF,
+                tid),
+            tid);
+
+        // ---- Online softmax: exp & sum ----
+        if (d_tid == 0u && col_tid < tile_count) {
+            shared_scores[col_tid] = exp(shared_scores[col_tid] - tile_max);
+        }
+        barrier();
+
+        const float tile_norm = broadcast_scalar(
+            reduce_workgroup_sum(
+                (d_tid == 0u && col_tid < tile_count)
+                    ? shared_scores[col_tid]
+                    : 0.0,
+                tid),
+            tid);
+
+        // ---- Fused softmax correction: pre-scale accumulator ----
+        const float merged_max = max(running_max, tile_max);
+        const float running_scale = (running_norm > 0.0) ? exp(running_max - merged_max) : 0.0;
+        const float tile_scale = exp(tile_max - merged_max);
+
+        for (uint s = 0u; s < OUT_VECS; ++s) {
+            accum[s] = float16_t(running_scale) * accum[s];
+        }
+
+        // ---- Load V tile into shared_kv (reuse buffer) ----
+        for (uint idx = tid; idx < tile_count * HEAD_DIM_V4; idx += WG_SIZE) {
+            const uint col = idx / HEAD_DIM_V4;
+            const uint vec_idx = idx % HEAD_DIM_V4;
+            const uint dim = vec_idx * 4u;
+            const uint base = kv_offset_fn(kv_head, tile_base + col, dim);
+            shared_kv[col * KV_STRIDE + vec_idx] = f16vec4(
+                v_buf.v[base + 0u],
+                v_buf.v[base + 1u],
+                v_buf.v[base + 2u],
+                v_buf.v[base + 3u]);
+        }
+        barrier();
+
+        // ---- Accumulate weighted V directly into accum (fused, no tile_accum) ----
+        const float16_t h_tile_scale = float16_t(tile_scale);
+        for (uint col = 0u; col < tile_count; ++col) {
+            const float16_t weight = float16_t(shared_scores[col]) * h_tile_scale;
+            uint slot = 0u;
+            for (uint v = d_tid; v < HEAD_DIM_V4; v += D_SPLIT) {
+                accum[slot] += weight * shared_kv[col * KV_STRIDE + v];
+                ++slot;
+            }
+        }
+        barrier();
+
+        running_norm = running_norm * running_scale + tile_norm * tile_scale;
+        running_max = merged_max;
     }
 
-    const float workgroup_lsum = reduce_workgroup_sum(local_lsum, tid);
-    if (tid == 0u) {
-        shared_scalar = workgroup_lsum;
-    }
-    barrier();
+    // ---- Write output ----
+    const float16_t inv_norm = float16_t((running_norm > 0.0) ? (1.0 / running_norm) : 0.0);
 
-    const float inv_lsum = (shared_scalar > 0.0) ? (1.0 / shared_scalar) : 0.0;
-    if (dim0 < pc.head_dim) {
-        o_buf.o[q_offset(q_head, dim0)] = float16_t(acc0 * inv_lsum);
-    }
-    if (dim1 < pc.head_dim) {
-        o_buf.o[q_offset(q_head, dim1)] = float16_t(acc1 * inv_lsum);
-    }
-    if (dim2 < pc.head_dim) {
-        o_buf.o[q_offset(q_head, dim2)] = float16_t(acc2 * inv_lsum);
-    }
-    if (dim3 < pc.head_dim) {
-        o_buf.o[q_offset(q_head, dim3)] = float16_t(acc3 * inv_lsum);
+    if (col_tid == 0u) {
+        uint slot = 0u;
+        for (uint v = d_tid; v < HEAD_DIM_V4; v += D_SPLIT) {
+            const uint dim = v * 4u;
+            const f16vec4 out_vec = accum[slot] * inv_norm;
+            if (split_count > 1u) {
+                partial_o_buf.partial_o[partial_o_offset_fn(split_idx, q_head, dim + 0u)] = out_vec.x;
+                partial_o_buf.partial_o[partial_o_offset_fn(split_idx, q_head, dim + 1u)] = out_vec.y;
+                partial_o_buf.partial_o[partial_o_offset_fn(split_idx, q_head, dim + 2u)] = out_vec.z;
+                partial_o_buf.partial_o[partial_o_offset_fn(split_idx, q_head, dim + 3u)] = out_vec.w;
+            } else {
+                o_buf.o[q_offset_fn(q_head, dim + 0u)] = out_vec.x;
+                o_buf.o[q_offset_fn(q_head, dim + 1u)] = out_vec.y;
+                o_buf.o[q_offset_fn(q_head, dim + 2u)] = out_vec.z;
+                o_buf.o[q_offset_fn(q_head, dim + 3u)] = out_vec.w;
+            }
+            ++slot;
+        }
+
+        if (split_count > 1u && d_tid == 0u) {
+            partial_stats_buf.partial_stats[partial_stats_offset_fn(split_idx, q_head, 0u)] = running_norm;
+            partial_stats_buf.partial_stats[partial_stats_offset_fn(split_idx, q_head, 1u)] = running_max;
+        }
     }
 }

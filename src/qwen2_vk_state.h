@@ -26,6 +26,8 @@ struct Qwen2VkState {
 
     Qwen2KVCache kv_cache = {};
     Qwen2Scratch scratch = {};
+    uint16_t* decode_partial_out = nullptr;
+    float* decode_partial_stats = nullptr;
 
     vulkan::VkContext vk;
     vulkan::VkKernelRuntime runtime;
