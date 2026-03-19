@@ -1,6 +1,9 @@
 add_executable(cpu_micro_bench cpu_micro_bench.cpp)
 target_link_libraries(cpu_micro_bench PRIVATE mruntime)
 target_include_directories(cpu_micro_bench PRIVATE ${CMAKE_SOURCE_DIR}/include)
+if((CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64" OR CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64") AND NOT MSVC)
+    target_compile_options(cpu_micro_bench PRIVATE -march=armv8.2-a+fp16)
+endif()
 
 add_executable(cpu_e2e_bench cpu_e2e_bench.cpp)
 target_link_libraries(cpu_e2e_bench PRIVATE mruntime)
